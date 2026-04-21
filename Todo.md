@@ -5,3 +5,5 @@
 3. in the chat when it edits/wrote a file it shows it in the buttom but we want to make it clickable so that we can open it when user click on them it should be opened in the editor beside the other files if some other files are already opens.
 
 4. This coding agent doesnot write structured code for big files see what can be done here so for big files it writes proper syntax and indentation code 
+
+5. Password change for admin and users (through admin portal)

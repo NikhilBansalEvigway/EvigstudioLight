@@ -6,7 +6,7 @@ import bcrypt from 'bcryptjs';
 import { db } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { COOKIE_NAME, signSession } from '../auth/jwt.js';
-import { writeAuditLog } from '../audit.js';
+import { auditActorSnapshot, auditRequestContext, writeStructuredAuditLog } from '../audit.js';
 import type { HonoEnv } from '../middleware/session.js';
 import type { RoleName } from '../rbac.js';
 
@@ -22,10 +22,6 @@ const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1).max(128),
 });
-
-function clientIp(c: { req: { header: (n: string) => string | undefined } }): string {
-  return c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || c.req.header('x-real-ip') || '';
-}
 
 authRoutes.post('/register', async (c) => {
   const body = registerSchema.safeParse(await c.req.json());
@@ -62,13 +58,19 @@ authRoutes.post('/register', async (c) => {
       secure: process.env.NODE_ENV === 'production',
     });
 
-    await writeAuditLog({
-      userId: row.id,
+    await writeStructuredAuditLog({
       action: 'user.register',
       resourceType: 'user',
       resourceId: row.id,
-      ip: clientIp(c),
-      metadata: { email: row.email, bootstrapAdmin: isFirst },
+      actor: auditActorSnapshot(row),
+      context: auditRequestContext(c),
+      target: {
+        type: 'user',
+        id: row.id,
+        label: row.email,
+      },
+      result: { status: 'success', code: 200 },
+      details: { bootstrapAdmin: isFirst },
     });
 
     return c.json({
@@ -92,12 +94,17 @@ authRoutes.post('/login', async (c) => {
   const rows = await db.select().from(users).where(eq(users.email, email)).limit(1);
   const user = rows[0];
   if (!user || !(await bcrypt.compare(body.data.password, user.passwordHash))) {
-    await writeAuditLog({
-      userId: null,
+    await writeStructuredAuditLog({
       action: 'auth.login_failed',
       resourceType: 'user',
       resourceId: email,
-      ip: clientIp(c),
+      context: auditRequestContext(c),
+      target: {
+        type: 'user',
+        id: null,
+        label: email,
+      },
+      result: { status: 'denied', code: 401, reason: 'invalid_credentials' },
     });
     return c.json({ error: 'Invalid email or password' }, 401);
   }
@@ -116,12 +123,18 @@ authRoutes.post('/login', async (c) => {
     secure: process.env.NODE_ENV === 'production',
   });
 
-  await writeAuditLog({
-    userId: user.id,
+  await writeStructuredAuditLog({
     action: 'auth.login',
     resourceType: 'user',
     resourceId: user.id,
-    ip: clientIp(c),
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: {
+      type: 'user',
+      id: user.id,
+      label: user.email,
+    },
+    result: { status: 'success', code: 200 },
   });
 
   return c.json({
@@ -133,12 +146,18 @@ authRoutes.post('/logout', async (c) => {
   const u = c.get('user');
   deleteCookie(c, COOKIE_NAME, { path: '/' });
   if (u) {
-    await writeAuditLog({
-      userId: u.id,
+    await writeStructuredAuditLog({
       action: 'auth.logout',
       resourceType: 'user',
       resourceId: u.id,
-      ip: clientIp(c),
+      actor: auditActorSnapshot(u),
+      context: auditRequestContext(c),
+      target: {
+        type: 'user',
+        id: u.id,
+        label: u.email,
+      },
+      result: { status: 'success', code: 200 },
     });
   }
   return c.json({ ok: true });

@@ -64,6 +64,23 @@ export async function persistenceLoadChats(): Promise<Chat[]> {
   return data.chats.map(mapServerRow);
 }
 
+export async function persistenceLoadChat(id: string): Promise<Chat> {
+  if (mode === 'idb') {
+    const chats = await loadChats();
+    const chat = chats.find((c) => c.id === id);
+    if (!chat) throw new Error('Chat not found');
+    return chat;
+  }
+
+  const r = await fetch(`/api/chats/${id}`, { credentials: 'include' });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(t || 'Failed to load chat from server');
+  }
+  const data = (await r.json()) as { chat: Parameters<typeof mapServerRow>[0] };
+  return mapServerRow(data.chat);
+}
+
 export async function persistenceSaveChat(chat: Chat): Promise<void> {
   if (mode === 'idb') {
     await saveChat(chat);

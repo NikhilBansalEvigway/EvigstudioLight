@@ -418,8 +418,13 @@ export function ChatPane() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chatId,
+            chatTitle: useAppStore.getState().chats.find((c) => c.id === chatId)?.title ?? null,
+            chatMode: currentMode,
             model: settings.textModel,
             preview: getMessageText(userMsg).slice(0, 500),
+            promptLength: getMessageText(userMsg).length,
+            imageCount: images.length,
+            mentionedFileCount: mentionedFiles.length,
           }),
         });
       } catch {

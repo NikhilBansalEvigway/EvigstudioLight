@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { auditActorSnapshot, auditRequestContext, writeStructuredAuditLog } from '../audit.js';
 import type { HonoEnv } from '../middleware/session.js';
 
 export const llmProxyRoutes = new Hono<HonoEnv>();
@@ -73,6 +74,11 @@ function buildUpstreamUrl(c: { req: { url: string } }): string {
   return `${upstreamBase()}${path}${u.search}`;
 }
 
+function requestPath(c: { req: { url: string } }): string {
+  const u = new URL(c.req.url);
+  return u.pathname.replace(/^\/api\/llm/, '') || '/';
+}
+
 function forwardRequestHeaders(src: Headers): Headers {
   const out = new Headers();
   src.forEach((value, key) => {
@@ -96,9 +102,22 @@ function forwardResponseHeaders(src: Headers): Headers {
 }
 
 llmProxyRoutes.all('*', async (c) => {
+  const user = c.get('user');
+  const context = auditRequestContext(c);
+  const path = requestPath(c);
+  const startedAt = Date.now();
+
   if (requireAuth()) {
-    const user = c.get('user');
     if (!user) {
+      await writeStructuredAuditLog({
+        action: 'llm.proxy',
+        resourceType: 'llm_proxy',
+        resourceId: path,
+        context,
+        target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+        result: { status: 'denied', code: 401, reason: 'auth_required' },
+        details: { path, upstreamBase: upstreamBase() },
+      });
       return c.json({ error: 'Unauthorized', message: 'LLM proxy requires sign-in (LLM_REQUIRE_AUTH).' }, 401);
     }
   }
@@ -120,6 +139,22 @@ llmProxyRoutes.all('*', async (c) => {
     ]);
   } catch (e) {
     if (e instanceof Error && e.name === 'QueueTimeout') {
+      await writeStructuredAuditLog({
+        action: 'llm.proxy',
+        resourceType: 'llm_proxy',
+        resourceId: path,
+        actor: auditActorSnapshot(user),
+        context,
+        target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+        result: { status: 'error', code: 503, reason: 'queue_timeout' },
+        details: {
+          path,
+          upstreamBase: upstreamBase(),
+          method,
+          latencyMs: Date.now() - startedAt,
+          queueWaitMs: waitMs,
+        },
+      });
       return c.json(
         {
           error: 'Too many concurrent LLM requests',
@@ -155,6 +190,21 @@ llmProxyRoutes.all('*', async (c) => {
 
     const res = await fetch(upstreamUrl, init);
     const outHeaders = forwardResponseHeaders(res.headers);
+    await writeStructuredAuditLog({
+      action: 'llm.proxy',
+      resourceType: 'llm_proxy',
+      resourceId: path,
+      actor: auditActorSnapshot(user),
+      context,
+      target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+      result: { status: res.ok ? 'success' : 'error', code: res.status, reason: res.ok ? null : res.statusText },
+      details: {
+        path,
+        upstreamBase: upstreamBase(),
+        method,
+        latencyMs: Date.now() - startedAt,
+      },
+    });
     return new Response(res.body, {
       status: res.status,
       statusText: res.statusText,
@@ -163,9 +213,39 @@ llmProxyRoutes.all('*', async (c) => {
   } catch (e) {
     const name = e instanceof Error ? e.name : '';
     if (name === 'AbortError') {
+      await writeStructuredAuditLog({
+        action: 'llm.proxy',
+        resourceType: 'llm_proxy',
+        resourceId: path,
+        actor: auditActorSnapshot(user),
+        context,
+        target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+        result: { status: 'error', code: 504, reason: 'upstream_timeout' },
+        details: {
+          path,
+          upstreamBase: upstreamBase(),
+          method,
+          latencyMs: Date.now() - startedAt,
+        },
+      });
       return c.json({ error: 'Upstream timeout', message: 'LM Studio did not respond in time.' }, 504);
     }
     console.error('[llmProxy] upstream fetch failed', e);
+    await writeStructuredAuditLog({
+      action: 'llm.proxy',
+      resourceType: 'llm_proxy',
+      resourceId: path,
+      actor: auditActorSnapshot(user),
+      context,
+      target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+      result: { status: 'error', code: 502, reason: e instanceof Error ? e.message : 'fetch_failed' },
+      details: {
+        path,
+        upstreamBase: upstreamBase(),
+        method,
+        latencyMs: Date.now() - startedAt,
+      },
+    });
     return c.json({ error: 'Upstream error', message: e instanceof Error ? e.message : 'fetch failed' }, 502);
   } finally {
     if (timer) clearTimeout(timer);

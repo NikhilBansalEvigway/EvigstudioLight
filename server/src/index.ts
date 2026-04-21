@@ -5,6 +5,7 @@ import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { existsSync } from 'node:fs';
 import { verifyPostgresOrExit } from './db/verifyPostgres.js';
+import { backfillLegacyAuditLogs, cleanupExpiredAuditLogs } from './audit.js';
 import { sessionMiddleware, type HonoEnv } from './middleware/session.js';
 import { healthRoutes } from './routes/health.js';
 import { authRoutes } from './routes/auth.js';
@@ -16,6 +17,12 @@ import { llmProxyRoutes } from './routes/llmProxy.js';
 
 await verifyPostgresOrExit();
 console.log('[evigstudio] API data store: PostgreSQL only (no SQLite .db files).');
+const auditCleanup = await cleanupExpiredAuditLogs();
+console.log(
+  `[evigstudio] Audit retention ${auditCleanup.retentionDays}d; removed ${auditCleanup.deleted} expired audit row(s).`,
+);
+const auditBackfill = await backfillLegacyAuditLogs();
+console.log(`[evigstudio] Audit backfill repaired ${auditBackfill.updated} legacy audit row(s).`);
 
 const app = new Hono<HonoEnv>();
 

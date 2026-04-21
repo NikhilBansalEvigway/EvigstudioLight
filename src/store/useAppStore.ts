@@ -7,6 +7,7 @@ import {
   getChatPersistenceMode,
   persistenceCreateChat,
   persistenceDeleteChat,
+  persistenceLoadChat,
   persistenceLoadChats,
   persistenceSaveChat,
 } from '@/lib/chatPersistence';
@@ -29,6 +30,7 @@ interface AppState {
   initChats: () => Promise<void>;
   resetChats: () => void;
   createChat: () => Promise<string>;
+  refreshChat: (id: string) => Promise<void>;
   selectChat: (id: string) => void;
   deleteChat: (id: string) => Promise<void>;
   renameChat: (id: string, title: string) => void;
@@ -95,6 +97,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       chats.sort((a, b) => b.updatedAt - a.updatedAt);
       set({ chats });
       if (chats.length > 0) set({ activeChatId: chats[0].id });
+      if (getChatPersistenceMode() === 'server' && chats.length > 0) {
+        void get().refreshChat(chats[0].id);
+      }
     } catch (e) {
       console.error('[EvigStudio] initChats failed', e);
       set({ chats: [], activeChatId: null });
@@ -119,7 +124,28 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ chats: [chat, ...s.chats], activeChatId: chat.id }));
     return chat.id;
   },
-  selectChat: (id) => set({ activeChatId: id }),
+  refreshChat: async (id) => {
+    if (getChatPersistenceMode() !== 'server') return;
+    try {
+      const fresh = normalizeChat(await persistenceLoadChat(id));
+      set((s) => {
+        const existing = s.chats.some((c) => c.id === id);
+        const chats = existing
+          ? s.chats.map((c) => (c.id === id ? fresh : c))
+          : [fresh, ...s.chats];
+        chats.sort((a, b) => b.updatedAt - a.updatedAt);
+        return { chats };
+      });
+    } catch (e) {
+      console.error('[EvigStudio] refreshChat failed', e);
+    }
+  },
+  selectChat: (id) => {
+    set({ activeChatId: id });
+    if (getChatPersistenceMode() === 'server') {
+      void get().refreshChat(id);
+    }
+  },
   deleteChat: async (id) => {
     try {
       const chat = get().chats.find((c) => c.id === id);

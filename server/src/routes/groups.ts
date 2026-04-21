@@ -3,15 +3,15 @@ import { z } from 'zod';
 import { and, count, desc, eq, ilike, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { groupMembers, groupWorkspaces, groups, users } from '../db/schema.js';
-import { writeAuditLog } from '../audit.js';
+import {
+  auditActorSnapshot,
+  auditRequestContext,
+  writeStructuredAuditLog,
+} from '../audit.js';
 import type { HonoEnv } from '../middleware/session.js';
 import { roleHasPermission } from '../rbac.js';
 
 export const groupRoutes = new Hono<HonoEnv>();
-
-function clientIp(c: { req: { header: (n: string) => string | undefined } }): string {
-  return c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || c.req.header('x-real-ip') || '';
-}
 
 function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, '\\$&');
@@ -100,6 +100,13 @@ groupRoutes.post('/', async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
   if (!roleHasPermission(user.role, 'groups.manage')) {
+    await writeStructuredAuditLog({
+      action: 'group.create',
+      resourceType: 'group',
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      result: { status: 'denied', code: 403, reason: 'role_cannot_create_group' },
+    });
     return c.json({ error: 'Only admins or users with group management rights can create teams' }, 403);
   }
 
@@ -121,13 +128,15 @@ groupRoutes.post('/', async (c) => {
     roleInGroup: 'lead',
   });
 
-  await writeAuditLog({
-    userId: user.id,
+  await writeStructuredAuditLog({
     action: 'group.create',
     resourceType: 'group',
     resourceId: g.id,
-    ip: clientIp(c),
-    metadata: { name: g.name },
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: { type: 'group', id: g.id, label: g.name },
+    result: { status: 'success', code: 200 },
+    details: { name: g.name, description: g.description ?? null },
   });
 
   return c.json({ group: g });
@@ -157,6 +166,15 @@ groupRoutes.post('/:id/members', async (c) => {
   const isLead = selfMem?.roleInGroup === 'lead';
   const canManageGroups = roleHasPermission(user.role, 'groups.manage');
   if (!canManageGroups && !isLead) {
+    await writeStructuredAuditLog({
+      action: 'group.member_add',
+      resourceType: 'group',
+      resourceId: groupId,
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      target: { type: 'group', id: groupId, label: g.name },
+      result: { status: 'denied', code: 403, reason: 'not_group_manager_or_lead' },
+    });
     return c.json({ error: 'Only admins, group managers, or group leads can add members' }, 403);
   }
 
@@ -172,13 +190,22 @@ groupRoutes.post('/:id/members', async (c) => {
     })
     .onConflictDoNothing();
 
-  await writeAuditLog({
-    userId: user.id,
+  await writeStructuredAuditLog({
     action: 'group.member_add',
     resourceType: 'group',
     resourceId: groupId,
-    ip: clientIp(c),
-    metadata: { addedUserId: parsed.data.userId },
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: { type: 'group', id: groupId, label: g.name },
+    result: { status: 'success', code: 200 },
+    details: {
+      addedUser: {
+        id: target.id,
+        email: target.email,
+        displayName: target.displayName,
+      },
+      roleInGroup: parsed.data.roleInGroup,
+    },
   });
 
   return c.json({ ok: true });
@@ -198,21 +225,41 @@ groupRoutes.delete('/:id/members/:userId', async (c) => {
     .limit(1);
   const isLead = selfMem?.roleInGroup === 'lead';
   const canManageGroups = roleHasPermission(user.role, 'groups.manage');
+  const [g] = await db.select().from(groups).where(eq(groups.id, groupId)).limit(1);
+  if (!g) return c.json({ error: 'Group not found' }, 404);
   if (!canManageGroups && !isLead) {
+    await writeStructuredAuditLog({
+      action: 'group.member_remove',
+      resourceType: 'group',
+      resourceId: groupId,
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      target: { type: 'group', id: groupId, label: g.name },
+      result: { status: 'denied', code: 403, reason: 'not_group_manager_or_lead' },
+      details: { removedUserId: targetUserId },
+    });
     return c.json({ error: 'Forbidden' }, 403);
   }
+
+  const [target] = await db.select().from(users).where(eq(users.id, targetUserId)).limit(1);
 
   await db
     .delete(groupMembers)
     .where(and(eq(groupMembers.groupId, groupId), eq(groupMembers.userId, targetUserId)));
 
-  await writeAuditLog({
-    userId: user.id,
+  await writeStructuredAuditLog({
     action: 'group.member_remove',
     resourceType: 'group',
     resourceId: groupId,
-    ip: clientIp(c),
-    metadata: { removedUserId: targetUserId },
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: { type: 'group', id: groupId, label: g.name },
+    result: { status: 'success', code: 200 },
+    details: {
+      removedUser: target
+        ? { id: target.id, email: target.email, displayName: target.displayName }
+        : { id: targetUserId },
+    },
   });
 
   return c.json({ ok: true });
@@ -242,11 +289,31 @@ groupRoutes.post('/:id/workspaces', async (c) => {
     roleHasPermission(user.role, 'workspace.shares_manage') ||
     isLead;
   if (user.role !== 'admin' && !mem) {
+    await writeStructuredAuditLog({
+      action: 'group.workspace_add',
+      resourceType: 'group_workspace',
+      resourceId: groupId,
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      target: { type: 'group', id: groupId },
+      result: { status: 'denied', code: 403, reason: 'not_group_member' },
+    });
     return c.json({ error: 'Forbidden' }, 403);
   }
   if (!canShare) {
+    await writeStructuredAuditLog({
+      action: 'group.workspace_add',
+      resourceType: 'group_workspace',
+      resourceId: groupId,
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      target: { type: 'group', id: groupId },
+      result: { status: 'denied', code: 403, reason: 'cannot_manage_workspace_shares' },
+    });
     return c.json({ error: 'Forbidden' }, 403);
   }
+
+  const [g] = await db.select().from(groups).where(eq(groups.id, groupId)).limit(1);
 
   const [ws] = await db
     .insert(groupWorkspaces)
@@ -257,13 +324,15 @@ groupRoutes.post('/:id/workspaces', async (c) => {
     })
     .returning();
 
-  await writeAuditLog({
-    userId: user.id,
+  await writeStructuredAuditLog({
     action: 'group.workspace_add',
     resourceType: 'group_workspace',
     resourceId: ws.id,
-    ip: clientIp(c),
-    metadata: { groupId, label: ws.label },
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: { type: 'group_workspace', id: ws.id, label: ws.label, groupId, groupName: g?.name ?? null },
+    result: { status: 'success', code: 200 },
+    details: { groupId, groupName: g?.name ?? null, label: ws.label, rootPath: ws.rootPath },
   });
 
   return c.json({ workspace: ws });
@@ -295,7 +364,17 @@ const patchGroupSchema = z.object({
 groupRoutes.patch('/:id', async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
-  if (user.role !== 'admin') return c.json({ error: 'Forbidden' }, 403);
+  if (user.role !== 'admin') {
+    await writeStructuredAuditLog({
+      action: 'group.update',
+      resourceType: 'group',
+      resourceId: c.req.param('id'),
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      result: { status: 'denied', code: 403, reason: 'admin_only' },
+    });
+    return c.json({ error: 'Forbidden' }, 403);
+  }
 
   const groupId = c.req.param('id');
   const parsed = patchGroupSchema.safeParse(await c.req.json());
@@ -314,13 +393,19 @@ groupRoutes.patch('/:id', async (c) => {
     .where(eq(groups.id, groupId))
     .returning();
 
-  await writeAuditLog({
-    userId: user.id,
+  await writeStructuredAuditLog({
     action: 'group.update',
     resourceType: 'group',
     resourceId: groupId,
-    ip: clientIp(c),
-    metadata: parsed.data,
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: { type: 'group', id: groupId, label: updated.name },
+    change: {
+      fields: Object.keys(parsed.data),
+      before: { name: g.name, description: g.description },
+      after: { name: updated.name, description: updated.description },
+    },
+    result: { status: 'success', code: 200 },
   });
 
   return c.json({ group: updated });
@@ -329,7 +414,17 @@ groupRoutes.patch('/:id', async (c) => {
 groupRoutes.delete('/:id', async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
-  if (user.role !== 'admin') return c.json({ error: 'Forbidden' }, 403);
+  if (user.role !== 'admin') {
+    await writeStructuredAuditLog({
+      action: 'group.delete',
+      resourceType: 'group',
+      resourceId: c.req.param('id'),
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      result: { status: 'denied', code: 403, reason: 'admin_only' },
+    });
+    return c.json({ error: 'Forbidden' }, 403);
+  }
 
   const groupId = c.req.param('id');
   const [g] = await db.select().from(groups).where(eq(groups.id, groupId)).limit(1);
@@ -337,13 +432,15 @@ groupRoutes.delete('/:id', async (c) => {
 
   await db.delete(groups).where(eq(groups.id, groupId));
 
-  await writeAuditLog({
-    userId: user.id,
+  await writeStructuredAuditLog({
     action: 'group.delete',
     resourceType: 'group',
     resourceId: groupId,
-    ip: clientIp(c),
-    metadata: { name: g.name },
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: { type: 'group', id: groupId, label: g.name },
+    result: { status: 'success', code: 200 },
+    details: { name: g.name, description: g.description },
   });
 
   return c.json({ ok: true });
