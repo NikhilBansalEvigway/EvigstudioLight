@@ -1,0 +1,55 @@
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: evigstudio-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: evigstudio
+      POSTGRES_PASSWORD: evigstudio
+      POSTGRES_DB: evigstudio
+    volumes:
+      - evigstudio_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evigstudio"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Node / Hono API ─────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: evigstudio-api
+    restart: unless-stopped
+    env_file: ./server/.env
+    environment:
+      DATABASE_URL: postgresql://evigstudio:evigstudio@db:5432/evigstudio
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── Nginx + React frontend (HTTPS) ──────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: src/Dockerfile
+    container_name: evigstudio-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
+
+networks:
+  default:
+    name: evigstudio-net
+
+volumes:
+  evigstudio_pgdata:

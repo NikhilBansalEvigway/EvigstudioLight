@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+drizzle/meta/
+# Ignore stray local DB files (this project uses PostgreSQL only)
+data/
+*.db

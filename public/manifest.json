@@ -1,0 +1,16 @@
+{
+  "name": "EvigStudio",
+  "short_name": "EvigStudio",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d1017",
+  "theme_color": "#17b8a6",
+  "description": "Local-first agentic coding assistant — languages, frameworks, databases, powered by local AI",
+  "icons": [
+    {
+      "src": "/favicon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
