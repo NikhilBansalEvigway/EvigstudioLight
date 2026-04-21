@@ -5,16 +5,18 @@ import type { ChatMode } from '@/types';
 interface ChatModeToggleProps {
   chatId: string;
   mode: ChatMode;
+  disabled?: boolean;
 }
 
-export function ChatModeToggle({ chatId, mode }: ChatModeToggleProps) {
+export function ChatModeToggle({ chatId, mode, disabled = false }: ChatModeToggleProps) {
   const { setChatMode, isStreaming } = useAppStore();
+  const isDisabled = disabled || isStreaming;
 
   return (
     <div className="inline-flex items-center rounded-full border border-border bg-muted/40 p-0.5 text-[11px]">
       <button
         type="button"
-        disabled={isStreaming}
+        disabled={isDisabled}
         onClick={() => setChatMode(chatId, 'chat')}
         className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 font-medium transition-all disabled:cursor-not-allowed ${
           mode === 'chat'
@@ -27,7 +29,7 @@ export function ChatModeToggle({ chatId, mode }: ChatModeToggleProps) {
       </button>
       <button
         type="button"
-        disabled={isStreaming}
+        disabled={isDisabled}
         onClick={() => setChatMode(chatId, 'agent')}
         className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 font-medium transition-all disabled:cursor-not-allowed ${
           mode === 'agent'

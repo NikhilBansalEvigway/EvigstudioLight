@@ -15,6 +15,12 @@ export interface Message {
 /** Default is private to the owner until shared with a group or org-wide. */
 export type ChatPrivacy = 'private' | 'shared' | 'group';
 
+export interface ChatAccess {
+  read: boolean;
+  write: boolean;
+  delete: boolean;
+}
+
 export interface ChatVersionSnapshot {
   id: string;
   savedAt: number;
@@ -35,9 +41,12 @@ export interface Chat {
   mode: ChatMode;
   /** Present when chat is loaded from team server */
   ownerId?: string;
+  ownerDisplayName?: string | null;
   groupId?: string | null;
+  groupName?: string | null;
   /** Who can see this chat besides the owner (server-enforced when using team API). */
   privacy?: ChatPrivacy;
+  access?: ChatAccess;
   /** Optional topic/session grouping for threaded navigation in the sidebar. */
   threadId?: string | null;
   threadTitle?: string | null;
@@ -61,13 +70,24 @@ export function normalizeChat(
     updatedAt: raw.updatedAt,
     mode,
     ownerId: raw.ownerId,
+    ownerDisplayName: raw.ownerDisplayName ?? null,
     groupId: raw.groupId ?? null,
+    groupName: raw.groupName ?? null,
     privacy,
+    access: raw.access ?? { read: true, write: true, delete: true },
     threadId: raw.threadId ?? null,
     threadTitle: raw.threadTitle ?? null,
     tags: Array.isArray(raw.tags) ? raw.tags : [],
     versionHistory: Array.isArray(raw.versionHistory) ? raw.versionHistory : [],
   };
+}
+
+export function canWriteChat(chat: Chat): boolean {
+  return chat.access?.write !== false;
+}
+
+export function canDeleteChat(chat: Chat): boolean {
+  return chat.access?.delete !== false;
 }
 
 export interface FileNode {

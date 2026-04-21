@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { Chat, ChatPrivacy } from '@/types';
+import { canWriteChat, type Chat, type ChatPrivacy } from '@/types';
 import { useAppStore } from '@/store/useAppStore';
 import { useAuth } from '@/contexts/AuthContext';
 import { getChatPersistenceMode } from '@/lib/chatPersistence';
@@ -67,6 +67,7 @@ export function ChatToolbar({ chat }: { chat: Chat }) {
   }, [serverMode]);
 
   const privacy = (chat.privacy ?? 'private') as ChatPrivacy;
+  const canWrite = canWriteChat(chat);
 
   const onThreadBlur = useCallback(() => {
     const t = threadTitle.trim();
@@ -155,6 +156,7 @@ export function ChatToolbar({ chat }: { chat: Chat }) {
               size="sm"
               variant="secondary"
               className="w-full text-xs"
+              disabled={!canWrite}
               onClick={() => {
                 saveVersionSnapshot(chat.id);
                 toast.success('Snapshot saved');
@@ -182,6 +184,7 @@ export function ChatToolbar({ chat }: { chat: Chat }) {
                       size="sm"
                       variant="outline"
                       className="shrink-0 h-7 text-[10px]"
+                      disabled={!canWrite}
                       onClick={() => {
                         restoreVersionSnapshot(chat.id, v.id);
                         toast.success('Restored snapshot');
@@ -198,9 +201,15 @@ export function ChatToolbar({ chat }: { chat: Chat }) {
 
         {serverMode && (
           <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+            {!canWrite && (
+              <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
+                Read only{chat.ownerDisplayName ? ` · ${chat.ownerDisplayName}` : ''}
+              </span>
+            )}
             <span className="text-muted-foreground hidden sm:inline">Visibility</span>
             <Select
               value={privacy}
+              disabled={!canWrite}
               onValueChange={(v) => {
                 const next = v as ChatPrivacy;
                 if (next === 'private') {
@@ -231,6 +240,7 @@ export function ChatToolbar({ chat }: { chat: Chat }) {
             {privacy === 'group' && (
               <Select
                 value={chat.groupId ?? ''}
+                disabled={!canWrite}
                 onValueChange={(gid) =>
                   updateChatFields(chat.id, { privacy: 'group', groupId: gid })
                 }
@@ -258,6 +268,7 @@ export function ChatToolbar({ chat }: { chat: Chat }) {
             value={threadTitle}
             onChange={(e) => setThreadTitle(e.target.value)}
             onBlur={onThreadBlur}
+            disabled={!canWrite}
             placeholder="Topic / session name"
             className="flex-1 min-w-0 bg-input rounded px-2 py-0.5 text-[11px] outline-none focus:ring-1 focus:ring-ring"
           />
@@ -268,6 +279,7 @@ export function ChatToolbar({ chat }: { chat: Chat }) {
             value={tagsStr}
             onChange={(e) => setTagsStr(e.target.value)}
             onBlur={onTagsBlur}
+            disabled={!canWrite}
             placeholder="comma, separated"
             className="flex-1 min-w-0 bg-input rounded px-2 py-0.5 text-[11px] outline-none focus:ring-1 focus:ring-ring"
           />

@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { and, desc, eq, inArray, or } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { chats } from '../db/schema.js';
+import { chats, groups, users } from '../db/schema.js';
 import { writeAuditLog } from '../audit.js';
 import type { HonoEnv } from '../middleware/session.js';
 import { canAccessChat, roleHasPermission } from '../rbac.js';
@@ -55,6 +55,30 @@ function clientIp(c: { req: { header: (n: string) => string | undefined } }): st
   return c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || c.req.header('x-real-ip') || '';
 }
 
+function serializeChat(
+  row: typeof chats.$inferSelect,
+  access: { read: boolean; write: boolean; delete: boolean },
+  extras?: { ownerDisplayName?: string | null; groupName?: string | null },
+) {
+  return {
+    id: row.id,
+    title: row.title,
+    messages: row.messages,
+    createdAt: row.createdAt.getTime(),
+    updatedAt: row.updatedAt.getTime(),
+    ownerId: row.ownerId,
+    ownerDisplayName: extras?.ownerDisplayName ?? null,
+    groupId: row.groupId,
+    groupName: extras?.groupName ?? null,
+    privacy: (row.privacy ?? 'private') as 'private' | 'shared' | 'group',
+    access,
+    threadId: row.threadId,
+    threadTitle: row.threadTitle,
+    tags: (row.tags as string[]) ?? [],
+    versionHistory: (row.versionHistory as unknown[]) ?? [],
+  };
+}
+
 chatRoutes.get('/', async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
@@ -64,33 +88,42 @@ chatRoutes.get('/', async (c) => {
 
   let rows;
   if (user.role === 'admin' || user.role === 'auditor') {
-    rows = await db.select().from(chats).orderBy(desc(chats.updatedAt));
+    rows = await db
+      .select({ chat: chats, ownerDisplayName: users.displayName, groupName: groups.name })
+      .from(chats)
+      .innerJoin(users, eq(chats.ownerId, users.id))
+      .leftJoin(groups, eq(chats.groupId, groups.id))
+      .orderBy(desc(chats.updatedAt));
   } else {
     const conds = [eq(chats.ownerId, user.id), eq(chats.privacy, 'shared')];
     if (groupIds.length > 0) {
       conds.push(and(eq(chats.privacy, 'group'), inArray(chats.groupId, groupIds))!);
     }
     rows = await db
-      .select()
+      .select({ chat: chats, ownerDisplayName: users.displayName, groupName: groups.name })
       .from(chats)
+      .innerJoin(users, eq(chats.ownerId, users.id))
+      .leftJoin(groups, eq(chats.groupId, groups.id))
       .where(or(...conds))
       .orderBy(desc(chats.updatedAt));
   }
 
-  const out = rows.map((r) => ({
-    id: r.id,
-    title: r.title,
-    messages: r.messages,
-    createdAt: r.createdAt.getTime(),
-    updatedAt: r.updatedAt.getTime(),
-    ownerId: r.ownerId,
-    groupId: r.groupId,
-    privacy: (r.privacy ?? 'private') as 'private' | 'shared' | 'group',
-    threadId: r.threadId,
-    threadTitle: r.threadTitle,
-    tags: (r.tags as string[]) ?? [],
-    versionHistory: (r.versionHistory as unknown[]) ?? [],
-  }));
+  const out = rows
+    .map((r) => {
+      const access = canAccessChat(user.role, {
+        userId: user.id,
+        chatOwnerId: r.chat.ownerId,
+        chatGroupId: r.chat.groupId,
+        chatPrivacy: (r.chat.privacy ?? 'private') as 'private' | 'shared' | 'group',
+        memberOfGroupIds: gidSet,
+      });
+      if (!access.read) return null;
+      return serializeChat(r.chat, access, {
+        ownerDisplayName: r.ownerDisplayName,
+        groupName: r.groupName,
+      });
+    })
+    .filter((row): row is NonNullable<typeof row> => row !== null);
 
   return c.json({ chats: out });
 });
@@ -146,20 +179,17 @@ chatRoutes.post('/', async (c) => {
   });
 
   return c.json({
-    chat: {
-      id: row.id,
-      title: row.title,
-      messages: row.messages,
-      createdAt: row.createdAt.getTime(),
-      updatedAt: row.updatedAt.getTime(),
-      ownerId: row.ownerId,
-      groupId: row.groupId,
-      privacy: (row.privacy ?? 'private') as 'private' | 'shared' | 'group',
-      threadId: row.threadId,
-      threadTitle: row.threadTitle,
-      tags: (row.tags as string[]) ?? [],
-      versionHistory: (row.versionHistory as unknown[]) ?? [],
-    },
+    chat: serializeChat(
+      row,
+      canAccessChat(user.role, {
+        userId: user.id,
+        chatOwnerId: row.ownerId,
+        chatGroupId: row.groupId,
+        chatPrivacy: (row.privacy ?? 'private') as 'private' | 'shared' | 'group',
+        memberOfGroupIds: new Set(await getUserGroupIds(user.id)),
+      }),
+      { ownerDisplayName: user.displayName },
+    ),
   });
 });
 
@@ -242,20 +272,17 @@ chatRoutes.put('/:id', async (c) => {
   });
 
   return c.json({
-    chat: {
-      id: row.id,
-      title: row.title,
-      messages: row.messages,
-      createdAt: row.createdAt.getTime(),
-      updatedAt: row.updatedAt.getTime(),
-      ownerId: row.ownerId,
-      groupId: row.groupId,
-      privacy: (row.privacy ?? 'private') as 'private' | 'shared' | 'group',
-      threadId: row.threadId,
-      threadTitle: row.threadTitle,
-      tags: (row.tags as string[]) ?? [],
-      versionHistory: (row.versionHistory as unknown[]) ?? [],
-    },
+    chat: serializeChat(
+      row,
+      canAccessChat(user.role, {
+        userId: user.id,
+        chatOwnerId: row.ownerId,
+        chatGroupId: row.groupId,
+        chatPrivacy: (row.privacy ?? 'private') as 'private' | 'shared' | 'group',
+        memberOfGroupIds: new Set(gids),
+      }),
+      { ownerDisplayName: user.displayName },
+    ),
   });
 });
 

@@ -1,9 +1,9 @@
 import { useAppStore } from '@/store/useAppStore';
 import { chatMatchesSearch, groupChatsForSidebar } from '@/lib/chatFilters';
 import { toast } from 'sonner';
-import { Plus, MessageSquare, Trash2, Search, Pencil, Check, X } from 'lucide-react';
+import { Plus, MessageSquare, Trash2, Search, Pencil, Check, X, Lock } from 'lucide-react';
 import { useState, useRef, useEffect, useCallback } from 'react';
-import type { Chat } from '@/types';
+import { canDeleteChat, canWriteChat, type Chat } from '@/types';
 import { format } from 'date-fns';
 
 type ChatRowProps = {
@@ -33,6 +33,9 @@ function ChatRow({
   startRename,
   deleteChat,
 }: ChatRowProps) {
+  const canWrite = canWriteChat(chat);
+  const canDelete = canDeleteChat(chat);
+
   return (
     <div
       onClick={() => editingId !== chat.id && selectChat(chat.id)}
@@ -84,30 +87,36 @@ function ChatRow({
           <div className="flex-1 min-w-0">
             <span className="block truncate">{chat.title}</span>
             <span className="block text-[10px] text-muted-foreground/80">
+              {chat.ownerDisplayName ? `${chat.ownerDisplayName} · ` : ''}
               {format(chat.updatedAt, 'MMM d, HH:mm')}
             </span>
           </div>
           <div className="flex items-center gap-0.5">
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                startRename(chat.id, chat.title);
-              }}
-              className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-primary transition-all"
-              title="Rename chat"
-            >
-              <Pencil className="w-3 h-3" />
-            </button>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                void deleteChat(chat.id);
-              }}
-              className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-destructive transition-all"
-              title="Delete chat"
-            >
-              <Trash2 className="w-3 h-3" />
-            </button>
+            {!canWrite && <Lock className="w-3 h-3 text-muted-foreground" />}
+            {canWrite && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  startRename(chat.id, chat.title);
+                }}
+                className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-primary transition-all"
+                title="Rename chat"
+              >
+                <Pencil className="w-3 h-3" />
+              </button>
+            )}
+            {canDelete && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void deleteChat(chat.id);
+                }}
+                className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-destructive transition-all"
+                title="Delete chat"
+              >
+                <Trash2 className="w-3 h-3" />
+              </button>
+            )}
           </div>
         </>
       )}

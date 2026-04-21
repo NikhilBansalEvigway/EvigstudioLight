@@ -1,5 +1,5 @@
 import { toast } from 'sonner';
-import type { Chat, ChatPrivacy, ChatVersionSnapshot } from '@/types';
+import type { Chat, ChatAccess, ChatPrivacy, ChatVersionSnapshot } from '@/types';
 import { normalizeChat } from '@/types';
 import { loadChats, saveChat, deleteChat as deleteChatIdb } from '@/lib/storage';
 
@@ -23,8 +23,11 @@ function mapServerRow(row: {
   createdAt: number;
   updatedAt: number;
   ownerId?: string;
+  ownerDisplayName?: string | null;
   groupId?: string | null;
+  groupName?: string | null;
   privacy?: ChatPrivacy;
+  access?: ChatAccess;
   threadId?: string | null;
   threadTitle?: string | null;
   tags?: string[];
@@ -37,8 +40,11 @@ function mapServerRow(row: {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     ownerId: row.ownerId,
+    ownerDisplayName: row.ownerDisplayName ?? null,
     groupId: row.groupId ?? null,
+    groupName: row.groupName ?? null,
     privacy: row.privacy,
+    access: row.access,
     threadId: row.threadId ?? null,
     threadTitle: row.threadTitle ?? null,
     tags: row.tags,

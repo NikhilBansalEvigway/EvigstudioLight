@@ -16,6 +16,7 @@ import { FileMentionPopover } from '@/components/FileMentionPopover';
 import {
   AGENT_SYSTEM_PROMPT,
   CHAT_SYSTEM_PROMPT,
+  canWriteChat,
   getMessageText,
   type Message,
   type ContentPart,
@@ -24,7 +25,7 @@ import {
 import { getChatPersistenceMode, persistenceSaveChat } from '@/lib/chatPersistence';
 import { ChatToolbar } from '@/components/ChatToolbar';
 import { useSpeechDictation } from '@/hooks/useSpeechDictation';
-import { Send, ImagePlus, Loader2, StopCircle, Zap, FileCode, X, Mic, Bot, MessageSquare } from 'lucide-react';
+import { Send, ImagePlus, Loader2, StopCircle, FileCode, X, Mic, Bot, MessageSquare, Lock } from 'lucide-react';
 import { toast } from 'sonner';
 
 const KEY_PROJECT_FILES = [
@@ -81,6 +82,7 @@ export function ChatPane() {
   );
 
   const activeChat = chats.find(c => c.id === activeChatId);
+  const isLocked = activeChat ? !canWriteChat(activeChat) : false;
   const chatMode = activeChat?.mode ?? 'agent';
   const isAgent = chatMode === 'agent';
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -359,6 +361,10 @@ export function ChatPane() {
 
   const handleSend = useCallback(async () => {
     if ((!input.trim() && images.length === 0) || isStreaming) return;
+    if (activeChat && !canWriteChat(activeChat)) {
+      toast.error('This conversation is locked. Start a new chat to continue.');
+      return;
+    }
 
     const currentMode = useAppStore.getState().chats.find((c) => c.id === activeChatId)?.mode ?? 'agent';
     const isAgentMode = currentMode === 'agent';
@@ -552,6 +558,7 @@ export function ChatPane() {
   }, [
     input,
     images,
+    activeChat,
     activeChatId,
     isStreaming,
     settings,
@@ -611,12 +618,24 @@ export function ChatPane() {
           <span className="truncate min-w-0">{activeChat?.title || 'New Chat'}</span>
           <div className="ml-auto shrink-0">
             {activeChat && (
-              <ChatModeToggle chatId={activeChat.id} mode={chatMode} />
+              <ChatModeToggle chatId={activeChat.id} mode={chatMode} disabled={isLocked} />
             )}
           </div>
         </div>
         {activeChat && <ChatToolbar chat={activeChat} />}
       </div>
+
+      {activeChat && isLocked && (
+        <div className="border-b border-border bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground sm:px-5">
+          <div className="flex items-center gap-2">
+            <Lock className="h-3 w-3 shrink-0" />
+            <span>
+              Read-only conversation{activeChat.ownerDisplayName ? ` from ${activeChat.ownerDisplayName}` : ''}.
+              Only the owner can continue or edit it.
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Messages */}
       <div ref={scrollContainerRef} className="flex-1 space-y-4 overflow-y-auto px-3 py-3 sm:px-5">
@@ -709,7 +728,7 @@ export function ChatPane() {
           <button
             type="button"
             onClick={() => toggleDictation()}
-            disabled={!sttSupported || isStreaming}
+            disabled={!sttSupported || isStreaming || isLocked}
             className={`shrink-0 rounded p-2 transition-colors hover:bg-secondary ${
               dictating
                 ? 'bg-primary/15 text-primary ring-2 ring-primary/40'
@@ -722,6 +741,7 @@ export function ChatPane() {
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
+            disabled={isLocked}
             className="shrink-0 rounded p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
             title="Attach image for vision"
           >
@@ -748,6 +768,7 @@ export function ChatPane() {
               value={input}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
+              disabled={isLocked}
               placeholder={isAgent ? 'Describe what to build, fix, or change… (@ file)' : 'Ask anything…'}
               rows={2}
               className="min-h-[48px] w-full resize-none rounded-lg border border-border/80 bg-input px-3 py-3 text-base leading-snug outline-none ring-2 ring-transparent transition-shadow placeholder:text-muted-foreground focus:border-primary/40 focus:ring-primary/30 sm:min-h-[44px] sm:py-2.5 sm:text-sm"
@@ -765,7 +786,7 @@ export function ChatPane() {
             <button
               type="button"
               onClick={handleSend}
-              disabled={!input.trim() && images.length === 0 && mentionedFiles.length === 0}
+              disabled={isLocked || (!input.trim() && images.length === 0 && mentionedFiles.length === 0)}
               className="glow-primary shrink-0 rounded bg-primary p-2.5 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30 sm:p-2"
             >
               <Send className="h-5 w-5 sm:h-4 sm:w-4" />

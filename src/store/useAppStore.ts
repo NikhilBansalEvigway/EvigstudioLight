@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { toast } from 'sonner';
 import type { Chat, ChatMode, ChatVersionSnapshot, Message, FileNode, AppSettings } from '@/types';
-import { DEFAULT_SETTINGS, normalizeChat } from '@/types';
+import { DEFAULT_SETTINGS, canDeleteChat, canWriteChat, normalizeChat } from '@/types';
 import { loadSettings, saveSettings } from '@/lib/storage';
 import {
   getChatPersistenceMode,
@@ -122,6 +122,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectChat: (id) => set({ activeChatId: id }),
   deleteChat: async (id) => {
     try {
+      const chat = get().chats.find((c) => c.id === id);
+      if (chat && !canDeleteChat(chat)) {
+        toast.error('This conversation is locked. Only the owner can delete it.');
+        return;
+      }
       await persistenceDeleteChat(id);
       set((s) => ({
         chats: s.chats.filter((c) => c.id !== id),
@@ -140,6 +145,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const chats = s.chats.map((c) => {
         if (c.id !== id) return c;
+        if (!canWriteChat(c)) return c;
         const updated = normalizeChat({ ...c, title, updatedAt: Date.now() });
         void persistenceSaveChat(updated).catch((err) => console.error('[EvigStudio] rename save', err));
         return updated;
@@ -151,6 +157,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const chats = s.chats.map((c) => {
         if (c.id !== chatId) return c;
+        if (!canWriteChat(c)) return c;
         const updated = normalizeChat({
           ...c,
           messages: [...c.messages, msg],
@@ -185,6 +192,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const chats = s.chats.map((c) => {
         if (c.id !== chatId) return c;
+        if (!canWriteChat(c)) return c;
         const merged = { ...c, ...patch, updatedAt: Date.now() };
         const updated = normalizeChat(merged);
         void persistenceSaveChat(updated).catch((err) =>
@@ -199,6 +207,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const chats = s.chats.map((c) => {
         if (c.id !== chatId) return c;
+        if (!canWriteChat(c)) return c;
         const updated = normalizeChat({ ...c, mode, updatedAt: Date.now() });
         void persistenceSaveChat(updated).catch((err) =>
           console.error('[EvigStudio] setChatMode save', err),
@@ -213,6 +222,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const chats = s.chats.map((c) => {
         if (c.id !== chatId) return c;
+        if (!canWriteChat(c)) return c;
         const snap: ChatVersionSnapshot = {
           id: crypto.randomUUID(),
           savedAt: Date.now(),
@@ -234,6 +244,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const chats = s.chats.map((c) => {
         if (c.id !== chatId) return c;
+        if (!canWriteChat(c)) return c;
         const snap = c.versionHistory?.find((v) => v.id === snapshotId);
         if (!snap) return c;
         const updated = normalizeChat({

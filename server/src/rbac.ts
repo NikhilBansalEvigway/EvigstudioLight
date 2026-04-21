@@ -59,18 +59,15 @@ export function canAccessChat(
   const privacy: ChatPrivacy =
     opts.chatPrivacy === 'shared' || opts.chatPrivacy === 'group' ? opts.chatPrivacy : 'private';
 
-  if (role === 'admin') {
-    return { read: true, write: true, delete: true };
-  }
-  if (role === 'auditor') {
-    return { read: true, write: false, delete: false };
-  }
   if (isOwner) {
     return {
-      read: roleHasPermission(role, 'chats.read_own'),
-      write: roleHasPermission(role, 'chats.write_own'),
+      read: roleHasPermission(role, 'chats.read_own') || roleHasPermission(role, 'chats.read_all'),
+      write: roleHasPermission(role, 'chats.write_own') || roleHasPermission(role, 'chats.write_all'),
       delete: roleHasPermission(role, 'chats.delete_own'),
     };
+  }
+  if (roleHasPermission(role, 'chats.read_all')) {
+    return { read: true, write: false, delete: false };
   }
   if (privacy === 'private') {
     return { read: false, write: false, delete: false };
@@ -79,11 +76,8 @@ export function canAccessChat(
     const read = roleHasPermission(role, 'chats.read_own');
     return { read, write: false, delete: false };
   }
-  if (privacy === 'group' && inSharedGroup && (role === 'developer' || role === 'tester')) {
-    return { read: true, write: true, delete: false };
-  }
-  if (roleHasPermission(role, 'chats.read_all')) {
-    return { read: true, write: roleHasPermission(role, 'chats.write_all'), delete: false };
+  if (privacy === 'group' && inSharedGroup) {
+    return { read: roleHasPermission(role, 'chats.read_own'), write: false, delete: false };
   }
   return { read: false, write: false, delete: false };
 }
