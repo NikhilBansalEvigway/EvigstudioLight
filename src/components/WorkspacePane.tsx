@@ -114,42 +114,63 @@ export function WorkspacePane() {
       <div className="flex-1 overflow-hidden">
         {rightPaneTab === 'files' && (
           <div className="flex flex-col h-full">
-            <div className="flex items-center gap-1 px-2 py-1.5 border-b border-border">
-              <button onClick={handleOpenFolder} className="flex items-center gap-1 px-2 py-1 rounded bg-primary/15 text-primary text-[10px] hover:bg-primary/25 transition-colors">
-                <FolderOpen className="w-3 h-3" /> {workspaceHandle ? 'Change Folder' : 'Open Folder'}
-              </button>
-              {workspaceHandle && (
-                <>
-                  <button onClick={handleRefresh} className="px-2 py-1 rounded text-[10px] text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors">
-                    Refresh
-                  </button>
-                  <button onClick={() => setShowNewFile(!showNewFile)} className="px-1 py-1 rounded text-muted-foreground hover:text-primary transition-colors">
-                    <FilePlus className="w-3 h-3" />
-                  </button>
-                </>
-              )}
+            <div className="border-b border-border bg-gradient-to-b from-card via-card to-muted/20 px-2 py-2">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  onClick={handleOpenFolder}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-primary/20 bg-primary/10 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-primary transition-all hover:-translate-y-0.5 hover:bg-primary/15"
+                >
+                  <FolderOpen className="h-3.5 w-3.5" />
+                  {workspaceHandle ? 'Change Folder' : 'Open Folder'}
+                </button>
+                {workspaceHandle && (
+                  <>
+                    <button
+                      onClick={handleRefresh}
+                      className="rounded-xl border border-border/70 bg-background px-2.5 py-1.5 text-[10px] font-medium text-muted-foreground transition-all hover:border-primary/20 hover:text-foreground"
+                    >
+                      Refresh
+                    </button>
+                    <button
+                      onClick={() => setShowNewFile(!showNewFile)}
+                      className={`rounded-xl border px-2.5 py-1.5 text-[10px] font-medium transition-all ${showNewFile
+                        ? 'border-primary/20 bg-primary/10 text-primary'
+                        : 'border-border/70 bg-background text-muted-foreground hover:border-primary/20 hover:text-primary'}`}
+                      title="Quick create file"
+                    >
+                      <span className="inline-flex items-center gap-1">
+                        <FilePlus className="h-3.5 w-3.5" />
+                        Quick file
+                      </span>
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
             {!fsSupported && (
-              <div className="flex items-start gap-2 px-3 py-2 bg-warning/10 border-b border-warning/20 text-[10px]">
-                <AlertTriangle className="w-3 h-3 text-warning shrink-0 mt-0.5" />
+              <div className="flex items-start gap-2 border-b border-warning/20 bg-warning/10 px-3 py-2 text-[10px]">
+                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-warning" />
                 <span className="text-warning">File System Access requires Chrome or Edge. Firefox/Safari not supported.</span>
               </div>
             )}
             {showNewFile && workspaceHandle && (
-              <div className="flex items-center gap-1 px-2 py-1.5 border-b border-border">
+              <div className="flex items-center gap-1.5 border-b border-border px-2 py-2 animate-fade-in">
                 <input
                   value={newFileName}
                   onChange={e => setNewFileName(e.target.value)}
                   onKeyDown={e => e.key === 'Enter' && handleCreateFile()}
                   placeholder="path/to/file.vhd"
-                  className="flex-1 bg-input rounded px-2 py-1 text-[10px] outline-none focus:ring-1 focus:ring-ring"
+                  className="flex-1 rounded-xl border border-border/70 bg-input px-3 py-2 text-[10px] outline-none focus:ring-1 focus:ring-ring"
                 />
-                <button onClick={handleCreateFile} className="px-2 py-1 rounded bg-accent/20 text-accent text-[10px]">Create</button>
+                <button onClick={handleCreateFile} className="rounded-xl bg-accent/15 px-3 py-2 text-[10px] font-semibold text-accent transition-colors hover:bg-accent/25">Create</button>
               </div>
             )}
             {workspaceHandle && (
-              <div className="text-[10px] text-muted-foreground px-2 py-1 border-b border-border/50">
-                📂 {workspaceHandle.name}
+              <div className="border-b border-border/60 px-2 py-1.5 text-[10px] text-muted-foreground">
+                <div className="inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-background px-2.5 py-1">
+                  <FolderOpen className="h-3 w-3 text-primary" />
+                  <span className="max-w-[220px] truncate font-medium text-foreground/90">{workspaceHandle.name}</span>
+                </div>
               </div>
             )}
             <div className="flex-1 overflow-y-auto">
