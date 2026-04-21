@@ -3,8 +3,9 @@ services:
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
   db:
     image: postgres:16-alpine
-    container_name: evigstudio-db
     restart: unless-stopped
+    ports:
+      - "5434:5432"
     environment:
       POSTGRES_USER: evigstudio
       POSTGRES_PASSWORD: evigstudio
@@ -22,7 +23,6 @@ services:
     build:
       context: ./server
       dockerfile: Dockerfile
-    container_name: evigstudio-api
     restart: unless-stopped
     env_file: ./server/.env
     environment:
@@ -39,7 +39,6 @@ services:
     build:
       context: .
       dockerfile: src/Dockerfile
-    container_name: evigstudio-frontend
     restart: unless-stopped
     ports:
       - "80:80"
