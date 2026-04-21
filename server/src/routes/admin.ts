@@ -262,6 +262,19 @@ adminRoutes.patch('/users/:id', async (c) => {
     }
   }
 
+  if (parsed.data.password !== undefined && target.id === adminUser.id) {
+    await writeStructuredAuditLog({
+      action: 'admin.user_update',
+      resourceType: 'user',
+      resourceId: id,
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      target: { type: 'user', id, label: target.email },
+      result: { status: 'denied', code: 400, reason: 'use_self_password_change' },
+    });
+    return c.json({ error: 'Use the account password change form for your own password' }, 400);
+  }
+
   const patch: Partial<typeof users.$inferInsert> = {};
   if (parsed.data.email !== undefined) patch.email = parsed.data.email.toLowerCase();
   if (parsed.data.displayName !== undefined) patch.displayName = parsed.data.displayName;
@@ -315,6 +328,76 @@ adminRoutes.patch('/users/:id', async (c) => {
     console.error(e);
     return c.json({ error: 'Update failed' }, 500);
   }
+});
+
+const changeUserPasswordSchema = z.object({
+  password: z.string().min(8).max(128),
+});
+
+adminRoutes.patch('/users/:id/password', async (c) => {
+  const adminUser = c.get('user');
+  if (!adminUser) return c.json({ error: 'Unauthorized' }, 401);
+  if (adminUser.role !== 'admin') {
+    await writeStructuredAuditLog({
+      action: 'admin.user_password_change',
+      resourceType: 'user',
+      resourceId: c.req.param('id'),
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'denied', code: 403, reason: 'admin_only' },
+    });
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const id = c.req.param('id');
+  const parsed = changeUserPasswordSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    await writeStructuredAuditLog({
+      action: 'admin.user_password_change',
+      resourceType: 'user',
+      resourceId: id,
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'error', code: 400, reason: 'invalid_payload' },
+    });
+    return c.json({ error: 'Invalid payload' }, 400);
+  }
+
+  const [target] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  if (!target) return c.json({ error: 'User not found' }, 404);
+
+  if (target.id === adminUser.id) {
+    await writeStructuredAuditLog({
+      action: 'admin.user_password_change',
+      resourceType: 'user',
+      resourceId: id,
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      target: { type: 'user', id, label: target.email },
+      result: { status: 'denied', code: 400, reason: 'use_self_password_change' },
+    });
+    return c.json({ error: 'Use the account password change form for your own password' }, 400);
+  }
+
+  const passwordHash = await bcrypt.hash(parsed.data.password, 10);
+  await db.update(users).set({ passwordHash }).where(eq(users.id, id));
+
+  await writeStructuredAuditLog({
+    action: 'admin.user_password_change',
+    resourceType: 'user',
+    resourceId: id,
+    actor: auditActorSnapshot(adminUser),
+    context: auditRequestContext(c),
+    target: { type: 'user', id, label: target.email },
+    change: {
+      fields: ['password'],
+      before: { passwordChanged: false },
+      after: { passwordChanged: true },
+    },
+    result: { status: 'success', code: 200 },
+  });
+
+  return c.json({ ok: true });
 });
 
 const patchRoleSchema = z.object({

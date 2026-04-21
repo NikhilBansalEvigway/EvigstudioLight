@@ -2,7 +2,7 @@ import { useAppStore } from '@/store/useAppStore';
 import { FileTree } from '@/components/FileTree';
 import { pickDirectory, buildFileTree, isFileSystemAccessSupported, writeFile, getFileExtension } from '@/lib/fsWorkspace';
 import { SYSTEM_PROMPT } from '@/types';
-import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus } from 'lucide-react';
+import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useState, useCallback } from 'react';
 import { useTheme } from 'next-themes';
@@ -27,7 +27,7 @@ export function WorkspacePane() {
   const {
     rightPaneTab, setRightPaneTab,
     workspaceHandle, setWorkspaceHandle, setFileTree,
-    activeFilePath, activeFileContent, setActiveFileContent,
+    openEditorTabs, activeFilePath, activeFileContent, setActiveFileContent, setActiveEditorFile, closeEditorFile,
     contextFiles, toggleContextFile, clearContextFiles,
   } = useAppStore();
 
@@ -183,6 +183,41 @@ export function WorkspacePane() {
           <div className="flex flex-col h-full">
             {activeFilePath ? (
               <>
+                {openEditorTabs.length > 0 && (
+                  <div className="flex items-center gap-1 overflow-x-auto border-b border-border bg-muted/20 px-2 py-1.5">
+                    {openEditorTabs.map((tab) => {
+                      const isActive = tab.path === activeFilePath;
+                      const shortName = tab.path.split('/').pop() ?? tab.path;
+                      return (
+                        <div
+                          key={tab.path}
+                          className={`group inline-flex max-w-[220px] shrink-0 items-center gap-1 rounded-xl border px-2 py-1 text-[10px] transition-colors ${
+                            isActive
+                              ? 'border-primary/30 bg-primary/10 text-primary'
+                              : 'border-border/70 bg-background text-muted-foreground hover:border-primary/20 hover:text-foreground'
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => setActiveEditorFile(tab.path)}
+                            className="min-w-0 flex-1 truncate text-left"
+                            title={tab.path}
+                          >
+                            {shortName}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => closeEditorFile(tab.path)}
+                            className="rounded p-0.5 text-current/70 transition-colors hover:bg-background/70 hover:text-foreground"
+                            title={`Close ${tab.path}`}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
                 <div className="flex items-center justify-between px-3 py-1.5 border-b border-border">
                   <span className="text-[10px] text-muted-foreground truncate">{activeFilePath}</span>
                   <button

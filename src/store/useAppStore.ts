@@ -12,6 +12,11 @@ import {
   persistenceSaveChat,
 } from '@/lib/chatPersistence';
 
+export interface EditorTab {
+  path: string;
+  content: string;
+}
+
 interface AppState {
   // Settings
   settings: AppSettings;
@@ -51,10 +56,15 @@ interface AppState {
   clearContextFiles: () => void;
 
   // Editor
+  openEditorTabs: EditorTab[];
   activeFilePath: string | null;
   activeFileContent: string;
   setActiveFile: (path: string | null, content: string) => void;
+  setActiveEditorFile: (path: string) => void;
   setActiveFileContent: (content: string) => void;
+  syncEditorFileContent: (path: string, content: string) => void;
+  closeEditorFile: (path: string) => void;
+  renameEditorFile: (oldPath: string, newPath: string, content?: string) => void;
 
   // UI
   showSettings: boolean;
@@ -301,11 +311,84 @@ export const useAppStore = create<AppState>((set, get) => ({
     })),
   clearContextFiles: () => set({ contextFiles: [] }),
 
+  openEditorTabs: [],
   activeFilePath: null,
   activeFileContent: '',
   setActiveFile: (path, content) =>
-    set({ activeFilePath: path, activeFileContent: content, rightPaneTab: 'editor' }),
-  setActiveFileContent: (content) => set({ activeFileContent: content }),
+    set((s) => {
+      if (!path) {
+        return { activeFilePath: null, activeFileContent: '', rightPaneTab: 'editor' };
+      }
+
+      const existingTab = s.openEditorTabs.find((tab) => tab.path === path);
+      return {
+        openEditorTabs: existingTab ? s.openEditorTabs : [...s.openEditorTabs, { path, content }],
+        activeFilePath: path,
+        activeFileContent: existingTab?.content ?? content,
+        rightPaneTab: 'editor',
+      };
+    }),
+  setActiveEditorFile: (path) =>
+    set((s) => {
+      const tab = s.openEditorTabs.find((item) => item.path === path);
+      if (!tab) return {};
+      return {
+        activeFilePath: tab.path,
+        activeFileContent: tab.content,
+        rightPaneTab: 'editor',
+      };
+    }),
+  setActiveFileContent: (content) =>
+    set((s) => {
+      if (!s.activeFilePath) return { activeFileContent: content };
+      return {
+        activeFileContent: content,
+        openEditorTabs: s.openEditorTabs.map((tab) =>
+          tab.path === s.activeFilePath ? { ...tab, content } : tab,
+        ),
+      };
+    }),
+  syncEditorFileContent: (path, content) =>
+    set((s) => {
+      const hasOpenTab = s.openEditorTabs.some((tab) => tab.path === path);
+      if (!hasOpenTab) return {};
+      return {
+        openEditorTabs: s.openEditorTabs.map((tab) =>
+          tab.path === path ? { ...tab, content } : tab,
+        ),
+        ...(s.activeFilePath === path ? { activeFileContent: content } : {}),
+      };
+    }),
+  closeEditorFile: (path) =>
+    set((s) => {
+      const nextTabs = s.openEditorTabs.filter((tab) => tab.path !== path);
+      if (s.activeFilePath !== path) {
+        return { openEditorTabs: nextTabs };
+      }
+      const nextActive = nextTabs[nextTabs.length - 1] ?? null;
+      return {
+        openEditorTabs: nextTabs,
+        activeFilePath: nextActive?.path ?? null,
+        activeFileContent: nextActive?.content ?? '',
+      };
+    }),
+  renameEditorFile: (oldPath, newPath, content) =>
+    set((s) => {
+      const updatedTabs = s.openEditorTabs.map((tab) =>
+        tab.path === oldPath ? { path: newPath, content: content ?? tab.content } : tab,
+      );
+      if (!updatedTabs.some((tab) => tab.path === newPath)) return {};
+      const renamedTab = updatedTabs.find((tab) => tab.path === newPath);
+      return {
+        openEditorTabs: updatedTabs,
+        ...(s.activeFilePath === oldPath
+          ? {
+              activeFilePath: newPath,
+              activeFileContent: renamedTab?.content ?? content ?? s.activeFileContent,
+            }
+          : {}),
+      };
+    }),
 
   showSettings: false,
   setShowSettings: (v) => set({ showSettings: v }),

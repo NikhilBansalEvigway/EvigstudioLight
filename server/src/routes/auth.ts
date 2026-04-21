@@ -23,6 +23,11 @@ const loginSchema = z.object({
   password: z.string().min(1).max(128),
 });
 
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1).max(128),
+  newPassword: z.string().min(8).max(128),
+});
+
 authRoutes.post('/register', async (c) => {
   const body = registerSchema.safeParse(await c.req.json());
   if (!body.success) return c.json({ error: 'Invalid payload' }, 400);
@@ -160,6 +165,73 @@ authRoutes.post('/logout', async (c) => {
       result: { status: 'success', code: 200 },
     });
   }
+  return c.json({ ok: true });
+});
+
+authRoutes.post('/change-password', async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  const body = changePasswordSchema.safeParse(await c.req.json());
+  if (!body.success) {
+    await writeStructuredAuditLog({
+      action: 'auth.password_change',
+      resourceType: 'user',
+      resourceId: user.id,
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      target: { type: 'user', id: user.id, label: user.email },
+      result: { status: 'error', code: 400, reason: 'invalid_payload' },
+    });
+    return c.json({ error: 'Invalid payload' }, 400);
+  }
+
+  const matchesCurrent = await bcrypt.compare(body.data.currentPassword, user.passwordHash);
+  if (!matchesCurrent) {
+    await writeStructuredAuditLog({
+      action: 'auth.password_change',
+      resourceType: 'user',
+      resourceId: user.id,
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      target: { type: 'user', id: user.id, label: user.email },
+      result: { status: 'denied', code: 400, reason: 'invalid_current_password' },
+    });
+    return c.json({ error: 'Current password is incorrect' }, 400);
+  }
+
+  const reusesCurrent = await bcrypt.compare(body.data.newPassword, user.passwordHash);
+  if (reusesCurrent) {
+    await writeStructuredAuditLog({
+      action: 'auth.password_change',
+      resourceType: 'user',
+      resourceId: user.id,
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      target: { type: 'user', id: user.id, label: user.email },
+      result: { status: 'denied', code: 400, reason: 'password_unchanged' },
+    });
+    return c.json({ error: 'New password must be different from the current password' }, 400);
+  }
+
+  const passwordHash = await bcrypt.hash(body.data.newPassword, 10);
+  await db.update(users).set({ passwordHash }).where(eq(users.id, user.id));
+
+  await writeStructuredAuditLog({
+    action: 'auth.password_change',
+    resourceType: 'user',
+    resourceId: user.id,
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: { type: 'user', id: user.id, label: user.email },
+    change: {
+      fields: ['password'],
+      before: { passwordChanged: false },
+      after: { passwordChanged: true },
+    },
+    result: { status: 'success', code: 200 },
+  });
+
   return c.json({ ok: true });
 });
 

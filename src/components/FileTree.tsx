@@ -161,8 +161,10 @@ function getFileVisual(name: string): { Icon: LucideIcon; iconClassName: string;
 export function FileTree() {
   const {
     activeFilePath,
+    closeEditorFile,
     contextFiles,
     fileTree,
+    renameEditorFile,
     setActiveFile,
     setFileTree,
     toggleContextFile,
@@ -205,23 +207,24 @@ export function FileTree() {
     if (!deleteTarget || !workspaceHandle) return;
     try {
       await deleteFileOrDir(workspaceHandle, deleteTarget.path);
-      if (activeFilePath === deleteTarget.path) setActiveFile(null, '');
+      closeEditorFile(deleteTarget.path);
       await refreshTree();
     } catch (err: any) {
       console.error('Delete failed:', err);
     }
     setDeleteTarget(null);
-  }, [deleteTarget, workspaceHandle, activeFilePath, setActiveFile, refreshTree]);
+  }, [deleteTarget, workspaceHandle, closeEditorFile, refreshTree]);
 
   const handleRename = useCallback(async () => {
     if (!renameTarget || !workspaceHandle || !renameName.trim()) return;
     try {
       await renameFileOrDir(workspaceHandle, renameTarget.path, renameName.trim());
+      const parts = renameTarget.path.split('/');
+      parts[parts.length - 1] = renameName.trim();
+      const newPath = parts.join('/');
+      const content = await readFile(workspaceHandle, newPath);
+      renameEditorFile(renameTarget.path, newPath, content);
       if (activeFilePath === renameTarget.path) {
-        const parts = renameTarget.path.split('/');
-        parts[parts.length - 1] = renameName.trim();
-        const newPath = parts.join('/');
-        const content = await readFile(workspaceHandle, newPath);
         setActiveFile(newPath, content);
       }
       await refreshTree();
@@ -230,7 +233,7 @@ export function FileTree() {
     }
     setRenameTarget(null);
     setRenameName('');
-  }, [renameTarget, workspaceHandle, renameName, activeFilePath, setActiveFile, refreshTree]);
+  }, [renameTarget, workspaceHandle, renameName, activeFilePath, renameEditorFile, setActiveFile, refreshTree]);
 
   const handleCreate = useCallback(async () => {
     if (!createState || !workspaceHandle || !createName.trim()) return;

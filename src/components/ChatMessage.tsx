@@ -10,6 +10,9 @@ import {
   Check,
   Bot,
   User,
+  Pencil,
+  RotateCcw,
+  Loader2,
   FileCode,
   Play,
   Eye,
@@ -20,7 +23,7 @@ import {
   FolderOpen,
   FileSearch,
 } from 'lucide-react';
-import { useState, useCallback, useLayoutEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 import { DiffViewer } from '@/components/DiffViewer';
 import { MessageTtsBar } from '@/components/MessageTtsBar';
 
@@ -31,6 +34,10 @@ interface ChatMessageProps {
   onGetOriginal?: (filePath: string) => Promise<string>;
   autoAppliedPaths?: string[];
   agentActions?: AgentAction[];
+  onOpenFile?: (filePath: string) => void;
+  onSubmitEdit?: (messageId: string, text: string) => Promise<void>;
+  onRegenerate?: (messageId: string) => Promise<void>;
+  busy?: boolean;
 }
 
 export function ChatMessage({
@@ -40,7 +47,16 @@ export function ChatMessage({
   onGetOriginal,
   autoAppliedPaths,
   agentActions,
+  onOpenFile,
+  onSubmitEdit,
+  onRegenerate,
+  busy = false,
 }: ChatMessageProps) {
+  const [copied, setCopied] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [draftText, setDraftText] = useState('');
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
+  const [isRegenerating, setIsRegenerating] = useState(false);
   const rawText = getMessageText(message);
   const images = getImages(message);
   const isAgent = chatMode === 'agent';
@@ -58,9 +74,58 @@ export function ChatMessage({
     isAgent && message.role === 'assistant' && (agentActions?.length ?? 0) > 0;
   const showAutoAppliedBadges =
     isAgent && message.role === 'assistant' && !showAgentActionBadges && (autoAppliedPaths?.length ?? 0) > 0;
+  const canCopyMessage = displayText.trim().length > 0 && !isEditing;
+  const canEditMessage =
+    !busy &&
+    message.role === 'user' &&
+    typeof message.content === 'string' &&
+    !hasImages(message) &&
+    !!onSubmitEdit &&
+    rawText.trim().length > 0;
+  const canRegenerateMessage = !busy && message.role === 'assistant' && !!onRegenerate;
+
+  useEffect(() => {
+    if (!isEditing) {
+      setDraftText(rawText);
+    }
+  }, [isEditing, rawText]);
+
+  const handleCopyMessage = useCallback(() => {
+    const text = displayText.trim() || rawText.trim();
+    if (!text) return;
+    void navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }, [displayText, rawText]);
+
+  const handleSubmitEdit = useCallback(async () => {
+    const trimmed = draftText.trim();
+    if (!onSubmitEdit || !trimmed || trimmed === rawText.trim()) {
+      setIsEditing(false);
+      return;
+    }
+
+    setIsSavingEdit(true);
+    try {
+      await onSubmitEdit(message.id, trimmed);
+      setIsEditing(false);
+    } finally {
+      setIsSavingEdit(false);
+    }
+  }, [draftText, message.id, onSubmitEdit, rawText]);
+
+  const handleRegenerate = useCallback(async () => {
+    if (!onRegenerate) return;
+    setIsRegenerating(true);
+    try {
+      await onRegenerate(message.id);
+    } finally {
+      setIsRegenerating(false);
+    }
+  }, [message.id, onRegenerate]);
 
   return (
-    <div className={`flex gap-3 animate-fade-in ${message.role === 'user' ? 'justify-end' : ''}`}>
+    <div className={`group flex gap-3 animate-fade-in ${message.role === 'user' ? 'justify-end' : ''}`}>
       {message.role === 'assistant' && (
         <div className="w-6 h-6 rounded bg-primary/20 flex items-center justify-center shrink-0 mt-1">
           <Bot className="w-3.5 h-3.5 text-primary" />
@@ -82,7 +147,50 @@ export function ChatMessage({
           </div>
         )}
 
-        {displayText.trim().length > 0 && (
+        {isEditing ? (
+          <div className="space-y-2">
+            <textarea
+              value={draftText}
+              onChange={(event) => setDraftText(event.target.value)}
+              onKeyDown={(event) => {
+                if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                  event.preventDefault();
+                  void handleSubmitEdit();
+                }
+                if (event.key === 'Escape') {
+                  event.preventDefault();
+                  setIsEditing(false);
+                  setDraftText(rawText);
+                }
+              }}
+              rows={Math.min(10, Math.max(3, draftText.split('\n').length))}
+              className="min-h-[96px] w-full resize-y rounded-lg border border-border/80 bg-background px-3 py-2 text-sm leading-relaxed outline-none ring-2 ring-transparent transition-shadow focus:border-primary/40 focus:ring-primary/30"
+            />
+            <div className="flex items-center justify-end gap-2 text-[11px]">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsEditing(false);
+                  setDraftText(rawText);
+                }}
+                disabled={isSavingEdit}
+                className="rounded-md border border-border/60 px-2.5 py-1 text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSubmitEdit()}
+                disabled={isSavingEdit || !draftText.trim() || draftText.trim() === rawText.trim()}
+                className="inline-flex items-center gap-1 rounded-md bg-primary px-2.5 py-1 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isSavingEdit ? <Loader2 className="h-3 w-3 animate-spin" /> : <Pencil className="h-3 w-3" />}
+                Save and resend
+              </button>
+            </div>
+            <p className="text-[11px] text-muted-foreground">This replaces this turn and regenerates the conversation from here.</p>
+          </div>
+        ) : displayText.trim().length > 0 && (
           <div
             className="prose prose-sm max-w-none leading-relaxed dark:prose-invert
             [&_p]:my-1.5 [&_ul]:my-1 [&_ol]:my-1
@@ -120,7 +228,7 @@ export function ChatMessage({
         {showAgentActionBadges && (
           <div className="mt-2 flex flex-wrap gap-1.5">
             {agentActions!.map((action, i) => (
-              <AgentActionBadge key={`${action.path}-${i}`} action={action} />
+              <AgentActionBadge key={`${action.path}-${i}`} action={action} onOpenFile={onOpenFile} />
             ))}
           </div>
         )}
@@ -129,13 +237,17 @@ export function ChatMessage({
         {showAutoAppliedBadges && (
           <div className="mt-2 flex flex-wrap gap-1.5">
             {autoAppliedPaths!.map((path) => (
-              <span
+              <button
                 key={path}
-                className="inline-flex items-center gap-1 rounded-full bg-accent/15 border border-accent/20 px-2 py-0.5 text-[11px] text-accent"
+                type="button"
+                onClick={() => onOpenFile?.(path)}
+                className="inline-flex items-center gap-1 rounded-full border border-accent/20 bg-accent/15 px-2 py-0.5 text-[11px] text-accent transition-colors hover:bg-accent/25 disabled:cursor-default disabled:hover:bg-accent/15"
+                disabled={!onOpenFile}
+                title={onOpenFile ? `Open ${path}` : path}
               >
                 <Check className="h-3 w-3" />
                 <span className="max-w-[200px] truncate">{path}</span>
-              </span>
+              </button>
             ))}
           </div>
         )}
@@ -152,6 +264,39 @@ export function ChatMessage({
                 onGetOriginal={onGetOriginal}
               />
             ))}
+          </div>
+        )}
+
+        {(canCopyMessage || canEditMessage || canRegenerateMessage) && (
+          <div className="mt-2 flex items-center gap-1 text-[11px] opacity-70 transition-opacity group-hover:opacity-100">
+            {canCopyMessage && (
+              <MessageActionButton
+                label={copied ? 'Copied' : 'Copy'}
+                title="Copy message"
+                onClick={handleCopyMessage}
+                icon={copied ? Check : Copy}
+              />
+            )}
+            {canEditMessage && (
+              <MessageActionButton
+                label="Edit"
+                title="Edit this message in place"
+                onClick={() => {
+                  setDraftText(rawText);
+                  setIsEditing(true);
+                }}
+                icon={Pencil}
+              />
+            )}
+            {canRegenerateMessage && (
+              <MessageActionButton
+                label={isRegenerating ? 'Regenerating' : 'Regenerate'}
+                title="Regenerate from this point"
+                onClick={() => void handleRegenerate()}
+                icon={isRegenerating ? Loader2 : RotateCcw}
+                spinning={isRegenerating}
+              />
+            )}
           </div>
         )}
       </div>
@@ -181,10 +326,21 @@ const ACTION_LABELS: Record<AgentAction['type'], string> = {
   list: 'Listed',
 };
 
-function AgentActionBadge({ action }: { action: AgentAction }) {
+function getOpenableActionPath(action: AgentAction): string | null {
+  if (!action.success) return null;
+  if (action.type === 'read' || action.type === 'write') return action.path;
+  if (action.type === 'rename') {
+    const parts = action.path.split(/\s*->\s*/);
+    return parts[1] ?? null;
+  }
+  return null;
+}
+
+function AgentActionBadge({ action, onOpenFile }: { action: AgentAction; onOpenFile?: (filePath: string) => void }) {
   const Icon = ACTION_ICONS[action.type] ?? FileCode;
   const label = ACTION_LABELS[action.type] ?? action.type;
   const shortPath = action.path.split('/').pop() ?? action.path;
+  const openablePath = getOpenableActionPath(action);
 
   if (!action.success) {
     return (
@@ -205,6 +361,22 @@ function AgentActionBadge({ action }: { action: AgentAction }) {
         ? 'bg-accent/15 border-accent/20 text-accent'
         : 'bg-muted border-border text-muted-foreground';
 
+  if (openablePath && onOpenFile) {
+    return (
+      <button
+        type="button"
+        onClick={() => onOpenFile(openablePath)}
+        className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] border transition-colors hover:bg-background/70 ${colorClass}`}
+        title={`Open ${openablePath}`}
+      >
+        <Icon className="h-3 w-3" />
+        <span className="max-w-[180px] truncate" title={action.path}>
+          {label} {shortPath}
+        </span>
+      </button>
+    );
+  }
+
   return (
     <span
       className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] border ${colorClass}`}
@@ -214,6 +386,32 @@ function AgentActionBadge({ action }: { action: AgentAction }) {
         {label} {shortPath}
       </span>
     </span>
+  );
+}
+
+function MessageActionButton({
+  label,
+  title,
+  onClick,
+  icon: Icon,
+  spinning = false,
+}: {
+  label: string;
+  title: string;
+  onClick: () => void;
+  icon: React.ElementType;
+  spinning?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      className="inline-flex items-center gap-1 rounded-md border border-border/60 bg-background/60 px-2 py-1 text-muted-foreground transition-colors hover:text-foreground"
+    >
+      <Icon className={`h-3 w-3 ${spinning ? 'animate-spin' : ''}`} />
+      <span>{label}</span>
+    </button>
   );
 }
 

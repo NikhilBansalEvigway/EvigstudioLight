@@ -17,7 +17,9 @@ import {
   AGENT_SYSTEM_PROMPT,
   CHAT_SYSTEM_PROMPT,
   canWriteChat,
+  hasImages,
   getMessageText,
+  type ChatMode,
   type Message,
   type ContentPart,
   type ParsedPatch,
@@ -39,7 +41,7 @@ const KEY_PROJECT_FILES = [
 
 export function ChatPane() {
   const {
-    chats, activeChatId, createChat, addMessage, updateLastAssistantMessage,
+    chats, activeChatId, createChat, addMessage, updateLastAssistantMessage, updateChatFields, saveVersionSnapshot,
     settings, contextFiles, workspaceHandle, fileTree, isStreaming, setIsStreaming,
   } = useAppStore();
 
@@ -111,7 +113,23 @@ export function ChatPane() {
     }
   }, []);
 
-  const buildContextMessages = useCallback(async (): Promise<{ role: 'user'; content: string }[]> => {
+  const trimMessageUiState = useCallback((messages: Message[]) => {
+    const keepIds = new Set(messages.map((message) => message.id));
+    setAutoAppliedPathsByMessageId((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([messageId]) => keepIds.has(messageId))),
+    );
+    setAgentActionsByMessageId((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([messageId]) => keepIds.has(messageId))),
+    );
+  }, []);
+
+  const deriveChatTitle = useCallback((messages: Message[], fallbackTitle: string) => {
+    const firstUserMessage = messages.find((message) => message.role === 'user');
+    const text = firstUserMessage ? getMessageText(firstUserMessage).trim() : '';
+    return text ? text.slice(0, 40) : fallbackTitle;
+  }, []);
+
+  const buildContextMessages = useCallback(async (messageMentionedFiles: string[] = []): Promise<{ role: 'user'; content: string }[]> => {
     if (!workspaceHandle) return [];
 
     const included = new Set<string>();
@@ -149,7 +167,7 @@ export function ChatPane() {
       }
     }
 
-    const allFiles = [...new Set([...contextFiles, ...mentionedFiles])];
+    const allFiles = [...new Set([...contextFiles, ...messageMentionedFiles])];
     for (const path of allFiles) {
       if (included.has(path)) continue;
       included.add(path);
@@ -168,7 +186,7 @@ export function ChatPane() {
         content: `Workspace context (use paths below as ground truth; do not invent paths that are not listed):\n\n${parts.join('\n\n')}`,
       },
     ];
-  }, [workspaceHandle, fileTree, contextFiles, mentionedFiles]);
+  }, [workspaceHandle, fileTree, contextFiles]);
 
   const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
@@ -230,10 +248,7 @@ export function ChatPane() {
 
     if (operation === 'delete') {
       await deleteFileOrDir(handle, filePath);
-      const { activeFilePath, setActiveFile } = useAppStore.getState();
-      if (activeFilePath === filePath) {
-        setActiveFile(null, '');
-      }
+      useAppStore.getState().closeEditorFile(filePath);
       return;
     }
 
@@ -245,9 +260,23 @@ export function ChatPane() {
     }
     const result = applyPatch(original, patch);
     await writeFile(handle, filePath, result);
-    const { activeFilePath, setActiveFileContent } = useAppStore.getState();
-    if (activeFilePath === filePath) {
-      setActiveFileContent(result);
+    useAppStore.getState().syncEditorFileContent(filePath, result);
+  }, []);
+
+  const handleOpenEditorFile = useCallback(async (filePath: string) => {
+    const state = useAppStore.getState();
+    if (!state.workspaceHandle) {
+      toast.error('Open a workspace folder to view files');
+      return;
+    }
+
+    try {
+      const content = await readFile(state.workspaceHandle, filePath);
+      state.setShowRightPane(true);
+      state.setActiveFile(filePath, content);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Could not open ${filePath}: ${msg}`);
     }
   }, []);
 
@@ -359,6 +388,222 @@ export function ChatPane() {
     [applyPatchToWorkspace, refreshFileTree, addPatchedPaths],
   );
 
+  const runAssistantTurn = useCallback(async ({
+    chatId,
+    chatMode,
+    baseMessages,
+    hasVision,
+    mentionedFilePaths = [],
+  }: {
+    chatId: string;
+    chatMode: ChatMode;
+    baseMessages: Message[];
+    hasVision: boolean;
+    mentionedFilePaths?: string[];
+  }) => {
+    const isAgentMode = chatMode === 'agent';
+    const systemPrompt = isAgentMode ? AGENT_SYSTEM_PROMPT : CHAT_SYSTEM_PROMPT;
+    const contextMsgs = isAgentMode ? await buildContextMessages(mentionedFilePaths) : [];
+
+    const assistantMsg: Message = {
+      id: crypto.randomUUID(),
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+    };
+    addMessage(chatId, assistantMsg);
+
+    setIsStreaming(true);
+    abortRef.current = new AbortController();
+
+    const maxIter = isAgentMode
+      ? Math.min(10, Math.max(1, settings.agentMaxIterations ?? 5))
+      : 1;
+
+    const toApi = (message: Message): LLMMessage => ({ role: message.role, content: message.content });
+
+    let loopMessages: LLMMessage[] = [
+      { role: 'system', content: systemPrompt },
+      ...contextMsgs,
+      ...baseMessages.map(toApi),
+      { role: 'assistant', content: '' },
+    ];
+
+    try {
+      let streamedContent = '';
+      const allActions: AgentAction[] = [];
+
+      for (let iter = 1; iter <= maxIter; iter++) {
+        if (isAgentMode && iter > 1) {
+          setAgentGatherStep(iter);
+        }
+        if (iter > 1) {
+          updateLastAssistantMessage(chatId, '');
+        }
+
+        streamedContent = await chatCompletion({
+          messages: loopMessages,
+          settings,
+          useVision: hasVision && iter === 1,
+          onToken: (full) => updateLastAssistantMessage(chatId, full),
+          signal: abortRef.current!.signal,
+        });
+
+        if (!isAgentMode) break;
+        if (iter >= maxIter) break;
+
+        const tools = parseToolCalls(streamedContent);
+        if (!hasAgentTools(tools)) break;
+
+        const wh = useAppStore.getState().workspaceHandle;
+        if (!wh) {
+          toast.error('Open a workspace folder to use agent tools');
+          break;
+        }
+
+        const { textFeedback, actions } = await executeAgentTools(wh, tools);
+        allActions.push(...actions);
+
+        if (actions.some((action) => action.type === 'write' || action.type === 'delete' || action.type === 'rename')) {
+          await refreshFileTree();
+        }
+
+        if (!hasGatherTools(tools)) break;
+
+        loopMessages = [
+          { role: 'system', content: systemPrompt },
+          ...contextMsgs,
+          ...baseMessages.map(toApi),
+          { role: 'assistant', content: streamedContent },
+          {
+            role: 'user',
+            content:
+              'Tool results (use to continue; when ready, output patches in the required format):\n\n' +
+              textFeedback,
+          },
+          { role: 'assistant', content: '' },
+        ];
+      }
+
+      setAgentGatherStep(null);
+
+      if (allActions.length > 0) {
+        setAgentActionsByMessageId((prev) => ({
+          ...prev,
+          [assistantMsg.id]: [...(prev[assistantMsg.id] ?? []), ...allActions],
+        }));
+      }
+
+      const finalChat = useAppStore.getState().chats.find((chat) => chat.id === chatId);
+      if (finalChat) {
+        try {
+          await persistenceSaveChat(finalChat);
+        } catch (err) {
+          console.error('[EvigStudio] Failed to persist chat after stream', err);
+        }
+      }
+
+      if (typeof streamedContent === 'string' && streamedContent.length > 0) {
+        try {
+          if (isAgentMode) {
+            await runAgentAutoApply(assistantMsg.id, streamedContent);
+          } else {
+            await runDirectEditAutoApply(assistantMsg.id, streamedContent);
+          }
+        } catch (e) {
+          console.error('[EvigStudio] auto-apply', e);
+        }
+      }
+    } catch (err: unknown) {
+      const name = err instanceof Error ? err.name : '';
+      if (name !== 'AbortError') {
+        const errorMsg = err instanceof Error ? err.message : 'Unknown error';
+        updateLastAssistantMessage(chatId, `Error: ${errorMsg}\n\nTips:\n- Check your local AI server is running\n- Verify the base URL in settings\n- Enable CORS in your AI server\n- Try a different model`);
+        toast.error('Local AI request failed');
+      }
+    } finally {
+      setAgentGatherStep(null);
+      setIsStreaming(false);
+      abortRef.current = null;
+    }
+  }, [addMessage, buildContextMessages, refreshFileTree, runAgentAutoApply, runDirectEditAutoApply, setIsStreaming, settings, updateLastAssistantMessage]);
+
+  const handleSubmitMessageEdit = useCallback(async (messageId: string, nextText: string) => {
+    const chatId = useAppStore.getState().activeChatId;
+    if (!chatId || isStreaming) return;
+
+    const chat = useAppStore.getState().chats.find((entry) => entry.id === chatId);
+    if (!chat || !canWriteChat(chat)) return;
+
+    const messageIndex = chat.messages.findIndex((message) => message.id === messageId);
+    if (messageIndex < 0) return;
+
+    const originalMessage = chat.messages[messageIndex];
+    if (originalMessage.role !== 'user' || typeof originalMessage.content !== 'string') return;
+
+    const trimmed = nextText.trim();
+    if (!trimmed || trimmed === originalMessage.content.trim()) return;
+
+    saveVersionSnapshot(chat.id, `Before editing message ${messageIndex + 1}`);
+
+    const updatedMessage: Message = {
+      ...originalMessage,
+      content: trimmed,
+      timestamp: Date.now(),
+    };
+    const nextMessages = [...chat.messages.slice(0, messageIndex), updatedMessage];
+
+    trimMessageUiState(nextMessages);
+    updateChatFields(chat.id, {
+      messages: nextMessages,
+      title: deriveChatTitle(nextMessages, chat.title),
+    });
+
+    userScrolledUp.current = false;
+    await runAssistantTurn({
+      chatId: chat.id,
+      chatMode: chat.mode,
+      baseMessages: nextMessages,
+      hasVision: false,
+      mentionedFilePaths: [],
+    });
+  }, [deriveChatTitle, isStreaming, runAssistantTurn, saveVersionSnapshot, trimMessageUiState, updateChatFields]);
+
+  const handleRegenerateMessage = useCallback(async (messageId: string) => {
+    const chatId = useAppStore.getState().activeChatId;
+    if (!chatId || isStreaming) return;
+
+    const chat = useAppStore.getState().chats.find((entry) => entry.id === chatId);
+    if (!chat || !canWriteChat(chat)) return;
+
+    const messageIndex = chat.messages.findIndex((message) => message.id === messageId);
+    if (messageIndex < 0) return;
+
+    const targetMessage = chat.messages[messageIndex];
+    if (targetMessage.role !== 'assistant') return;
+
+    const nextMessages = chat.messages.slice(0, messageIndex);
+    if (nextMessages.length === 0) return;
+
+    saveVersionSnapshot(chat.id, `Before regenerating response ${messageIndex + 1}`);
+
+    trimMessageUiState(nextMessages);
+    updateChatFields(chat.id, {
+      messages: nextMessages,
+      title: deriveChatTitle(nextMessages, chat.title),
+    });
+
+    const lastPrompt = nextMessages[nextMessages.length - 1];
+    userScrolledUp.current = false;
+    await runAssistantTurn({
+      chatId: chat.id,
+      chatMode: chat.mode,
+      baseMessages: nextMessages,
+      hasVision: lastPrompt?.role === 'user' ? hasImages(lastPrompt) : false,
+      mentionedFilePaths: [],
+    });
+  }, [deriveChatTitle, isStreaming, runAssistantTurn, saveVersionSnapshot, trimMessageUiState, updateChatFields]);
+
   const handleSend = useCallback(async () => {
     if ((!input.trim() && images.length === 0) || isStreaming) return;
     if (activeChat && !canWriteChat(activeChat)) {
@@ -367,7 +612,6 @@ export function ChatPane() {
     }
 
     const currentMode = useAppStore.getState().chats.find((c) => c.id === activeChatId)?.mode ?? 'agent';
-    const isAgentMode = currentMode === 'agent';
 
     let chatId = activeChatId;
     if (!chatId) {
@@ -385,6 +629,7 @@ export function ChatPane() {
     }
 
     const hasVision = images.length > 0;
+    const mentionedFilePaths = mentionedFiles;
     let userContent: string | ContentPart[];
     if (hasVision) {
       const parts: ContentPart[] = [];
@@ -424,7 +669,7 @@ export function ChatPane() {
             preview: getMessageText(userMsg).slice(0, 500),
             promptLength: getMessageText(userMsg).length,
             imageCount: images.length,
-            mentionedFileCount: mentionedFiles.length,
+            mentionedFileCount: mentionedFilePaths.length,
           }),
         });
       } catch {
@@ -432,149 +677,25 @@ export function ChatPane() {
       }
     }
 
-    const systemPrompt = isAgentMode ? AGENT_SYSTEM_PROMPT : CHAT_SYSTEM_PROMPT;
-    const contextMsgs = isAgentMode ? await buildContextMessages() : [];
-
-    const assistantMsg: Message = {
-      id: crypto.randomUUID(),
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-    };
-    addMessage(chatId, assistantMsg);
-
-    const chatWithAssistant = useAppStore.getState().chats.find((c) => c.id === chatId);
-    if (!chatWithAssistant) return;
-    const baseForApi = chatWithAssistant.messages.slice(0, -1);
-
-    setIsStreaming(true);
-    abortRef.current = new AbortController();
-
-    const maxIter = isAgentMode
-      ? Math.min(10, Math.max(1, settings.agentMaxIterations ?? 5))
-      : 1;
-
-    const toApi = (m: Message): LLMMessage => ({ role: m.role, content: m.content });
-
-    let loopMessages: LLMMessage[] = [
-      { role: 'system', content: systemPrompt },
-      ...contextMsgs,
-      ...baseForApi.map(toApi),
-      { role: 'assistant', content: '' },
-    ];
-
-    try {
-      let streamedContent = '';
-      const allActions: AgentAction[] = [];
-
-      for (let iter = 1; iter <= maxIter; iter++) {
-        if (isAgentMode && iter > 1) {
-          setAgentGatherStep(iter);
-        }
-        if (iter > 1) {
-          updateLastAssistantMessage(chatId!, '');
-        }
-
-        streamedContent = await chatCompletion({
-          messages: loopMessages,
-          settings,
-          useVision: hasVision && iter === 1,
-          onToken: (full) => updateLastAssistantMessage(chatId!, full),
-          signal: abortRef.current!.signal,
-        });
-
-        if (!isAgentMode) break;
-        if (iter >= maxIter) break;
-
-        const tools = parseToolCalls(streamedContent);
-        if (!hasAgentTools(tools)) break;
-
-        const wh = useAppStore.getState().workspaceHandle;
-        if (!wh) {
-          toast.error('Open a workspace folder to use agent tools');
-          break;
-        }
-
-        const { textFeedback, actions } = await executeAgentTools(wh, tools);
-        allActions.push(...actions);
-
-        if (actions.some((a) => a.type === 'write' || a.type === 'delete' || a.type === 'rename')) {
-          await refreshFileTree();
-        }
-
-        if (!hasGatherTools(tools)) break;
-
-        loopMessages = [
-          { role: 'system', content: systemPrompt },
-          ...contextMsgs,
-          ...baseForApi.map(toApi),
-          { role: 'assistant', content: streamedContent },
-          {
-            role: 'user',
-            content:
-              'Tool results (use to continue; when ready, output patches in the required format):\n\n' +
-              textFeedback,
-          },
-          { role: 'assistant', content: '' },
-        ];
-      }
-
-      setAgentGatherStep(null);
-
-      if (allActions.length > 0) {
-        setAgentActionsByMessageId((prev) => ({
-          ...prev,
-          [assistantMsg.id]: [...(prev[assistantMsg.id] ?? []), ...allActions],
-        }));
-      }
-
-      const finalChat = useAppStore.getState().chats.find((c) => c.id === chatId);
-      if (finalChat) {
-        try {
-          await persistenceSaveChat(finalChat);
-        } catch (err) {
-          console.error('[EvigStudio] Failed to persist chat after stream', err);
-        }
-      }
-
-      if (typeof streamedContent === 'string' && streamedContent.length > 0) {
-        try {
-          if (isAgentMode) {
-            await runAgentAutoApply(assistantMsg.id, streamedContent);
-          } else {
-            await runDirectEditAutoApply(assistantMsg.id, streamedContent);
-          }
-        } catch (e) {
-          console.error('[EvigStudio] auto-apply', e);
-        }
-      }
-    } catch (err: unknown) {
-      const name = err instanceof Error ? err.name : '';
-      if (name !== 'AbortError') {
-        const errorMsg = err instanceof Error ? err.message : 'Unknown error';
-        updateLastAssistantMessage(chatId!, `Error: ${errorMsg}\n\nTips:\n- Check your local AI server is running\n- Verify the base URL in settings\n- Enable CORS in your AI server\n- Try a different model`);
-        toast.error('Local AI request failed');
-      }
-    } finally {
-      setAgentGatherStep(null);
-      setIsStreaming(false);
-      abortRef.current = null;
-    }
+    const baseMessages = useAppStore.getState().chats.find((c) => c.id === chatId)?.messages ?? [userMsg];
+    await runAssistantTurn({
+      chatId,
+      chatMode: currentMode,
+      baseMessages,
+      hasVision,
+      mentionedFilePaths,
+    });
   }, [
     input,
     images,
+    mentionedFiles,
     activeChat,
     activeChatId,
     isStreaming,
     settings,
     createChat,
     addMessage,
-    updateLastAssistantMessage,
-    setIsStreaming,
-    buildContextMessages,
-    runAgentAutoApply,
-    runDirectEditAutoApply,
-    refreshFileTree,
+    runAssistantTurn,
   ]);
 
   const handleStop = () => abortRef.current?.abort();
@@ -668,6 +789,10 @@ export function ChatPane() {
               onGetOriginal={handleGetOriginal}
               autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
               agentActions={agentActionsByMessageId[msg.id]}
+              onOpenFile={handleOpenEditorFile}
+              onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
+              onRegenerate={isLocked ? undefined : handleRegenerateMessage}
+              busy={isStreaming}
             />
           ))
         )}

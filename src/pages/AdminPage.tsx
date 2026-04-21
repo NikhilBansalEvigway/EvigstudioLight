@@ -15,6 +15,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -30,7 +31,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { toast } from 'sonner';
-import { ArrowLeft, ChevronLeft, ChevronRight, Download, Pencil, Plus, Search, Trash2 } from 'lucide-react';
+import { ArrowLeft, ChevronLeft, ChevronRight, Download, KeyRound, Pencil, Plus, Search, Trash2 } from 'lucide-react';
 
 type UserRow = Pick<AuthUser, 'id' | 'email' | 'displayName' | 'role'> & { createdAt?: string };
 
@@ -266,8 +267,15 @@ export default function AdminPage() {
   const [editUser, setEditUser] = useState<UserRow | null>(null);
   const [editEmail, setEditEmail] = useState('');
   const [editDisplayName, setEditDisplayName] = useState('');
-  const [editPassword, setEditPassword] = useState('');
   const [editRole, setEditRole] = useState<AuthUser['role']>('developer');
+
+  const [passwordUser, setPasswordUser] = useState<UserRow | null>(null);
+  const [passwordValue, setPasswordValue] = useState('');
+  const [passwordConfirm, setPasswordConfirm] = useState('');
+
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
 
   const [deleteUser, setDeleteUser] = useState<UserRow | null>(null);
 
@@ -490,7 +498,6 @@ export default function AdminPage() {
       displayName: editDisplayName.trim(),
       role: editRole,
     };
-    if (editPassword.trim().length >= 8) body.password = editPassword;
     const r = await fetch(`/api/admin/users/${editUser.id}`, {
       method: 'PATCH',
       credentials: 'include',
@@ -504,9 +511,67 @@ export default function AdminPage() {
     }
     toast.success('User updated');
     setEditUser(null);
-    setEditPassword('');
     void loadUsers();
     void loadUsersPicker();
+  };
+
+  const submitUserPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!passwordUser) return;
+    if (passwordValue.length < 8) {
+      toast.error('Password must be at least 8 characters');
+      return;
+    }
+    if (passwordValue !== passwordConfirm) {
+      toast.error('Passwords do not match');
+      return;
+    }
+
+    const r = await fetch(`/api/admin/users/${passwordUser.id}/password`, {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: passwordValue }),
+    });
+    const data = (await r.json().catch(() => ({}))) as { error?: string };
+    if (!r.ok) {
+      toast.error(data.error || 'Could not update password');
+      return;
+    }
+
+    toast.success(`Password updated for ${passwordUser.email}`);
+    setPasswordUser(null);
+    setPasswordValue('');
+    setPasswordConfirm('');
+  };
+
+  const submitOwnPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentPassword || newPassword.length < 8) {
+      toast.error('Enter your current password and a new password with at least 8 characters');
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      toast.error('New passwords do not match');
+      return;
+    }
+
+    const r = await fetch('/api/auth/change-password', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword, newPassword }),
+    });
+    const data = (await r.json().catch(() => ({}))) as { error?: string };
+    if (!r.ok) {
+      toast.error(data.error || 'Could not change password');
+      return;
+    }
+
+    toast.success('Your password has been updated');
+    setCurrentPassword('');
+    setNewPassword('');
+    setConfirmNewPassword('');
   };
 
   const confirmDeleteUser = async () => {
@@ -531,7 +596,12 @@ export default function AdminPage() {
     setEditEmail(u.email);
     setEditDisplayName(u.displayName);
     setEditRole(u.role);
-    setEditPassword('');
+  };
+
+  const openPasswordDialog = (u: UserRow) => {
+    setPasswordUser(u);
+    setPasswordValue('');
+    setPasswordConfirm('');
   };
 
   const createGroup = async (e: React.FormEvent) => {
@@ -714,6 +784,54 @@ export default function AdminPage() {
             <p className="text-xs text-muted-foreground">
               Search by email or name. Create, edit, or remove users; change roles from the table or edit dialog.
             </p>
+            <form onSubmit={submitOwnPassword} className="rounded-md border border-border bg-card p-4 space-y-3">
+              <div>
+                <div className="text-sm font-medium">Account password</div>
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  Change your own admin password here. Your current password is required.
+                </p>
+              </div>
+              <div className="grid gap-3 md:grid-cols-3">
+                <div className="space-y-1">
+                  <Label>Current password</Label>
+                  <Input
+                    type="password"
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    className="h-9 text-xs"
+                    autoComplete="current-password"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label>New password</Label>
+                  <Input
+                    type="password"
+                    minLength={8}
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    className="h-9 text-xs"
+                    autoComplete="new-password"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label>Confirm new password</Label>
+                  <Input
+                    type="password"
+                    minLength={8}
+                    value={confirmNewPassword}
+                    onChange={(e) => setConfirmNewPassword(e.target.value)}
+                    className="h-9 text-xs"
+                    autoComplete="new-password"
+                  />
+                </div>
+              </div>
+              <div className="flex justify-end">
+                <Button type="submit" size="sm" className="gap-1">
+                  <KeyRound className="h-3.5 w-3.5" />
+                  Change my password
+                </Button>
+              </div>
+            </form>
             <div className="flex flex-wrap items-center gap-2">
               <div className="relative flex-1 min-w-[200px] max-w-md">
                 <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -749,7 +867,7 @@ export default function AdminPage() {
                     <th className="text-left p-2">Email</th>
                     <th className="text-left p-2">Name</th>
                     <th className="text-left p-2">Role</th>
-                    <th className="text-right p-2 w-28">Actions</th>
+                    <th className="text-right p-2 w-36">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -771,6 +889,17 @@ export default function AdminPage() {
                         </Select>
                       </td>
                       <td className="p-2 align-middle text-right">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                          title={u.id === user.id ? 'Use the account password section above' : 'Change password'}
+                          disabled={u.id === user.id}
+                          onClick={() => openPasswordDialog(u)}
+                        >
+                          <KeyRound className="h-3.5 w-3.5" />
+                        </Button>
                         <Button
                           type="button"
                           variant="ghost"
@@ -1281,17 +1410,6 @@ export default function AdminPage() {
                 />
               </div>
               <div className="space-y-1">
-                <Label>New password (leave blank to keep)</Label>
-                <Input
-                  type="password"
-                  minLength={8}
-                  value={editPassword}
-                  onChange={(e) => setEditPassword(e.target.value)}
-                  className="h-9 text-xs"
-                  placeholder="••••••••"
-                />
-              </div>
-              <div className="space-y-1">
                 <Label>Role</Label>
                 <Select value={editRole} onValueChange={(v) => setEditRole(v as AuthUser['role'])}>
                   <SelectTrigger className="h-9 text-xs">
@@ -1311,6 +1429,61 @@ export default function AdminPage() {
                 </Button>
                 <Button type="submit" size="sm">
                   Save
+                </Button>
+              </DialogFooter>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!passwordUser}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPasswordUser(null);
+            setPasswordValue('');
+            setPasswordConfirm('');
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Change user password</DialogTitle>
+            <DialogDescription>
+              Set a new password for {passwordUser?.displayName ?? passwordUser?.email}. This takes effect immediately.
+            </DialogDescription>
+          </DialogHeader>
+          {passwordUser && (
+            <form onSubmit={submitUserPassword} className="space-y-3">
+              <div className="space-y-1">
+                <Label>New password</Label>
+                <Input
+                  type="password"
+                  minLength={8}
+                  value={passwordValue}
+                  onChange={(e) => setPasswordValue(e.target.value)}
+                  className="h-9 text-xs"
+                  autoComplete="new-password"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label>Confirm password</Label>
+                <Input
+                  type="password"
+                  minLength={8}
+                  value={passwordConfirm}
+                  onChange={(e) => setPasswordConfirm(e.target.value)}
+                  className="h-9 text-xs"
+                  autoComplete="new-password"
+                />
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="outline" size="sm" onClick={() => setPasswordUser(null)}>
+                  Cancel
+                </Button>
+                <Button type="submit" size="sm" className="gap-1">
+                  <KeyRound className="h-3.5 w-3.5" />
+                  Update password
                 </Button>
               </DialogFooter>
             </form>
