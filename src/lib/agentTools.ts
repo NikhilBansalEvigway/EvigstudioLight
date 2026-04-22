@@ -1,10 +1,11 @@
 import {
-  listDirectoryContents,
-  readFile,
-  writeFile,
-  deleteFileOrDir,
-  renameFileOrDir,
+  deleteWorkspacePath,
+  listWorkspaceDirectoryContents,
+  readWorkspaceFile,
+  renameWorkspacePath,
+  writeWorkspaceFile,
 } from '@/lib/fsWorkspace';
+import type { WorkspaceRoot } from '@/types';
 
 export interface AgentAction {
   type: 'read' | 'write' | 'delete' | 'rename' | 'list';
@@ -121,7 +122,7 @@ export function parseToolCalls(text: string): ParsedAgentTools {
   LIST_RE.lastIndex = 0;
   while ((m = LIST_RE.exec(text)) !== null) {
     const p = normalizeToolPath(m[1] ?? '');
-    if (p && !listDirs.includes(p)) listDirs.push(p);
+    if (!listDirs.includes(p)) listDirs.push(p);
   }
 
   DELETE_RE.lastIndex = 0;
@@ -171,7 +172,7 @@ export interface AgentToolResult {
 }
 
 export async function executeAgentTools(
-  workspaceHandle: FileSystemDirectoryHandle,
+  workspaceRoots: WorkspaceRoot[],
   tools: ParsedAgentTools,
 ): Promise<AgentToolResult> {
   const parts: string[] = [];
@@ -180,7 +181,7 @@ export async function executeAgentTools(
   for (const target of tools.readFiles) {
     const label = formatReadLabel(target);
     try {
-      const content = await readFile(workspaceHandle, target.path);
+      const content = await readWorkspaceFile(workspaceRoots, target.path);
       parts.push(`### Read File: ${label}\n${formatReadChunk(target, content)}`);
       actions.push({ type: 'read', path: label, success: true });
     } catch (e) {
@@ -192,7 +193,7 @@ export async function executeAgentTools(
 
   for (const dir of tools.listDirs) {
     try {
-      const entries = await listDirectoryContents(workspaceHandle, dir);
+      const entries = await listWorkspaceDirectoryContents(workspaceRoots, dir);
       parts.push(
         `### List Directory: ${dir || '(workspace root)'}\n${entries.length ? entries.join('\n') : '(empty)'}`,
       );
@@ -206,7 +207,7 @@ export async function executeAgentTools(
 
   for (const { path, content } of tools.writeFiles) {
     try {
-      await writeFile(workspaceHandle, path, content);
+      await writeWorkspaceFile(workspaceRoots, path, content);
       parts.push(`### Write File: ${path}\n(Written successfully, ${content.length} chars)`);
       actions.push({ type: 'write', path, success: true });
     } catch (e) {
@@ -218,7 +219,7 @@ export async function executeAgentTools(
 
   for (const path of tools.deletePaths) {
     try {
-      await deleteFileOrDir(workspaceHandle, path);
+      await deleteWorkspacePath(workspaceRoots, path);
       parts.push(`### Delete Path: ${path}\n(Deleted successfully)`);
       actions.push({ type: 'delete', path, success: true });
     } catch (e) {
@@ -230,7 +231,7 @@ export async function executeAgentTools(
 
   for (const { oldPath, newPath } of tools.renamePaths) {
     try {
-      await renameFileOrDir(workspaceHandle, oldPath, newPath);
+      await renameWorkspacePath(workspaceRoots, oldPath, newPath);
       parts.push(`### Rename File: ${oldPath} -> ${newPath}\n(Renamed successfully)`);
       actions.push({ type: 'rename', path: `${oldPath} -> ${newPath}`, success: true });
     } catch (e) {

@@ -1,6 +1,14 @@
 import { create } from 'zustand';
 import { toast } from 'sonner';
-import type { Chat, ChatMode, ChatVersionSnapshot, Message, FileNode, AppSettings } from '@/types';
+import type {
+  AppSettings,
+  Chat,
+  ChatMode,
+  ChatVersionSnapshot,
+  FileNode,
+  Message,
+  WorkspaceRoot,
+} from '@/types';
 import { DEFAULT_SETTINGS, canDeleteChat, canWriteChat, normalizeChat } from '@/types';
 import { loadSettings, saveSettings } from '@/lib/storage';
 import {
@@ -48,6 +56,11 @@ interface AppState {
   restoreVersionSnapshot: (chatId: string, snapshotId: string) => void;
 
   // Workspace
+  workspaceRoots: WorkspaceRoot[];
+  setWorkspaceRoots: (roots: WorkspaceRoot[]) => void;
+  addWorkspaceRoot: (root: WorkspaceRoot) => void;
+  removeWorkspaceRoot: (rootId: string) => void;
+  clearWorkspace: () => void;
   workspaceHandle: FileSystemDirectoryHandle | null;
   setWorkspaceHandle: (h: FileSystemDirectoryHandle | null) => void;
   fileTree: FileNode[];
@@ -55,6 +68,7 @@ interface AppState {
   contextFiles: string[];
   toggleContextFile: (path: string) => void;
   clearContextFiles: () => void;
+  removeWorkspacePathReferences: (path: string) => void;
 
   // Editor
   openEditorTabs: EditorTab[];
@@ -301,8 +315,52 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
 
+  workspaceRoots: [],
+  setWorkspaceRoots: (roots) =>
+    set({
+      workspaceRoots: roots,
+      workspaceHandle: roots[0]?.handle ?? null,
+    }),
+  addWorkspaceRoot: (root) =>
+    set((s) => {
+      const workspaceRoots = [...s.workspaceRoots, root];
+      return {
+        workspaceRoots,
+        workspaceHandle: workspaceRoots[0]?.handle ?? null,
+      };
+    }),
+  removeWorkspaceRoot: (rootId) =>
+    set((s) => {
+      const workspaceRoots = s.workspaceRoots.filter((root) => root.id !== rootId);
+      return {
+        workspaceRoots,
+        workspaceHandle: workspaceRoots[0]?.handle ?? null,
+      };
+    }),
+  clearWorkspace: () =>
+    set({
+      workspaceRoots: [],
+      workspaceHandle: null,
+      fileTree: [],
+      contextFiles: [],
+      openEditorTabs: [],
+      activeFilePath: null,
+      activeFileContent: '',
+    }),
   workspaceHandle: null,
-  setWorkspaceHandle: (h) => set({ workspaceHandle: h }),
+  setWorkspaceHandle: (h) =>
+    set({
+      workspaceHandle: h,
+      workspaceRoots: h
+        ? [
+            {
+              id: crypto.randomUUID(),
+              label: h.name,
+              handle: h,
+            },
+          ]
+        : [],
+    }),
   fileTree: [],
   setFileTree: (t) => set({ fileTree: t }),
   contextFiles: [],
@@ -313,6 +371,24 @@ export const useAppStore = create<AppState>((set, get) => ({
         : [...s.contextFiles, path],
     })),
   clearContextFiles: () => set({ contextFiles: [] }),
+  removeWorkspacePathReferences: (path) =>
+    set((s) => {
+      const matchesPath = (candidate: string) => candidate === path || candidate.startsWith(`${path}/`);
+      const nextTabs = s.openEditorTabs.filter((tab) => !matchesPath(tab.path));
+      const activeWasRemoved = s.activeFilePath ? matchesPath(s.activeFilePath) : false;
+      const nextActive = activeWasRemoved ? nextTabs[nextTabs.length - 1] ?? null : null;
+
+      return {
+        openEditorTabs: nextTabs,
+        contextFiles: s.contextFiles.filter((item) => !matchesPath(item)),
+        ...(activeWasRemoved
+          ? {
+              activeFilePath: nextActive?.path ?? null,
+              activeFileContent: nextActive?.content ?? '',
+            }
+          : {}),
+      };
+    }),
 
   openEditorTabs: [],
   activeFilePath: null,

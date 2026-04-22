@@ -96,6 +96,16 @@ export interface FileNode {
   type: 'file' | 'directory';
   children?: FileNode[];
   handle?: FileSystemFileHandle | FileSystemDirectoryHandle;
+  workspaceRootId?: string;
+  workspaceLabel?: string;
+  relativePath?: string;
+  isWorkspaceRoot?: boolean;
+}
+
+export interface WorkspaceRoot {
+  id: string;
+  label: string;
+  handle: FileSystemDirectoryHandle;
 }
 
 export interface ParsedPatch {

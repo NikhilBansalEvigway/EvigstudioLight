@@ -41,16 +41,18 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import {
-  buildFileTree,
-  createDirectory,
-  createFile,
-  deleteFileOrDir,
+  buildWorkspaceTree,
+  createWorkspaceDirectory,
+  createWorkspaceFile,
+  deleteWorkspacePath,
+  trashWorkspacePath,
   getFileExtension,
-  readFile,
-  renameFileOrDir,
+  readWorkspaceFile,
+  renameWorkspacePath,
 } from '@/lib/fsWorkspace';
 import { useAppStore } from '@/store/useAppStore';
 import type { FileNode } from '@/types';
+import { toast } from 'sonner';
 
 type TreeStats = {
   files: number;
@@ -73,6 +75,28 @@ function countTreeStats(nodes: FileNode[]): TreeStats {
   };
 
   walk(nodes);
+  return { files, directories };
+}
+
+function countNodeDescendants(node: FileNode): TreeStats {
+  if (node.type === 'file') {
+    return { files: 1, directories: 0 };
+  }
+
+  let files = 0;
+  let directories = 0;
+  const walk = (list: FileNode[]) => {
+    for (const child of list) {
+      if (child.type === 'directory') {
+        directories += 1;
+        if (child.children?.length) walk(child.children);
+      } else {
+        files += 1;
+      }
+    }
+  };
+
+  walk(node.children ?? []);
   return { files, directories };
 }
 
@@ -171,14 +195,17 @@ function getFileVisual(name: string): { Icon: LucideIcon; iconClassName: string;
 export function FileTree() {
     const {
       activeFilePath,
-      closeEditorFile,
       contextFiles,
       fileTree,
+      openEditorTabs,
+      removeWorkspacePathReferences,
+      removeWorkspaceRoot,
       renameWorkspacePathReferences,
       setActiveFile,
+      clearWorkspace,
       setFileTree,
       toggleContextFile,
-      workspaceHandle,
+      workspaceRoots,
   } = useAppStore();
 
   const [deleteTarget, setDeleteTarget] = useState<FileNode | null>(null);
@@ -193,75 +220,127 @@ export function FileTree() {
   const totalStats = countTreeStats(fileTree);
   const filteredStats = countTreeStats(filteredTree);
   const searching = deferredQuery.trim().length > 0;
+  const deleteStats = deleteTarget ? countNodeDescendants(deleteTarget) : null;
+  const deleteMatchesPath = useCallback(
+    (candidate: string) => !!deleteTarget && (candidate === deleteTarget.path || candidate.startsWith(`${deleteTarget.path}/`)),
+    [deleteTarget],
+  );
+  const affectedOpenTabs = deleteTarget ? openEditorTabs.filter((tab) => deleteMatchesPath(tab.path)) : [];
+  const affectedDirtyTabs = affectedOpenTabs.filter((tab) => tab.content !== tab.savedContent);
+  const affectedContextFiles = deleteTarget ? contextFiles.filter((path) => deleteMatchesPath(path)) : [];
 
   const handleFileClick = useCallback(
     async (node: FileNode) => {
-      if (node.type !== 'file' || !workspaceHandle) return;
+      if (node.type !== 'file' || workspaceRoots.length === 0) return;
       try {
-        const content = await readFile(workspaceHandle, node.path);
+        const content = await readWorkspaceFile(workspaceRoots, node.path);
         setActiveFile(node.path, content);
       } catch (err: any) {
         setActiveFile(node.path, `// Error reading file: ${err.message}`);
       }
     },
-    [workspaceHandle, setActiveFile],
+    [workspaceRoots, setActiveFile],
   );
 
   const refreshTree = useCallback(async () => {
-    if (!workspaceHandle) return;
-    const tree = await buildFileTree(workspaceHandle);
+    if (workspaceRoots.length === 0) {
+      setFileTree([]);
+      return;
+    }
+    const tree = await buildWorkspaceTree(workspaceRoots);
     setFileTree(tree);
-  }, [workspaceHandle, setFileTree]);
+  }, [workspaceRoots, setFileTree]);
 
-  const handleDelete = useCallback(async () => {
-    if (!deleteTarget || !workspaceHandle) return;
+  const handleDelete = useCallback(async (mode: 'trash' | 'delete') => {
+    if (!deleteTarget) return;
+
+    if (affectedDirtyTabs.length > 0) {
+      const confirmed = window.confirm(
+        `Close ${affectedDirtyTabs.length} unsaved tab${affectedDirtyTabs.length === 1 ? '' : 's'} under ${deleteTarget.name}?`,
+      );
+      if (!confirmed) return;
+    }
+
     try {
-      await deleteFileOrDir(workspaceHandle, deleteTarget.path);
-      closeEditorFile(deleteTarget.path);
-      await refreshTree();
+      if (deleteTarget.isWorkspaceRoot) {
+        if (workspaceRoots.length === 1) {
+          clearWorkspace();
+        } else {
+          removeWorkspacePathReferences(deleteTarget.path);
+          removeWorkspaceRoot(deleteTarget.workspaceRootId ?? '');
+          const nextRoots = workspaceRoots.filter((root) => root.id !== deleteTarget.workspaceRootId);
+          const tree = await buildWorkspaceTree(nextRoots);
+          setFileTree(tree);
+        }
+        toast.success(`Removed ${deleteTarget.name} from the workspace`);
+      } else {
+        if (mode === 'trash') {
+          await trashWorkspacePath(workspaceRoots, deleteTarget.path);
+          toast.success(`Moved ${deleteTarget.name} to Trash`);
+        } else {
+          await deleteWorkspacePath(workspaceRoots, deleteTarget.path);
+          toast.success(`Deleted ${deleteTarget.name}`);
+        }
+        removeWorkspacePathReferences(deleteTarget.path);
+        await refreshTree();
+      }
     } catch (err: any) {
       console.error('Delete failed:', err);
+      toast.error(`Delete failed: ${err.message}`);
     }
     setDeleteTarget(null);
-  }, [deleteTarget, workspaceHandle, closeEditorFile, refreshTree]);
+  }, [
+    affectedDirtyTabs.length,
+    clearWorkspace,
+    deleteTarget,
+    refreshTree,
+    removeWorkspacePathReferences,
+    removeWorkspaceRoot,
+    setFileTree,
+    workspaceRoots,
+  ]);
 
   const handleRename = useCallback(async () => {
-    if (!renameTarget || !workspaceHandle || !renameName.trim()) return;
+    if (!renameTarget || workspaceRoots.length === 0 || !renameName.trim()) return;
     const nextPath = resolveRenamePath(renameTarget.path, renameName);
     try {
-      await renameFileOrDir(workspaceHandle, renameTarget.path, nextPath);
+      await renameWorkspacePath(workspaceRoots, renameTarget.path, nextPath);
       renameWorkspacePathReferences(renameTarget.path, nextPath);
       if (renameTarget.type === 'file' && activeFilePath === renameTarget.path) {
-        const content = await readFile(workspaceHandle, nextPath);
+        const content = await readWorkspaceFile(workspaceRoots, nextPath);
         setActiveFile(nextPath, content);
       }
       await refreshTree();
+      toast.success(`Renamed ${renameTarget.name}`);
     } catch (err: any) {
       console.error('Rename failed:', err);
+      toast.error(`Rename failed: ${err.message}`);
     }
     setRenameTarget(null);
     setRenameName('');
-  }, [renameTarget, workspaceHandle, renameName, activeFilePath, renameWorkspacePathReferences, setActiveFile, refreshTree]);
+  }, [renameTarget, workspaceRoots, renameName, activeFilePath, renameWorkspacePathReferences, setActiveFile, refreshTree]);
 
   const handleCreate = useCallback(async () => {
-    if (!createState || !workspaceHandle || !createName.trim()) return;
+    if (!createState || workspaceRoots.length === 0 || !createName.trim()) return;
     const fullPath = createState.parentPath ? `${createState.parentPath}/${createName.trim()}` : createName.trim();
     try {
       if (createState.type === 'file') {
-        await createFile(workspaceHandle, fullPath);
+        await createWorkspaceFile(workspaceRoots, fullPath);
         await refreshTree();
-        const content = await readFile(workspaceHandle, fullPath);
+        const content = await readWorkspaceFile(workspaceRoots, fullPath);
         setActiveFile(fullPath, content);
       } else {
-        await createDirectory(workspaceHandle, fullPath);
+        await createWorkspaceDirectory(workspaceRoots, fullPath);
         await refreshTree();
       }
+      toast.success(`Created ${createName.trim()}`);
     } catch (err: any) {
       console.error('Create failed:', err);
+      toast.error(`Create failed: ${err.message}`);
     }
     setCreateState(null);
     setCreateName('');
-  }, [createState, workspaceHandle, createName, refreshTree, setActiveFile]);
+  }, [createState, workspaceRoots, createName, refreshTree, setActiveFile]);
 
   const openCreate = useCallback((type: 'file' | 'folder', parentPath: string) => {
     setCreateState({ type, parentPath });
@@ -282,7 +361,7 @@ export function FileTree() {
           </div>
           <p className="text-sm font-semibold text-foreground">No workspace open</p>
           <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-            Open a folder to search files, browse the tree, and jump into the editor.
+               Open one or more folders to search files, browse the tree, and jump into the editor.
           </p>
         </div>
       </div>
@@ -387,16 +466,62 @@ export function FileTree() {
       <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete {deleteTarget?.type === 'directory' ? 'folder' : 'file'}</AlertDialogTitle>
+            <AlertDialogTitle>
+              {deleteTarget?.isWorkspaceRoot
+                ? 'Remove folder from workspace'
+                : `Delete ${deleteTarget?.type === 'directory' ? 'folder' : 'file'}`}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete <strong>{deleteTarget?.name}</strong>? This action cannot be undone.
+              {deleteTarget?.isWorkspaceRoot ? (
+                <span>
+                  Remove <strong>{deleteTarget?.name}</strong> from this workspace? Files stay on disk.
+                </span>
+              ) : (
+                <span>
+                  Move <strong>{deleteTarget?.name}</strong> to Trash (recoverable from the workspace folder on disk).
+                </span>
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          <div className="space-y-2 text-xs text-muted-foreground">
+            <div className="rounded-lg border border-border/70 bg-muted/20 px-3 py-2">
+              <span className="font-medium text-foreground">Path:</span> {deleteTarget?.path}
+            </div>
+            {!deleteTarget?.isWorkspaceRoot && deleteTarget?.type === 'directory' && deleteStats && (
+              <div>
+                Deletes {deleteStats.files} file{deleteStats.files === 1 ? '' : 's'} and {deleteStats.directories} folder{deleteStats.directories === 1 ? '' : 's'} inside this folder.
+              </div>
+            )}
+            {affectedOpenTabs.length > 0 && (
+              <div>
+                Closes {affectedOpenTabs.length} open tab{affectedOpenTabs.length === 1 ? '' : 's'}{affectedDirtyTabs.length > 0 ? `, including ${affectedDirtyTabs.length} with unsaved changes` : ''}.
+              </div>
+            )}
+            {affectedContextFiles.length > 0 && (
+              <div>
+                Removes {affectedContextFiles.length} context file{affectedContextFiles.length === 1 ? '' : 's'} from the next agent request.
+              </div>
+            )}
+          </div>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDelete} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
-              Delete
-            </AlertDialogAction>
+            {deleteTarget?.isWorkspaceRoot ? (
+              <AlertDialogAction onClick={() => handleDelete('trash')}>
+                Remove
+              </AlertDialogAction>
+            ) : (
+              <>
+                <AlertDialogAction
+                  onClick={() => handleDelete('delete')}
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                >
+                  Delete permanently
+                </AlertDialogAction>
+                <AlertDialogAction onClick={() => handleDelete('trash')}>
+                  Move to Trash
+                </AlertDialogAction>
+              </>
+            )}
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -404,7 +529,7 @@ export function FileTree() {
       <Dialog open={!!renameTarget} onOpenChange={(open) => { if (!open) { setRenameTarget(null); setRenameName(''); } }}>
         <DialogContent className="sm:max-w-sm">
             <DialogHeader>
-              <DialogTitle>Rename {renameTarget?.type === 'directory' ? 'folder' : 'file'}</DialogTitle>
+             <DialogTitle>Rename {renameTarget?.type === 'directory' ? 'folder' : 'file'}</DialogTitle>
             <DialogDescription>
               Use a new name to rename in place, or enter a workspace-relative path to move <strong>{renameTarget?.name}</strong>.
             </DialogDescription>
@@ -483,6 +608,7 @@ function TreeNode({
   const isActive = activeFilePath === node.path;
   const isSearchMode = searchQuery.trim().length > 0;
   const isExpanded = forceExpanded || expanded;
+  const isWorkspaceRoot = node.isWorkspaceRoot === true;
 
   if (node.type === 'directory') {
     return (
@@ -501,6 +627,11 @@ function TreeNode({
               {isExpanded ? <FolderOpen className="h-3.5 w-3.5" /> : <Folder className="h-3.5 w-3.5" />}
             </span>
             <span className="min-w-0 truncate font-medium text-foreground">{highlightLabel(node.name, searchQuery)}</span>
+            {isWorkspaceRoot && (
+              <span className="rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-primary">
+                Workspace
+              </span>
+            )}
           </button>
           <div className="flex items-center gap-0.5 pr-1 opacity-0 transition-all group-hover:opacity-100">
             <button
@@ -519,19 +650,21 @@ function TreeNode({
             >
               <FolderPlus className="h-3 w-3" />
             </button>
-            <button
-              type="button"
-              onClick={() => onRename(node)}
-              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-primary"
-              title="Rename or move folder"
-            >
-              <Pencil className="h-3 w-3" />
-            </button>
+            {!isWorkspaceRoot && (
+              <button
+                type="button"
+                onClick={() => onRename(node)}
+                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-primary"
+                title="Rename or move folder"
+              >
+                <Pencil className="h-3 w-3" />
+              </button>
+            )}
             <button
               type="button"
               onClick={() => onDelete(node)}
               className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-destructive"
-              title="Delete folder"
+              title={isWorkspaceRoot ? 'Remove folder from workspace' : 'Delete folder'}
             >
               <Trash2 className="h-3 w-3" />
             </button>

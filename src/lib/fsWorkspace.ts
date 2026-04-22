@@ -1,4 +1,4 @@
-import type { FileNode } from '@/types';
+import type { FileNode, WorkspaceRoot } from '@/types';
 
 /**
  * Sanitize a file path for use with the File System Access API.
@@ -40,6 +40,21 @@ async function entryExists(dirHandle: FileSystemDirectoryHandle, name: string): 
   }
 }
 
+async function ensurePermission(handle: any, mode: 'read' | 'readwrite'): Promise<void> {
+  if (!handle || typeof handle.queryPermission !== 'function') return;
+  const opts = { mode };
+  try {
+    const current = await handle.queryPermission(opts);
+    if (current === 'granted') return;
+    const next = await handle.requestPermission?.(opts);
+    if (next === 'granted') return;
+    throw new Error('Permission denied');
+  } catch (e) {
+    // Some Electron/Chromium builds may throw for permission queries; fall back to operation errors.
+    if (e instanceof Error && e.message === 'Permission denied') throw e;
+  }
+}
+
 async function writeBinaryFile(
   dirHandle: FileSystemDirectoryHandle,
   name: string,
@@ -65,6 +80,58 @@ async function copyDirectoryRecursive(
     const file = await (handle as FileSystemFileHandle).getFile();
     await writeBinaryFile(target, name, await file.arrayBuffer());
   }
+}
+
+async function copyEntryBetweenDirectories(
+  sourceRoot: FileSystemDirectoryHandle,
+  oldPath: string,
+  targetRoot: FileSystemDirectoryHandle,
+  newPath: string,
+): Promise<void> {
+  const oldParts = sanitizePath(oldPath);
+  const newParts = sanitizePath(newPath);
+  if (oldParts.length === 0) throw new Error(`Invalid path: "${oldPath}"`);
+  if (newParts.length === 0) throw new Error(`Invalid path: "${newPath}"`);
+
+  const oldParent = await getDirectoryHandleForParts(sourceRoot, oldParts.slice(0, -1));
+  const newParent = await getDirectoryHandleForParts(targetRoot, newParts.slice(0, -1), { create: true });
+  const oldName = oldParts[oldParts.length - 1];
+  const newName = newParts[newParts.length - 1];
+
+  if (await entryExists(newParent, newName)) {
+    throw new Error(`Target already exists: "${newParts.join('/')}"`);
+  }
+
+  try {
+    const fileHandle = await oldParent.getFileHandle(oldName);
+    const file = await fileHandle.getFile();
+    await writeBinaryFile(newParent, newName, await file.arrayBuffer());
+    return;
+  } catch {
+    const sourceDir = await oldParent.getDirectoryHandle(oldName);
+    const targetDir = await newParent.getDirectoryHandle(newName, { create: true });
+    await copyDirectoryRecursive(sourceDir, targetDir);
+  }
+}
+
+function annotateWorkspaceNodes(nodes: FileNode[], root: WorkspaceRoot): FileNode[] {
+  return nodes.map((node) => {
+    const relativePath = node.path;
+    const nextNode: FileNode = {
+      ...node,
+      path: buildWorkspacePath(root.label, relativePath),
+      relativePath,
+      workspaceRootId: root.id,
+      workspaceLabel: root.label,
+      isWorkspaceRoot: false,
+    };
+
+    if (node.type === 'directory' && node.children) {
+      nextNode.children = annotateWorkspaceNodes(node.children, root);
+    }
+
+    return nextNode;
+  });
 }
 
 export function isFileSystemAccessSupported(): boolean {
@@ -120,10 +187,82 @@ export async function pickDirectory(): Promise<FileSystemDirectoryHandle | null>
   }
 }
 
+export function buildWorkspacePath(workspaceLabel: string, relativePath = ''): string {
+  const cleanRelative = sanitizePath(relativePath).join('/');
+  return cleanRelative ? `${workspaceLabel}/${cleanRelative}` : workspaceLabel;
+}
+
+export function getUniqueWorkspaceLabel(
+  existingRoots: Array<Pick<WorkspaceRoot, 'label'>>,
+  baseLabel: string,
+): string {
+  const cleanBase = baseLabel.trim() || 'workspace';
+  const existing = new Set(existingRoots.map((root) => root.label));
+  if (!existing.has(cleanBase)) return cleanBase;
+
+  let index = 2;
+  while (existing.has(`${cleanBase} (${index})`)) {
+    index += 1;
+  }
+  return `${cleanBase} (${index})`;
+}
+
+export function resolveWorkspacePath(
+  workspaceRoots: WorkspaceRoot[],
+  path: string,
+): { root: WorkspaceRoot; relativePath: string; workspacePath: string } {
+  const parts = sanitizePath(path);
+  if (parts.length === 0) throw new Error(`Invalid path: "${path}"`);
+
+  const directRoot = workspaceRoots.find((root) => root.label === parts[0]);
+  if (directRoot) {
+    const relativePath = parts.slice(1).join('/');
+    return {
+      root: directRoot,
+      relativePath,
+      workspacePath: buildWorkspacePath(directRoot.label, relativePath),
+    };
+  }
+
+  if (workspaceRoots.length === 1) {
+    return {
+      root: workspaceRoots[0],
+      relativePath: parts.join('/'),
+      workspacePath: buildWorkspacePath(workspaceRoots[0].label, parts.join('/')),
+    };
+  }
+
+  throw new Error(
+    `Path must start with a workspace folder: ${workspaceRoots.map((root) => root.label).join(', ')}`,
+  );
+}
+
+export async function buildWorkspaceTree(workspaceRoots: WorkspaceRoot[]): Promise<FileNode[]> {
+  const roots = await Promise.all(
+    workspaceRoots.map(async (root) => {
+      const children = annotateWorkspaceNodes(await buildFileTree(root.handle), root);
+      return {
+        name: root.label,
+        path: root.label,
+        type: 'directory' as const,
+        children,
+        handle: root.handle,
+        workspaceRootId: root.id,
+        workspaceLabel: root.label,
+        relativePath: '',
+        isWorkspaceRoot: true,
+      } satisfies FileNode;
+    }),
+  );
+
+  return roots.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+}
+
 export async function buildFileTree(
   dirHandle: FileSystemDirectoryHandle,
   path = ''
 ): Promise<FileNode[]> {
+  await ensurePermission(dirHandle, 'read');
   const nodes: FileNode[] = [];
 
   for await (const [name, handle] of (dirHandle as any).entries()) {
@@ -146,6 +285,7 @@ export async function buildFileTree(
 }
 
 export async function readFile(dirHandle: FileSystemDirectoryHandle, path: string): Promise<string> {
+  await ensurePermission(dirHandle, 'read');
   const parts = sanitizePath(path);
   if (parts.length === 0) throw new Error(`Invalid file path: "${path}"`);
 
@@ -160,6 +300,7 @@ export async function readFile(dirHandle: FileSystemDirectoryHandle, path: strin
 }
 
 export async function writeFile(dirHandle: FileSystemDirectoryHandle, path: string, content: string): Promise<void> {
+  await ensurePermission(dirHandle, 'readwrite');
   const parts = sanitizePath(path);
   if (parts.length === 0) throw new Error(`Invalid file path: "${path}"`);
 
@@ -179,6 +320,7 @@ export async function createFile(dirHandle: FileSystemDirectoryHandle, path: str
 }
 
 export async function createDirectory(dirHandle: FileSystemDirectoryHandle, path: string): Promise<void> {
+  await ensurePermission(dirHandle, 'readwrite');
   const parts = sanitizePath(path);
   if (parts.length === 0) throw new Error(`Invalid directory path: "${path}"`);
 
@@ -189,6 +331,7 @@ export async function createDirectory(dirHandle: FileSystemDirectoryHandle, path
 }
 
 export async function deleteFileOrDir(dirHandle: FileSystemDirectoryHandle, path: string): Promise<void> {
+  await ensurePermission(dirHandle, 'readwrite');
   const parts = sanitizePath(path);
   if (parts.length === 0) throw new Error(`Invalid path: "${path}"`);
 
@@ -200,11 +343,74 @@ export async function deleteFileOrDir(dirHandle: FileSystemDirectoryHandle, path
   await (current as any).removeEntry(parts[parts.length - 1], { recursive: true });
 }
 
+export async function readWorkspaceFile(workspaceRoots: WorkspaceRoot[], path: string): Promise<string> {
+  const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
+  if (!relativePath) throw new Error(`Cannot read workspace root: "${path}"`);
+  return readFile(root.handle, relativePath);
+}
+
+export async function writeWorkspaceFile(
+  workspaceRoots: WorkspaceRoot[],
+  path: string,
+  content: string,
+): Promise<void> {
+  const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
+  if (!relativePath) throw new Error(`Cannot write to workspace root: "${path}"`);
+  await writeFile(root.handle, relativePath, content);
+}
+
+export async function createWorkspaceFile(workspaceRoots: WorkspaceRoot[], path: string): Promise<void> {
+  const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
+  if (!relativePath) throw new Error(`Cannot create a file at workspace root: "${path}"`);
+  await createFile(root.handle, relativePath);
+}
+
+export async function createWorkspaceDirectory(workspaceRoots: WorkspaceRoot[], path: string): Promise<void> {
+  const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
+  if (!relativePath) throw new Error(`Cannot create a folder at workspace root: "${path}"`);
+  await createDirectory(root.handle, relativePath);
+}
+
+export async function deleteWorkspacePath(workspaceRoots: WorkspaceRoot[], path: string): Promise<void> {
+  const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
+  if (!relativePath) {
+    throw new Error('Cannot delete a workspace root from disk. Remove it from the workspace instead.');
+  }
+  await deleteFileOrDir(root.handle, relativePath);
+}
+
+export async function renameWorkspacePath(
+  workspaceRoots: WorkspaceRoot[],
+  oldPath: string,
+  newPath: string,
+): Promise<void> {
+  const oldResolved = resolveWorkspacePath(workspaceRoots, oldPath);
+  const newResolved = resolveWorkspacePath(workspaceRoots, newPath);
+
+  if (!oldResolved.relativePath || !newResolved.relativePath) {
+    throw new Error('Workspace roots cannot be renamed or moved from the file tree.');
+  }
+
+  if (oldResolved.root.id === newResolved.root.id) {
+    await renameFileOrDir(oldResolved.root.handle, oldResolved.relativePath, newResolved.relativePath);
+    return;
+  }
+
+  await copyEntryBetweenDirectories(
+    oldResolved.root.handle,
+    oldResolved.relativePath,
+    newResolved.root.handle,
+    newResolved.relativePath,
+  );
+  await deleteFileOrDir(oldResolved.root.handle, oldResolved.relativePath);
+}
+
 export async function renameFileOrDir(
   dirHandle: FileSystemDirectoryHandle,
   oldPath: string,
   newPath: string,
 ): Promise<void> {
+  await ensurePermission(dirHandle, 'readwrite');
   const oldParts = sanitizePath(oldPath);
   const newParts = sanitizePath(newPath);
   if (oldParts.length === 0) throw new Error(`Invalid path: "${oldPath}"`);
@@ -244,6 +450,34 @@ export async function renameFileOrDir(
   }
 }
 
+export async function trashWorkspacePath(
+  workspaceRoots: WorkspaceRoot[],
+  path: string,
+): Promise<{ trashedPath: string }>
+{
+  const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
+  if (!relativePath) {
+    throw new Error('Cannot trash a workspace root. Remove it from the workspace instead.');
+  }
+
+  const parts = sanitizePath(relativePath);
+  if (parts.length === 0) throw new Error(`Invalid path: "${path}"`);
+
+  // If something is already under the internal trash, just delete it.
+  if (parts[0] === '.evigstudio-trash') {
+    await deleteFileOrDir(root.handle, relativePath);
+    return { trashedPath: buildWorkspacePath(root.label, relativePath) };
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const nonce = (globalThis.crypto?.randomUUID?.() ?? Math.random().toString(16).slice(2)).slice(0, 8);
+  const trashBase = `.evigstudio-trash/${stamp}-${nonce}`;
+  const destRel = `${trashBase}/${parts.join('/')}`;
+
+  await renameFileOrDir(root.handle, relativePath, destRel);
+  return { trashedPath: buildWorkspacePath(root.label, destRel) };
+}
+
 export function getFileExtension(name: string): string {
   const dot = name.lastIndexOf('.');
   return dot >= 0 ? name.slice(dot) : '';
@@ -278,6 +512,7 @@ export async function listDirectoryContents(
   dirHandle: FileSystemDirectoryHandle,
   relativePath: string,
 ): Promise<string[]> {
+  await ensurePermission(dirHandle, 'read');
   const parts = sanitizePath(relativePath);
   let current = dirHandle;
   for (const part of parts) {
@@ -288,4 +523,19 @@ export async function listDirectoryContents(
     names.push(handle.kind === 'directory' ? `${name}/` : name);
   }
   return names.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+}
+
+export async function listWorkspaceDirectoryContents(
+  workspaceRoots: WorkspaceRoot[],
+  path: string,
+): Promise<string[]> {
+  const trimmed = path.trim();
+  if (!trimmed || trimmed === '.') {
+    return workspaceRoots
+      .map((root) => `${root.label}/`)
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  }
+
+  const { root, relativePath } = resolveWorkspacePath(workspaceRoots, trimmed);
+  return listDirectoryContents(root.handle, relativePath);
 }

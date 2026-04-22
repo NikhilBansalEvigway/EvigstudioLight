@@ -88,6 +88,7 @@ async function streamResponse(body: ReadableStream<Uint8Array>, onToken?: (token
   const decoder = new TextDecoder();
   let full = '';
   let buffer = '';
+  let sawSse = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -99,9 +100,16 @@ async function streamResponse(body: ReadableStream<Uint8Array>, onToken?: (token
 
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith('data: ')) continue;
-      const data = trimmed.slice(6);
-      if (data === '[DONE]') continue;
+      if (!trimmed) continue;
+      const idx = trimmed.indexOf('data:');
+      if (idx !== 0) continue;
+      sawSse = true;
+      const data = trimmed.slice(5).trimStart();
+      if (data === '[DONE]') {
+        // Some servers keep the connection open; stop once DONE is received.
+        try { await reader.cancel(); } catch {}
+        return full;
+      }
 
       try {
         const parsed = JSON.parse(data);
@@ -111,6 +119,27 @@ async function streamResponse(body: ReadableStream<Uint8Array>, onToken?: (token
           onToken?.(full);
         }
       } catch { }
+    }
+  }
+
+  // Fallback: if server ignored streaming and returned a JSON body.
+  if (!sawSse) {
+    const text = (buffer || '').trim();
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(text);
+        const content = parsed?.choices?.[0]?.message?.content;
+        if (typeof content === 'string' && content.length > 0) {
+          onToken?.(content);
+          return content;
+        }
+        const errMsg = parsed?.error?.message;
+        if (typeof errMsg === 'string' && errMsg) {
+          throw new Error(errMsg);
+        }
+      } catch {
+        // ignore
+      }
     }
   }
 

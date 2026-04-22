@@ -1,7 +1,14 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useAppStore } from '@/store/useAppStore';
 import { chatCompletion, type ChatMessage as LLMMessage } from '@/lib/llmClient';
-import { readFile, writeFile, buildFileTree, deleteFileOrDir, serializeFileTree } from '@/lib/fsWorkspace';
+import {
+  buildWorkspacePath,
+  buildWorkspaceTree,
+  deleteWorkspacePath,
+  readWorkspaceFile,
+  serializeFileTree,
+  writeWorkspaceFile,
+} from '@/lib/fsWorkspace';
 import {
   parseToolCalls,
   hasAgentTools,
@@ -42,7 +49,7 @@ const KEY_PROJECT_FILES = [
 export function ChatPane() {
   const {
     chats, activeChatId, createChat, addMessage, updateLastAssistantMessage, updateChatFields, saveVersionSnapshot,
-    settings, contextFiles, workspaceHandle, fileTree, isStreaming, setIsStreaming,
+    settings, contextFiles, fileTree, isStreaming, setIsStreaming, workspaceRoots,
   } = useAppStore();
 
   const [autoAppliedPathsByMessageId, setAutoAppliedPathsByMessageId] = useState<Record<string, string[]>>({});
@@ -130,24 +137,42 @@ export function ChatPane() {
   }, []);
 
   const buildContextMessages = useCallback(async (messageMentionedFiles: string[] = []): Promise<{ role: 'user'; content: string }[]> => {
-    if (!workspaceHandle) return [];
+    if (workspaceRoots.length === 0) return [];
 
     const included = new Set<string>();
     const parts: string[] = [];
 
+    const MAX_TREE_CHARS = 30_000;
+    const MAX_FILE_CHARS_AUTO = 2_000;
+    const MAX_FILE_CHARS_EXPLICIT = 8_000;
+    const MAX_TOTAL_CONTEXT_CHARS = 120_000;
+
+    const truncate = (content: string, maxChars: number) =>
+      content.length > maxChars ? `${content.slice(0, maxChars)}\n\n… [truncated]` : content;
+
+    const totalChars = () => parts.reduce((sum, part) => sum + part.length, 0);
+    const canAdd = (nextPart: string) => totalChars() + nextPart.length <= MAX_TOTAL_CONTEXT_CHARS;
+
     const treeStr = fileTree.length ? serializeFileTree(fileTree) : '';
     if (treeStr) {
-      parts.push(`## Project structure (file paths)\n\`\`\`\n${treeStr}\n\`\`\``);
+      const tree = truncate(treeStr, MAX_TREE_CHARS);
+      const block = `## Project structure (file paths)\n\`\`\`\n${tree}\n\`\`\``;
+      if (canAdd(block)) {
+        parts.push(block);
+      }
     }
 
-    for (const rel of KEY_PROJECT_FILES) {
+    const keyProjectPaths = workspaceRoots.flatMap((root) =>
+      KEY_PROJECT_FILES.map((rel) => buildWorkspacePath(root.label, rel)),
+    );
+    for (const path of keyProjectPaths) {
       try {
-        let content = await readFile(workspaceHandle, rel);
-        included.add(rel);
-        if (content.length > 2000) {
-          content = `${content.slice(0, 2000)}\n\n… [truncated]`;
-        }
-        parts.push(`### Key file: ${rel}\n\`\`\`\n${content}\n\`\`\``);
+        let content = await readWorkspaceFile(workspaceRoots, path);
+        included.add(path);
+        content = truncate(content, MAX_FILE_CHARS_AUTO);
+        const block = `### Key file: ${path}\n\`\`\`\n${content}\n\`\`\``;
+        if (!canAdd(block)) break;
+        parts.push(block);
       } catch {
         /* optional */
       }
@@ -156,27 +181,43 @@ export function ChatPane() {
     for (const path of patchedPathsRef.current) {
       if (included.has(path)) continue;
       try {
-        let content = await readFile(workspaceHandle, path);
+        let content = await readWorkspaceFile(workspaceRoots, path);
         included.add(path);
-        if (content.length > 2000) {
-          content = `${content.slice(0, 2000)}\n\n… [truncated]`;
-        }
-        parts.push(`### Recently edited in this chat: ${path}\n\`\`\`\n${content}\n\`\`\``);
+        content = truncate(content, MAX_FILE_CHARS_AUTO);
+        const block = `### Recently edited in this chat: ${path}\n\`\`\`\n${content}\n\`\`\``;
+        if (!canAdd(block)) break;
+        parts.push(block);
       } catch {
         /* skip */
       }
     }
 
     const allFiles = [...new Set([...contextFiles, ...messageMentionedFiles])];
+    let omittedFiles = 0;
     for (const path of allFiles) {
       if (included.has(path)) continue;
       included.add(path);
       try {
-        const content = await readFile(workspaceHandle, path);
-        parts.push(`### File: ${path}\n\`\`\`\n${content}\n\`\`\``);
+        let content = await readWorkspaceFile(workspaceRoots, path);
+        content = truncate(content, MAX_FILE_CHARS_EXPLICIT);
+        const block = `### File: ${path}\n\`\`\`\n${content}\n\`\`\`\n`;
+        if (!canAdd(block)) {
+          omittedFiles += 1;
+          continue;
+        }
+        parts.push(block.trimEnd());
       } catch {
-        parts.push(`### File: ${path}\n(Could not read file)`);
+        const block = `### File: ${path}\n(Could not read file)`;
+        if (!canAdd(block)) {
+          omittedFiles += 1;
+          continue;
+        }
+        parts.push(block);
       }
+    }
+
+    if (omittedFiles > 0) {
+      parts.push(`(Omitted ${omittedFiles} file(s) from context due to size limits. Add fewer files or mention specific paths/sections.)`);
     }
 
     if (parts.length === 0) return [];
@@ -186,7 +227,7 @@ export function ChatPane() {
         content: `Workspace context (use paths below as ground truth; do not invent paths that are not listed):\n\n${parts.join('\n\n')}`,
       },
     ];
-  }, [workspaceHandle, fileTree, contextFiles]);
+  }, [workspaceRoots, fileTree, contextFiles]);
 
   const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
@@ -234,44 +275,44 @@ export function ChatPane() {
   }, []);
 
   const refreshFileTree = useCallback(async () => {
-    const handle = useAppStore.getState().workspaceHandle;
-    if (!handle) return;
-    const tree = await buildFileTree(handle);
+    const roots = useAppStore.getState().workspaceRoots;
+    if (roots.length === 0) return;
+    const tree = await buildWorkspaceTree(roots);
     useAppStore.getState().setFileTree(tree);
   }, []);
 
   const applyPatchToWorkspace = useCallback(async (patch: ParsedPatch) => {
-    const handle = useAppStore.getState().workspaceHandle;
-    if (!handle) throw new Error('No workspace folder open');
+    const roots = useAppStore.getState().workspaceRoots;
+    if (roots.length === 0) throw new Error('No workspace folder open');
 
     const { filePath, content, operation = 'update' } = patch;
 
     if (operation === 'delete') {
-      await deleteFileOrDir(handle, filePath);
-      useAppStore.getState().closeEditorFile(filePath);
+      await deleteWorkspacePath(roots, filePath);
+      useAppStore.getState().removeWorkspacePathReferences(filePath);
       return;
     }
 
     let original = '';
     try {
-      original = await readFile(handle, filePath);
+      original = await readWorkspaceFile(roots, filePath);
     } catch {
       /* new or missing file */
     }
     const result = applyPatch(original, patch);
-    await writeFile(handle, filePath, result);
+    await writeWorkspaceFile(roots, filePath, result);
     useAppStore.getState().syncEditorFileContent(filePath, result);
   }, []);
 
   const handleOpenEditorFile = useCallback(async (filePath: string) => {
     const state = useAppStore.getState();
-    if (!state.workspaceHandle) {
+    if (state.workspaceRoots.length === 0) {
       toast.error('Open a workspace folder to view files');
       return;
     }
 
     try {
-      const content = await readFile(state.workspaceHandle, filePath);
+      const content = await readWorkspaceFile(state.workspaceRoots, filePath);
       state.setShowRightPane(true);
       state.setActiveFile(filePath, content);
     } catch (err: unknown) {
@@ -282,7 +323,7 @@ export function ChatPane() {
 
   const handleApplyPatch = useCallback(
     async (patch: ParsedPatch) => {
-      if (!useAppStore.getState().workspaceHandle) {
+      if (useAppStore.getState().workspaceRoots.length === 0) {
         toast.error('No workspace folder open');
         return;
       }
@@ -304,7 +345,7 @@ export function ChatPane() {
   const runAgentAutoApply = useCallback(
     async (assistantMessageId: string, text: string) => {
       const st = useAppStore.getState();
-      if (!st.workspaceHandle) return;
+      if (st.workspaceRoots.length === 0) return;
       if (!containsPatches(text)) return;
       const patches = parsePatches(text);
       if (patches.length === 0) return;
@@ -353,7 +394,7 @@ export function ChatPane() {
   const runDirectEditAutoApply = useCallback(
     async (assistantMessageId: string, text: string) => {
       const st = useAppStore.getState();
-      if (!st.settings.directEditMode || !st.workspaceHandle) return;
+      if (!st.settings.directEditMode || st.workspaceRoots.length === 0) return;
       if (!containsPatches(text)) return;
       const patches = parsePatches(text);
       if (patches.length === 0) return;
@@ -455,13 +496,13 @@ export function ChatPane() {
         const tools = parseToolCalls(streamedContent);
         if (!hasAgentTools(tools)) break;
 
-        const wh = useAppStore.getState().workspaceHandle;
-        if (!wh) {
+        const roots = useAppStore.getState().workspaceRoots;
+        if (roots.length === 0) {
           toast.error('Open a workspace folder to use agent tools');
           break;
         }
 
-        const { textFeedback, actions } = await executeAgentTools(wh, tools);
+        const { textFeedback, actions } = await executeAgentTools(roots, tools);
         allActions.push(...actions);
 
         if (actions.some((action) => action.type === 'write' || action.type === 'delete' || action.type === 'rename')) {
@@ -716,13 +757,13 @@ export function ChatPane() {
   };
 
   const handleGetOriginal = useCallback(async (filePath: string): Promise<string> => {
-    if (!workspaceHandle) return '';
+    if (workspaceRoots.length === 0) return '';
     try {
-      return await readFile(workspaceHandle, filePath);
+      return await readWorkspaceFile(workspaceRoots, filePath);
     } catch {
       return '';
     }
-  }, [workspaceHandle]);
+  }, [workspaceRoots]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (showMention) return;

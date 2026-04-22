@@ -1,11 +1,18 @@
 import { useAppStore } from '@/store/useAppStore';
 import { useAuth } from '@/contexts/AuthContext';
 import { FileTree } from '@/components/FileTree';
-import { pickDirectory, buildFileTree, getFileSystemAccessStatus, writeFile, getFileExtension } from '@/lib/fsWorkspace';
+import {
+  buildWorkspaceTree,
+  getFileSystemAccessStatus,
+  getFileExtension,
+  getUniqueWorkspaceLabel,
+  pickDirectory,
+  writeWorkspaceFile,
+} from '@/lib/fsWorkspace';
 import { SYSTEM_PROMPT } from '@/types';
 import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus, X, Copy, Users } from 'lucide-react';
 import { toast } from 'sonner';
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useTheme } from 'next-themes';
 import Editor from '@monaco-editor/react';
 
@@ -35,7 +42,7 @@ type SharedWorkspaceRow = {
 export function WorkspacePane() {
   const {
     rightPaneTab, setRightPaneTab,
-    workspaceHandle, setWorkspaceHandle, setFileTree,
+    workspaceRoots, clearWorkspace, removeWorkspacePathReferences, removeWorkspaceRoot, setFileTree,
     openEditorTabs, activeFilePath, activeFileContent, setActiveFileContent, setActiveEditorFile, closeEditorFile, markEditorFileSaved,
     contextFiles, toggleContextFile, clearContextFiles,
   } = useAppStore();
@@ -52,6 +59,11 @@ export function WorkspacePane() {
   const dirtyTabs = openEditorTabs.filter((tab) => tab.content !== tab.savedContent);
   const activeTab = openEditorTabs.find((tab) => tab.path === activeFilePath) ?? null;
   const activeDirty = !!activeTab && activeTab.content !== activeTab.savedContent;
+  const hasWorkspace = workspaceRoots.length > 0;
+
+  // Monaco keybindings are registered once; keep callbacks fresh.
+  const saveActiveRef = useRef<() => void>(() => {});
+  const saveAllRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     if (dirtyTabs.length === 0) return;
@@ -124,13 +136,13 @@ export function WorkspacePane() {
 
   const handleSavePath = useCallback(async (path: string) => {
     const state = useAppStore.getState();
-    if (!state.workspaceHandle) throw new Error('No workspace folder open');
+    if (state.workspaceRoots.length === 0) throw new Error('No workspace folder open');
 
     const tab = state.openEditorTabs.find((entry) => entry.path === path);
     if (!tab) return false;
     if (tab.content === tab.savedContent) return false;
 
-    await writeFile(state.workspaceHandle, path, tab.content);
+    await writeWorkspaceFile(state.workspaceRoots, path, tab.content);
     markEditorFileSaved(path, tab.content);
     return true;
   }, [markEditorFileSaved]);
@@ -142,22 +154,66 @@ export function WorkspacePane() {
     }
     const handle = await pickDirectory();
     if (handle) {
-      setWorkspaceHandle(handle);
-      const tree = await buildFileTree(handle);
+      const currentRoots = useAppStore.getState().workspaceRoots;
+      for (const root of currentRoots) {
+        if (typeof (root.handle as any).isSameEntry === 'function' && await (root.handle as any).isSameEntry(handle)) {
+          toast.message(`${root.label} is already open`);
+          return;
+        }
+      }
+
+      const label = getUniqueWorkspaceLabel(currentRoots, handle.name);
+      const nextRoots = [...currentRoots, { id: crypto.randomUUID(), label, handle }];
+      useAppStore.getState().setWorkspaceRoots(nextRoots);
+      const tree = await buildWorkspaceTree(nextRoots);
       setFileTree(tree);
-      toast.success(`Opened: ${handle.name}`);
+      toast.success(`${currentRoots.length === 0 ? 'Opened' : 'Added'}: ${label}`);
     }
   };
 
-  const handleRefresh = async () => {
-    if (workspaceHandle) {
-      const tree = await buildFileTree(workspaceHandle);
-      setFileTree(tree);
+  const handleRefresh = useCallback(async () => {
+    const roots = useAppStore.getState().workspaceRoots;
+    if (roots.length === 0) {
+      setFileTree([]);
+      return;
     }
-  };
+
+    const tree = await buildWorkspaceTree(roots);
+    setFileTree(tree);
+  }, [setFileTree]);
+
+  const handleRemoveRoot = useCallback(async (rootId: string) => {
+    const state = useAppStore.getState();
+    const root = state.workspaceRoots.find((entry) => entry.id === rootId);
+    if (!root) return;
+
+    const affectedDirtyTabs = state.openEditorTabs.filter(
+      (tab) => tab.path === root.label || tab.path.startsWith(`${root.label}/`),
+    ).filter((tab) => tab.content !== tab.savedContent);
+
+    if (affectedDirtyTabs.length > 0) {
+      const confirmed = window.confirm(
+        `Remove ${root.label} from the workspace and close ${affectedDirtyTabs.length} unsaved tab${affectedDirtyTabs.length === 1 ? '' : 's'}?`,
+      );
+      if (!confirmed) return;
+    }
+
+    removeWorkspacePathReferences(root.label);
+    if (state.workspaceRoots.length === 1) {
+      clearWorkspace();
+      toast.success(`Removed ${root.label} from the workspace`);
+      return;
+    }
+
+    const nextRoots = state.workspaceRoots.filter((entry) => entry.id !== rootId);
+    removeWorkspaceRoot(rootId);
+    const tree = await buildWorkspaceTree(nextRoots);
+    setFileTree(tree);
+    toast.success(`Removed ${root.label} from the workspace`);
+  }, [clearWorkspace, removeWorkspacePathReferences, removeWorkspaceRoot, setFileTree]);
 
   const handleSave = async () => {
-    if (!workspaceHandle || !activeFilePath) return;
+    if (!hasWorkspace || !activeFilePath) return;
     try {
       const saved = await handleSavePath(activeFilePath);
       if (!saved) return;
@@ -167,6 +223,12 @@ export function WorkspacePane() {
       toast.error(`Save failed: ${err.message}`);
     }
   };
+
+  useEffect(() => {
+    saveActiveRef.current = () => {
+      void handleSave();
+    };
+  });
 
   const handleSaveAll = useCallback(async () => {
     if (dirtyTabs.length === 0) return;
@@ -187,6 +249,12 @@ export function WorkspacePane() {
     }
   }, [dirtyTabs, handleRefresh, handleSavePath]);
 
+  useEffect(() => {
+    saveAllRef.current = () => {
+      void handleSaveAll();
+    };
+  }, [handleSaveAll]);
+
   const handleCloseTab = useCallback((path: string) => {
     const tab = openEditorTabs.find((entry) => entry.path === path);
     const isDirty = !!tab && tab.content !== tab.savedContent;
@@ -197,13 +265,13 @@ export function WorkspacePane() {
   }, [closeEditorFile, openEditorTabs]);
 
   const handleCreateFile = async () => {
-    if (!workspaceHandle || !newFileName.trim()) return;
+    if (!hasWorkspace || !newFileName.trim()) return;
     try {
-      await writeFile(workspaceHandle, newFileName.trim(), '');
+      await writeWorkspaceFile(workspaceRoots, newFileName.trim(), '');
       toast.success(`Created ${newFileName.trim()}`);
       setNewFileName('');
       setShowNewFile(false);
-      handleRefresh();
+      await handleRefresh();
     } catch (err: any) {
       toast.error(`Create failed: ${err.message}`);
     }
@@ -248,9 +316,9 @@ export function WorkspacePane() {
                   className="inline-flex items-center gap-1.5 rounded-xl border border-primary/20 bg-primary/10 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-primary transition-all hover:-translate-y-0.5 hover:bg-primary/15"
                 >
                   <FolderOpen className="h-3.5 w-3.5" />
-                  {workspaceHandle ? 'Change Folder' : 'Open Folder'}
+                  {hasWorkspace ? 'Add Folder' : 'Open Folder'}
                 </button>
-                {workspaceHandle && (
+                {hasWorkspace && (
                   <>
                     <button
                       onClick={handleRefresh}
@@ -270,6 +338,18 @@ export function WorkspacePane() {
                         Quick file
                       </span>
                     </button>
+                    <button
+                      onClick={() => {
+                        if (dirtyTabs.length > 0 && !window.confirm(`Clear the workspace and close ${dirtyTabs.length} open tab${dirtyTabs.length === 1 ? '' : 's'}?`)) {
+                          return;
+                        }
+                        clearWorkspace();
+                        toast.success('Cleared workspace folders');
+                      }}
+                      className="rounded-xl border border-border/70 bg-background px-2.5 py-1.5 text-[10px] font-medium text-muted-foreground transition-all hover:border-destructive/20 hover:text-destructive"
+                    >
+                      Clear
+                    </button>
                   </>
                 )}
               </div>
@@ -280,23 +360,35 @@ export function WorkspacePane() {
                 <span className="text-warning">{fsAccessStatus.message}</span>
               </div>
             )}
-            {showNewFile && workspaceHandle && (
+            {showNewFile && hasWorkspace && (
               <div className="flex items-center gap-1.5 border-b border-border px-2 py-2 animate-fade-in">
                 <input
                   value={newFileName}
                   onChange={e => setNewFileName(e.target.value)}
                   onKeyDown={e => e.key === 'Enter' && handleCreateFile()}
-                  placeholder="path/to/file.vhd"
+                  placeholder={workspaceRoots.length === 1 ? 'folder/path/to/file.vhd or src/file.vhd' : 'folder-name/path/to/file.vhd'}
                   className="flex-1 rounded-xl border border-border/70 bg-input px-3 py-2 text-[10px] outline-none focus:ring-1 focus:ring-ring"
                 />
                 <button onClick={handleCreateFile} className="rounded-xl bg-accent/15 px-3 py-2 text-[10px] font-semibold text-accent transition-colors hover:bg-accent/25">Create</button>
               </div>
             )}
-            {workspaceHandle && (
+            {hasWorkspace && (
               <div className="border-b border-border/60 px-2 py-1.5 text-[10px] text-muted-foreground">
-                <div className="inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-background px-2.5 py-1">
-                  <FolderOpen className="h-3 w-3 text-primary" />
-                  <span className="max-w-[220px] truncate font-medium text-foreground/90">{workspaceHandle.name}</span>
+                <div className="flex flex-wrap gap-1.5">
+                  {workspaceRoots.map((root) => (
+                    <div key={root.id} className="inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-background px-2.5 py-1">
+                      <FolderOpen className="h-3 w-3 text-primary" />
+                      <span className="max-w-[180px] truncate font-medium text-foreground/90">{root.label}</span>
+                      <button
+                        type="button"
+                        onClick={() => void handleRemoveRoot(root.id)}
+                        className="rounded-full p-0.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-destructive"
+                        title={`Remove ${root.label} from workspace`}
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
@@ -431,7 +523,11 @@ export function WorkspacePane() {
                       });
                     }}
                     onMount={(editor, monaco) => {
-                      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => handleSave());
+                      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveActiveRef.current());
+                      editor.addCommand(
+                        monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS,
+                        () => saveAllRef.current(),
+                      );
                     }}
                     options={{
                       fontSize: 12,

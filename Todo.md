@@ -28,3 +28,8 @@
 - Clickable file badges after agent edits already exist in `src/components/ChatMessage.tsx` and `src/components/ChatPane.tsx`.
 - Password change already exists for self-service and admin flows in `src/pages/AdminPage.tsx` and `server/src/routes/auth.ts`.
 - A `Remember me` checkbox exists already, but it needs a security/behavior fix rather than a fresh implementation.
+
+
+New features to implement:-
+-Think about the folder, file delete feature and improve it.
+-Make it so that multiple folders can be opened together (like workspace in vscode)
