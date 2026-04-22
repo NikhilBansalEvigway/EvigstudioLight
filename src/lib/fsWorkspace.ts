@@ -40,14 +40,20 @@ async function entryExists(dirHandle: FileSystemDirectoryHandle, name: string): 
   }
 }
 
-async function ensurePermission(handle: any, mode: 'read' | 'readwrite'): Promise<void> {
+async function ensurePermission(
+  handle: any,
+  mode: 'read' | 'readwrite',
+  options?: { request?: boolean },
+): Promise<void> {
   if (!handle || typeof handle.queryPermission !== 'function') return;
   const opts = { mode };
   try {
     const current = await handle.queryPermission(opts);
     if (current === 'granted') return;
-    const next = await handle.requestPermission?.(opts);
-    if (next === 'granted') return;
+    if (options?.request) {
+      const next = await handle.requestPermission?.(opts);
+      if (next === 'granted') return;
+    }
     throw new Error('Permission denied');
   } catch (e) {
     // Some Electron/Chromium builds may throw for permission queries; fall back to operation errors.
@@ -300,7 +306,7 @@ export async function readFile(dirHandle: FileSystemDirectoryHandle, path: strin
 }
 
 export async function writeFile(dirHandle: FileSystemDirectoryHandle, path: string, content: string): Promise<void> {
-  await ensurePermission(dirHandle, 'readwrite');
+  await ensurePermission(dirHandle, 'readwrite', { request: true });
   const parts = sanitizePath(path);
   if (parts.length === 0) throw new Error(`Invalid file path: "${path}"`);
 
@@ -320,7 +326,7 @@ export async function createFile(dirHandle: FileSystemDirectoryHandle, path: str
 }
 
 export async function createDirectory(dirHandle: FileSystemDirectoryHandle, path: string): Promise<void> {
-  await ensurePermission(dirHandle, 'readwrite');
+  await ensurePermission(dirHandle, 'readwrite', { request: true });
   const parts = sanitizePath(path);
   if (parts.length === 0) throw new Error(`Invalid directory path: "${path}"`);
 
@@ -331,7 +337,7 @@ export async function createDirectory(dirHandle: FileSystemDirectoryHandle, path
 }
 
 export async function deleteFileOrDir(dirHandle: FileSystemDirectoryHandle, path: string): Promise<void> {
-  await ensurePermission(dirHandle, 'readwrite');
+  await ensurePermission(dirHandle, 'readwrite', { request: true });
   const parts = sanitizePath(path);
   if (parts.length === 0) throw new Error(`Invalid path: "${path}"`);
 
@@ -410,7 +416,7 @@ export async function renameFileOrDir(
   oldPath: string,
   newPath: string,
 ): Promise<void> {
-  await ensurePermission(dirHandle, 'readwrite');
+  await ensurePermission(dirHandle, 'readwrite', { request: true });
   const oldParts = sanitizePath(oldPath);
   const newParts = sanitizePath(newPath);
   if (oldParts.length === 0) throw new Error(`Invalid path: "${oldPath}"`);

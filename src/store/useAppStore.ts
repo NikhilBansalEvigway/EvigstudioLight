@@ -11,6 +11,8 @@ import type {
 } from '@/types';
 import { DEFAULT_SETTINGS, canDeleteChat, canWriteChat, normalizeChat } from '@/types';
 import { loadSettings, saveSettings } from '@/lib/storage';
+import { loadWorkspaceSession, saveWorkspaceSession, deleteWorkspaceSession } from '@/lib/storage';
+import { buildWorkspaceTree } from '@/lib/fsWorkspace';
 import {
   getChatPersistenceMode,
   persistenceCreateChat,
@@ -70,10 +72,16 @@ interface AppState {
   clearContextFiles: () => void;
   removeWorkspacePathReferences: (path: string) => void;
 
+  // Workspace session (per chat, local)
+  hydrateWorkspaceSession: (chatId: string) => Promise<void>;
+  persistWorkspaceSession: (chatId: string) => Promise<void>;
+
   // Editor
   openEditorTabs: EditorTab[];
   activeFilePath: string | null;
   activeFileContent: string;
+  /** Bumps whenever editor/workspace session changes (used for autosave). */
+  workspaceSessionRevision: number;
   setActiveFile: (path: string | null, content: string) => void;
   setActiveEditorFile: (path: string) => void;
   setActiveFileContent: (content: string) => void;
@@ -123,7 +131,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       const chats = raw.map((c) => normalizeChat(c));
       chats.sort((a, b) => b.updatedAt - a.updatedAt);
       set({ chats });
-      if (chats.length > 0) set({ activeChatId: chats[0].id });
+      if (chats.length > 0) {
+        set({ activeChatId: chats[0].id });
+        void get().hydrateWorkspaceSession(chats[0].id);
+      }
       if (getChatPersistenceMode() === 'server' && chats.length > 0) {
         void get().refreshChat(chats[0].id);
       }
@@ -132,8 +143,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ chats: [], activeChatId: null });
     }
   },
-  resetChats: () => set({ chats: [], activeChatId: null }),
+  resetChats: () =>
+    set({
+      chats: [],
+      activeChatId: null,
+      workspaceRoots: [],
+      workspaceHandle: null,
+      fileTree: [],
+      contextFiles: [],
+      openEditorTabs: [],
+      activeFilePath: null,
+      activeFileContent: '',
+    }),
   createChat: async () => {
+    const prevActive = get().activeChatId;
     const modeBefore = getChatPersistenceMode();
     const chat = normalizeChat(await persistenceCreateChat());
     const modeAfter = getChatPersistenceMode();
@@ -142,13 +165,25 @@ export const useAppStore = create<AppState>((set, get) => ({
         await get().initChats();
       } catch (e) {
         console.error('[EvigStudio] initChats after offline fallback', e);
+        if (prevActive && prevActive !== chat.id) {
+          void get().persistWorkspaceSession(prevActive);
+        }
         set((s) => ({ chats: [chat, ...s.chats], activeChatId: chat.id }));
+        void get().hydrateWorkspaceSession(chat.id);
         return chat.id;
       }
+      if (prevActive && prevActive !== chat.id) {
+        void get().persistWorkspaceSession(prevActive);
+      }
       set({ activeChatId: chat.id });
+      void get().hydrateWorkspaceSession(chat.id);
       return chat.id;
     }
+    if (prevActive && prevActive !== chat.id) {
+      void get().persistWorkspaceSession(prevActive);
+    }
     set((s) => ({ chats: [chat, ...s.chats], activeChatId: chat.id }));
+    void get().hydrateWorkspaceSession(chat.id);
     return chat.id;
   },
   refreshChat: async (id) => {
@@ -168,7 +203,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   selectChat: (id) => {
+    const prev = get().activeChatId;
+    if (prev && prev !== id) {
+      void get().persistWorkspaceSession(prev);
+    }
     set({ activeChatId: id });
+    void get().hydrateWorkspaceSession(id);
     if (getChatPersistenceMode() === 'server') {
       void get().refreshChat(id);
     }
@@ -181,11 +221,32 @@ export const useAppStore = create<AppState>((set, get) => ({
         return;
       }
       await persistenceDeleteChat(id);
+      await deleteWorkspaceSession(id).catch(() => undefined);
+      const prevActive = get().activeChatId;
+      const nextActive =
+        prevActive === id ? (get().chats.find((c) => c.id !== id)?.id ?? null) : prevActive;
+
       set((s) => ({
         chats: s.chats.filter((c) => c.id !== id),
-        activeChatId:
-          s.activeChatId === id ? (s.chats.find((c) => c.id !== id)?.id ?? null) : s.activeChatId,
+        activeChatId: nextActive,
       }));
+
+      if (prevActive === id) {
+        if (nextActive) {
+          void get().hydrateWorkspaceSession(nextActive);
+        } else {
+          // No chats left
+          set({
+            workspaceRoots: [],
+            workspaceHandle: null,
+            fileTree: [],
+            contextFiles: [],
+            openEditorTabs: [],
+            activeFilePath: null,
+            activeFileContent: '',
+          });
+        }
+      }
     } catch (e) {
       console.error('[EvigStudio] deleteChat failed', e);
       toast.error(
@@ -393,10 +454,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   openEditorTabs: [],
   activeFilePath: null,
   activeFileContent: '',
+  workspaceSessionRevision: 0,
   setActiveFile: (path, content) =>
     set((s) => {
       if (!path) {
-        return { activeFilePath: null, activeFileContent: '', rightPaneTab: 'editor' };
+        return {
+          activeFilePath: null,
+          activeFileContent: '',
+          rightPaneTab: 'editor',
+          workspaceSessionRevision: s.workspaceSessionRevision + 1,
+        };
       }
 
       const existingTab = s.openEditorTabs.find((tab) => tab.path === path);
@@ -405,6 +472,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         activeFilePath: path,
         activeFileContent: existingTab?.content ?? content,
         rightPaneTab: 'editor',
+        workspaceSessionRevision: s.workspaceSessionRevision + 1,
       };
     }),
   setActiveEditorFile: (path) =>
@@ -425,6 +493,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         openEditorTabs: s.openEditorTabs.map((tab) =>
           tab.path === s.activeFilePath ? { ...tab, content } : tab,
         ),
+        workspaceSessionRevision: s.workspaceSessionRevision + 1,
       };
     }),
   markEditorFileSaved: (path, content) =>
@@ -433,6 +502,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         tab.path === path ? { ...tab, content, savedContent: content } : tab,
       ),
       ...(s.activeFilePath === path ? { activeFileContent: content } : {}),
+      workspaceSessionRevision: s.workspaceSessionRevision + 1,
     })),
   syncEditorFileContent: (path, content) =>
     set((s) => {
@@ -443,6 +513,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           tab.path === path ? { ...tab, content, savedContent: content } : tab,
         ),
         ...(s.activeFilePath === path ? { activeFileContent: content } : {}),
+        workspaceSessionRevision: s.workspaceSessionRevision + 1,
       };
     }),
   closeEditorFile: (path) =>
@@ -503,6 +574,105 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
     }),
 
+  hydrateWorkspaceSession: async (chatId) => {
+    try {
+      const session = await loadWorkspaceSession(chatId);
+      if (!session) {
+        // No session for this chat: start clean.
+        set({
+          workspaceRoots: [],
+          workspaceHandle: null,
+          fileTree: [],
+          contextFiles: [],
+          openEditorTabs: [],
+          activeFilePath: null,
+          activeFileContent: '',
+        });
+        return;
+      }
+
+      // Restore UI state first (even if FS permissions are missing, tabs stay visible).
+      const hydratedRoots = (session.workspaceRoots ?? [])
+        .filter((root) => !!root.handle)
+        .map((root) => ({ id: root.id, label: root.label, handle: root.handle! }));
+      set({
+        workspaceRoots: hydratedRoots,
+        workspaceHandle: hydratedRoots[0]?.handle ?? null,
+        contextFiles: session.contextFiles ?? [],
+        openEditorTabs: session.openEditorTabs ?? [],
+        activeFilePath: session.activeFilePath ?? null,
+        activeFileContent:
+          (session.activeFilePath
+            ? (session.openEditorTabs ?? []).find((t) => t.path === session.activeFilePath)?.content
+            : (session.openEditorTabs ?? [])[0]?.content) ??
+          '',
+      });
+
+      // Try to rebuild file tree; if permission is revoked, keep tree empty.
+      const roots = hydratedRoots;
+      if (roots.length > 0) {
+        try {
+          const tree = await buildWorkspaceTree(roots);
+          set({ fileTree: tree });
+        } catch (e) {
+          console.warn('[EvigStudio] workspace hydrate: could not rebuild file tree', e);
+          set({ fileTree: [] });
+        }
+      } else {
+        set({ fileTree: [] });
+      }
+    } catch (e) {
+      console.warn('[EvigStudio] hydrateWorkspaceSession failed', e);
+    }
+  },
+
+  persistWorkspaceSession: async (chatId) => {
+    const s = get();
+    if (!chatId) return;
+    if (s.activeChatId && s.activeChatId !== chatId) return;
+
+    // Cap payload size to avoid runaway IndexedDB growth.
+    const MAX_TABS = 25;
+    const MAX_TAB_CHARS = 200_000;
+    const tabs = s.openEditorTabs.slice(-MAX_TABS).map((tab) => ({
+      path: tab.path,
+      content: tab.content.length > MAX_TAB_CHARS ? `${tab.content.slice(0, MAX_TAB_CHARS)}\n\n… [truncated]` : tab.content,
+      savedContent: tab.savedContent.length > MAX_TAB_CHARS ? `${tab.savedContent.slice(0, MAX_TAB_CHARS)}\n\n… [truncated]` : tab.savedContent,
+    }));
+
+    const rootsForStorage = s.workspaceRoots.map((root) => ({
+      id: root.id,
+      label: root.label,
+      handle: root.handle,
+    }));
+
+    try {
+      await saveWorkspaceSession({
+        chatId,
+        updatedAt: Date.now(),
+        workspaceRoots: rootsForStorage,
+        openEditorTabs: tabs,
+        activeFilePath: s.activeFilePath,
+        contextFiles: s.contextFiles,
+      });
+    } catch (e) {
+      // FileSystemDirectoryHandle may not be serializable in some environments.
+      console.warn('[EvigStudio] persistWorkspaceSession failed; retrying without handles', e);
+      try {
+        await saveWorkspaceSession({
+          chatId,
+          updatedAt: Date.now(),
+          workspaceRoots: rootsForStorage.map((root) => ({ ...root, handle: null })),
+          openEditorTabs: tabs,
+          activeFilePath: s.activeFilePath,
+          contextFiles: s.contextFiles,
+        });
+      } catch (e2) {
+        console.warn('[EvigStudio] persistWorkspaceSession failed (no-handles)', e2);
+      }
+    }
+  },
+
   showSettings: false,
   setShowSettings: (v) => set({ showSettings: v }),
   rightPaneTab: 'files',
@@ -515,3 +685,36 @@ export const useAppStore = create<AppState>((set, get) => ({
   isStreaming: false,
   setIsStreaming: (v) => set({ isStreaming: v }),
 }));
+
+// Debounced autosave of per-chat workspace session.
+let workspaceSessionTimer: number | null = null;
+let lastWorkspaceSessionKey = '';
+useAppStore.subscribe((state) => {
+  const chatId = state.activeChatId;
+  if (!chatId) return;
+  const rootsSig = state.workspaceRoots.map((r) => `${r.id}:${r.label}`).join('|');
+  const tabsSig = state.openEditorTabs.map((t) => `${t.path}:${t.content !== t.savedContent ? 1 : 0}`).join('|');
+  const ctxSig = state.contextFiles.join('|');
+  const activeSig = state.activeFilePath ?? '';
+  const key = `${chatId}::${rootsSig}::${tabsSig}::${ctxSig}::${activeSig}::${state.workspaceSessionRevision}`;
+  if (key === lastWorkspaceSessionKey) return;
+  lastWorkspaceSessionKey = key;
+
+  if (workspaceSessionTimer) window.clearTimeout(workspaceSessionTimer);
+  workspaceSessionTimer = window.setTimeout(() => {
+    void useAppStore.getState().persistWorkspaceSession(chatId);
+  }, 350);
+});
+
+if (typeof window !== 'undefined') {
+  const flush = () => {
+    const st = useAppStore.getState();
+    if (st.activeChatId) {
+      void st.persistWorkspaceSession(st.activeChatId);
+    }
+  };
+  window.addEventListener('pagehide', flush);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flush();
+  });
+}

@@ -108,6 +108,26 @@ export interface WorkspaceRoot {
   handle: FileSystemDirectoryHandle;
 }
 
+export interface PersistedWorkspaceRoot {
+  id: string;
+  label: string;
+  /** Stored in IndexedDB when supported; may be null if persistence is unavailable. */
+  handle: FileSystemDirectoryHandle | null;
+}
+
+export interface WorkspaceSession {
+  chatId: string;
+  updatedAt: number;
+  workspaceRoots: PersistedWorkspaceRoot[];
+  openEditorTabs: Array<{
+    path: string;
+    content: string;
+    savedContent: string;
+  }>;
+  activeFilePath: string | null;
+  contextFiles: string[];
+}
+
 export interface ParsedPatch {
   filePath: string;
   content: string;

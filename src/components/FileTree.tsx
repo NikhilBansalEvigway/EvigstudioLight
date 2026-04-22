@@ -247,8 +247,14 @@ export function FileTree() {
       setFileTree([]);
       return;
     }
-    const tree = await buildWorkspaceTree(workspaceRoots);
-    setFileTree(tree);
+    try {
+      const tree = await buildWorkspaceTree(workspaceRoots);
+      setFileTree(tree);
+    } catch (err: any) {
+      console.error('Refresh tree failed:', err);
+      toast.error(`Could not refresh file tree: ${err?.message ?? String(err)}`);
+      setFileTree([]);
+    }
   }, [workspaceRoots, setFileTree]);
 
   const handleDelete = useCallback(async (mode: 'trash' | 'delete') => {
@@ -353,6 +359,31 @@ export function FileTree() {
   }, []);
 
   if (fileTree.length === 0) {
+    if (workspaceRoots.length > 0) {
+      return (
+        <div className="flex h-full items-center justify-center p-4 text-center">
+          <div className="w-full max-w-[260px] rounded-2xl border border-dashed border-border/70 bg-gradient-to-b from-card via-card to-muted/30 px-5 py-7 shadow-[inset_0_1px_0_hsl(var(--background)/0.9)]">
+            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl border border-primary/15 bg-primary/8 text-primary shadow-sm">
+              <FolderOpen className="h-6 w-6 opacity-90" />
+            </div>
+            <p className="text-sm font-semibold text-foreground">Workspace restored</p>
+            <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+              Your folders and open tabs were restored for this chat. Click refresh to rebuild the file tree if it is empty.
+            </p>
+            <div className="mt-4 flex items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={() => void refreshTree()}
+                className="rounded-xl border border-border/70 bg-background px-3 py-2 text-[10px] font-medium text-muted-foreground transition-all hover:border-primary/20 hover:text-foreground"
+              >
+                Refresh tree
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="flex h-full items-center justify-center p-4 text-center">
         <div className="w-full max-w-[240px] rounded-2xl border border-dashed border-border/70 bg-gradient-to-b from-card via-card to-muted/30 px-5 py-7 shadow-[inset_0_1px_0_hsl(var(--background)/0.9)]">

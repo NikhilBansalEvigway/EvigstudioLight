@@ -1,10 +1,10 @@
 import { openDB, type IDBPDatabase } from 'idb';
-import type { Chat, AppSettings } from '@/types';
+import type { Chat, AppSettings, WorkspaceSession } from '@/types';
 import { normalizeChat } from '@/types';
 import { DEFAULT_SETTINGS } from '@/types';
 
 const DB_NAME = 'offline-dev-agent';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 let dbPromise: Promise<IDBPDatabase> | null = null;
 
@@ -20,6 +20,10 @@ function getDB() {
         }
         if (oldVersion < 2 && db.objectStoreNames.contains('chats')) {
           // v2: chats may include privacy, threadId, tags, versionHistory — no store shape change
+        }
+
+        if (!db.objectStoreNames.contains('workspaceSessions')) {
+          db.createObjectStore('workspaceSessions', { keyPath: 'chatId' });
         }
       },
     });
@@ -82,4 +86,20 @@ export async function loadSettings(): Promise<AppSettings> {
 export async function saveSettings(settings: AppSettings): Promise<void> {
   const db = await getDB();
   await db.put('settings', settings, 'app-settings');
+}
+
+export async function loadWorkspaceSession(chatId: string): Promise<WorkspaceSession | null> {
+  const db = await getDB();
+  const row = await db.get('workspaceSessions', chatId);
+  return (row as WorkspaceSession) ?? null;
+}
+
+export async function saveWorkspaceSession(session: WorkspaceSession): Promise<void> {
+  const db = await getDB();
+  await db.put('workspaceSessions', session);
+}
+
+export async function deleteWorkspaceSession(chatId: string): Promise<void> {
+  const db = await getDB();
+  await db.delete('workspaceSessions', chatId);
 }
