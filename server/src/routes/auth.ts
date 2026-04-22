@@ -21,12 +21,30 @@ const registerSchema = z.object({
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1).max(128),
+  rememberMe: z.boolean().optional(),
 });
 
 const changePasswordSchema = z.object({
   currentPassword: z.string().min(1).max(128),
   newPassword: z.string().min(8).max(128),
 });
+
+const REMEMBER_ME_MAX_AGE_SECONDS = 60 * 60 * 24 * 30;
+
+function setSessionCookie(
+  c: Parameters<typeof setCookie>[0],
+  token: string,
+  options?: { rememberMe?: boolean },
+) {
+  const rememberMe = options?.rememberMe === true;
+  setCookie(c, COOKIE_NAME, token, {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: process.env.NODE_ENV === 'production',
+    ...(rememberMe ? { maxAge: REMEMBER_ME_MAX_AGE_SECONDS } : {}),
+  });
+}
 
 authRoutes.post('/register', async (c) => {
   const body = registerSchema.safeParse(await c.req.json());
@@ -55,13 +73,7 @@ authRoutes.post('/register', async (c) => {
       role: row.role,
     });
 
-    setCookie(c, COOKIE_NAME, token, {
-      path: '/',
-      httpOnly: true,
-      sameSite: 'Lax',
-      maxAge: 60 * 60 * 24 * 7,
-      secure: process.env.NODE_ENV === 'production',
-    });
+    setSessionCookie(c, token);
 
     await writeStructuredAuditLog({
       action: 'user.register',
@@ -114,19 +126,17 @@ authRoutes.post('/login', async (c) => {
     return c.json({ error: 'Invalid email or password' }, 401);
   }
 
-  const token = await signSession({
-    sub: user.id,
-    email: user.email,
-    role: user.role,
-  });
+  const rememberMe = body.data.rememberMe === true;
+  const token = await signSession(
+    {
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+    },
+    rememberMe ? '30d' : '7d',
+  );
 
-  setCookie(c, COOKIE_NAME, token, {
-    path: '/',
-    httpOnly: true,
-    sameSite: 'Lax',
-    maxAge: 60 * 60 * 24 * 7,
-    secure: process.env.NODE_ENV === 'production',
-  });
+  setSessionCookie(c, token, { rememberMe });
 
   await writeStructuredAuditLog({
     action: 'auth.login',
@@ -140,6 +150,7 @@ authRoutes.post('/login', async (c) => {
       label: user.email,
     },
     result: { status: 'success', code: 200 },
+    details: { rememberMe },
   });
 
   return c.json({

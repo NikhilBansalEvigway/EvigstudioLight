@@ -18,12 +18,15 @@ export type SessionPayload = {
   exp?: number;
 };
 
-export async function signSession(payload: Omit<SessionPayload, 'iat' | 'exp'>): Promise<string> {
+export async function signSession(
+  payload: Omit<SessionPayload, 'iat' | 'exp'>,
+  expiresIn: string = '7d',
+): Promise<string> {
   return new SignJWT({ email: payload.email, role: payload.role })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(payload.sub)
     .setIssuedAt()
-    .setExpirationTime('7d')
+    .setExpirationTime(expiresIn)
     .sign(getSecret());
 }
 

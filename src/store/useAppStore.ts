@@ -15,6 +15,7 @@ import {
 export interface EditorTab {
   path: string;
   content: string;
+  savedContent: string;
 }
 
 interface AppState {
@@ -62,9 +63,11 @@ interface AppState {
   setActiveFile: (path: string | null, content: string) => void;
   setActiveEditorFile: (path: string) => void;
   setActiveFileContent: (content: string) => void;
+  markEditorFileSaved: (path: string, content: string) => void;
   syncEditorFileContent: (path: string, content: string) => void;
   closeEditorFile: (path: string) => void;
   renameEditorFile: (oldPath: string, newPath: string, content?: string) => void;
+  renameWorkspacePathReferences: (oldPath: string, newPath: string) => void;
 
   // UI
   showSettings: boolean;
@@ -322,7 +325,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
       const existingTab = s.openEditorTabs.find((tab) => tab.path === path);
       return {
-        openEditorTabs: existingTab ? s.openEditorTabs : [...s.openEditorTabs, { path, content }],
+        openEditorTabs: existingTab ? s.openEditorTabs : [...s.openEditorTabs, { path, content, savedContent: content }],
         activeFilePath: path,
         activeFileContent: existingTab?.content ?? content,
         rightPaneTab: 'editor',
@@ -348,13 +351,20 @@ export const useAppStore = create<AppState>((set, get) => ({
         ),
       };
     }),
+  markEditorFileSaved: (path, content) =>
+    set((s) => ({
+      openEditorTabs: s.openEditorTabs.map((tab) =>
+        tab.path === path ? { ...tab, content, savedContent: content } : tab,
+      ),
+      ...(s.activeFilePath === path ? { activeFileContent: content } : {}),
+    })),
   syncEditorFileContent: (path, content) =>
     set((s) => {
       const hasOpenTab = s.openEditorTabs.some((tab) => tab.path === path);
       if (!hasOpenTab) return {};
       return {
         openEditorTabs: s.openEditorTabs.map((tab) =>
-          tab.path === path ? { ...tab, content } : tab,
+          tab.path === path ? { ...tab, content, savedContent: content } : tab,
         ),
         ...(s.activeFilePath === path ? { activeFileContent: content } : {}),
       };
@@ -375,7 +385,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   renameEditorFile: (oldPath, newPath, content) =>
     set((s) => {
       const updatedTabs = s.openEditorTabs.map((tab) =>
-        tab.path === oldPath ? { path: newPath, content: content ?? tab.content } : tab,
+        tab.path === oldPath
+          ? {
+              ...tab,
+              path: newPath,
+              content: content ?? tab.content,
+              savedContent: content ?? tab.savedContent,
+            }
+          : tab,
       );
       if (!updatedTabs.some((tab) => tab.path === newPath)) return {};
       const renamedTab = updatedTabs.find((tab) => tab.path === newPath);
@@ -387,6 +404,26 @@ export const useAppStore = create<AppState>((set, get) => ({
               activeFileContent: renamedTab?.content ?? content ?? s.activeFileContent,
             }
           : {}),
+      };
+    }),
+  renameWorkspacePathReferences: (oldPath, newPath) =>
+    set((s) => {
+      const withSlash = `${oldPath}/`;
+      const mapPath = (path: string) => {
+        if (path === oldPath) return newPath;
+        if (path.startsWith(withSlash)) {
+          return `${newPath}/${path.slice(withSlash.length)}`;
+        }
+        return path;
+      };
+
+      return {
+        openEditorTabs: s.openEditorTabs.map((tab) => ({
+          ...tab,
+          path: mapPath(tab.path),
+        })),
+        activeFilePath: s.activeFilePath ? mapPath(s.activeFilePath) : null,
+        contextFiles: s.contextFiles.map(mapPath),
       };
     }),
 

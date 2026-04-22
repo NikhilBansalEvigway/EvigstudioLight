@@ -1,9 +1,30 @@
-1. users should only see their conversation and admin can se all the users conversations but in a locked fashion, if the conversation is shared or they are in a team/group they should also see these conversations.
+# EvigStudio Next Todo
 
-2. File Search with good css for file listing and viewing (in current implementation there is no file search feature in FILES when we open a folder so implement this feature with good ui icons animations in the FILES )
+## Highest Priority
 
-3. in the chat when it edits/wrote a file it shows it in the buttom but we want to make it clickable so that we can open it when user click on them it should be opened in the editor beside the other files if some other files are already opens.
+1. Add focused tests for the riskiest shared features
+   - Chat access and lock rules: `server/src/routes/chats.ts`, `server/src/rbac.ts`
+   - Auth/session behavior: `server/src/routes/auth.ts`
+   - Workspace file operations: `src/lib/fsWorkspace.ts`, especially rename and delete paths
 
-4. This coding agent doesnot write structured code for big files see what can be done here so for big files it writes proper syntax and indentation code 
+## Regression Coverage
 
-5. Password change for admin and users (through admin portal)
+## Completed
+
+- `Remember me` no longer stores the raw password in `localStorage`.
+- Login now remembers only the email on the client and sends `rememberMe` to the backend.
+- The auth server now records remember-me logins in audit data and only makes the cookie persistent when the checkbox is enabled.
+- Workspace rename now supports files, folders, and workspace-relative moves instead of only same-folder file renames.
+- File tree folder rows now expose rename/move actions, and open editor/context path references stay in sync after moves.
+- Agent tool reads now support large-file ranged requests like `*** Read File: src/file.ts#L120-L240`.
+- Added parser coverage for ranged read tool syntax in `src/test/agentTools.test.ts`.
+- Editor tabs now track dirty state, warn before closing unsaved work, support save-all, and register a browser unload warning while edits are unsaved.
+- Sidebar discovery now includes mine/shared/team/locked filters plus visibility badges for private/shared/team chats and read-only state.
+- Shared team workspace references are now visible in the main app Context pane, with copy actions for the stored paths.
+
+## Already Done From The Old List
+
+- File search in the file tree already exists in `src/components/FileTree.tsx`.
+- Clickable file badges after agent edits already exist in `src/components/ChatMessage.tsx` and `src/components/ChatPane.tsx`.
+- Password change already exists for self-service and admin flows in `src/pages/AdminPage.tsx` and `server/src/routes/auth.ts`.
+- A `Remember me` checkbox exists already, but it needs a security/behavior fix rather than a fresh implementation.

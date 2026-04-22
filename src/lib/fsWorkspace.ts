@@ -14,8 +14,101 @@ function sanitizePath(path: string): string[] {
     .filter(part => part.length > 0 && part !== '.' && part !== '..');
 }
 
+async function getDirectoryHandleForParts(
+  dirHandle: FileSystemDirectoryHandle,
+  parts: string[],
+  options?: { create?: boolean },
+): Promise<FileSystemDirectoryHandle> {
+  let current = dirHandle;
+  for (const part of parts) {
+    current = await current.getDirectoryHandle(part, { create: options?.create === true });
+  }
+  return current;
+}
+
+async function entryExists(dirHandle: FileSystemDirectoryHandle, name: string): Promise<boolean> {
+  try {
+    await dirHandle.getFileHandle(name);
+    return true;
+  } catch {
+    try {
+      await dirHandle.getDirectoryHandle(name);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+async function writeBinaryFile(
+  dirHandle: FileSystemDirectoryHandle,
+  name: string,
+  data: ArrayBuffer,
+): Promise<void> {
+  const fileHandle = await dirHandle.getFileHandle(name, { create: true });
+  const writable = await (fileHandle as any).createWritable();
+  await writable.write(data);
+  await writable.close();
+}
+
+async function copyDirectoryRecursive(
+  source: FileSystemDirectoryHandle,
+  target: FileSystemDirectoryHandle,
+): Promise<void> {
+  for await (const [name, handle] of (source as any).entries()) {
+    if (handle.kind === 'directory') {
+      const next = await target.getDirectoryHandle(name, { create: true });
+      await copyDirectoryRecursive(handle as FileSystemDirectoryHandle, next);
+      continue;
+    }
+
+    const file = await (handle as FileSystemFileHandle).getFile();
+    await writeBinaryFile(target, name, await file.arrayBuffer());
+  }
+}
+
 export function isFileSystemAccessSupported(): boolean {
-  return 'showDirectoryPicker' in window;
+  return getFileSystemAccessStatus().supported;
+}
+
+export type FileSystemAccessSupportReason = 'supported' | 'insecure-context' | 'unsupported-browser';
+
+export interface FileSystemAccessStatus {
+  supported: boolean;
+  reason: FileSystemAccessSupportReason;
+  message: string | null;
+}
+
+export function getFileSystemAccessStatus(): FileSystemAccessStatus {
+  if (typeof window === 'undefined') {
+    return {
+      supported: false,
+      reason: 'unsupported-browser',
+      message: 'File System Access requires Chrome or Edge. Firefox/Safari not supported.',
+    };
+  }
+
+  if ('showDirectoryPicker' in window) {
+    return {
+      supported: true,
+      reason: 'supported',
+      message: null,
+    };
+  }
+
+  if (!window.isSecureContext) {
+    return {
+      supported: false,
+      reason: 'insecure-context',
+      message: 'Workspace access over the network requires HTTPS in Chrome or Edge. Open EvigStudio via HTTPS or use localhost.',
+    };
+  }
+
+  return {
+    supported: false,
+    reason: 'unsupported-browser',
+    message: 'File System Access requires Chrome or Edge. Firefox/Safari not supported.',
+  };
 }
 
 export async function pickDirectory(): Promise<FileSystemDirectoryHandle | null> {
@@ -110,30 +203,45 @@ export async function deleteFileOrDir(dirHandle: FileSystemDirectoryHandle, path
 export async function renameFileOrDir(
   dirHandle: FileSystemDirectoryHandle,
   oldPath: string,
-  newName: string
+  newPath: string,
 ): Promise<void> {
-  const parts = sanitizePath(oldPath);
-  if (parts.length === 0) throw new Error(`Invalid path: "${oldPath}"`);
+  const oldParts = sanitizePath(oldPath);
+  const newParts = sanitizePath(newPath);
+  if (oldParts.length === 0) throw new Error(`Invalid path: "${oldPath}"`);
+  if (newParts.length === 0) throw new Error(`Invalid path: "${newPath}"`);
 
-  const oldName = parts[parts.length - 1];
-  if (oldName === newName) return;
+  const oldNormalized = oldParts.join('/');
+  const newNormalized = newParts.join('/');
+  if (oldNormalized === newNormalized) return;
 
-  let parentHandle: FileSystemDirectoryHandle = dirHandle;
-  for (let i = 0; i < parts.length - 1; i++) {
-    parentHandle = await parentHandle.getDirectoryHandle(parts[i]);
+  const movingDirectoryIntoItself =
+    newParts.length > oldParts.length &&
+    oldParts.every((part, index) => newParts[index] === part);
+  if (movingDirectoryIntoItself) {
+    throw new Error('Cannot move a folder inside itself');
   }
 
-  // Read old file content, create new, delete old
-  const oldFileHandle = await parentHandle.getFileHandle(oldName);
-  const file = await oldFileHandle.getFile();
-  const content = await file.text();
+  const oldParent = await getDirectoryHandleForParts(dirHandle, oldParts.slice(0, -1));
+  const newParent = await getDirectoryHandleForParts(dirHandle, newParts.slice(0, -1), { create: true });
+  const oldName = oldParts[oldParts.length - 1];
+  const newName = newParts[newParts.length - 1];
 
-  const newFileHandle = await parentHandle.getFileHandle(newName, { create: true });
-  const writable = await (newFileHandle as any).createWritable();
-  await writable.write(content);
-  await writable.close();
+  if (await entryExists(newParent, newName)) {
+    throw new Error(`Target already exists: "${newNormalized}"`);
+  }
 
-  await (parentHandle as any).removeEntry(oldName);
+  try {
+    const fileHandle = await oldParent.getFileHandle(oldName);
+    const file = await fileHandle.getFile();
+    await writeBinaryFile(newParent, newName, await file.arrayBuffer());
+    await (oldParent as any).removeEntry(oldName);
+    return;
+  } catch {
+    const sourceDir = await oldParent.getDirectoryHandle(oldName);
+    const targetDir = await newParent.getDirectoryHandle(newName, { create: true });
+    await copyDirectoryRecursive(sourceDir, targetDir);
+    await (oldParent as any).removeEntry(oldName, { recursive: true });
+  }
 }
 
 export function getFileExtension(name: string): string {

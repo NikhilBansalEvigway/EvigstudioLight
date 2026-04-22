@@ -81,27 +81,10 @@ export function parsePatches(text: string): ParsedPatch[] {
   return patches;
 }
 
-/** True when the patch body looks like a unified diff (not a plain full-file dump). */
-function isUnifiedDiffBody(content: string): boolean {
+/** Existing-file updates must use real unified diff hunks. */
+function hasUnifiedDiffHunks(content: string): boolean {
   if (!content.trim()) return false;
-  const lines = content.split(/\r?\n/);
-  if (lines.some((l) => l.trimStart().startsWith('@@'))) return true;
-  const hasMinus = lines.some((l) => {
-    const t = l.trimStart();
-    return t.startsWith('-') && !t.startsWith('---');
-  });
-  if (hasMinus) return true;
-  const hasPlus = lines.some((l) => {
-    const t = l.trimStart();
-    return t.startsWith('+') && !t.startsWith('+++');
-  });
-  return (
-    hasPlus &&
-    lines.some((l) => {
-      const t = l.trimStart();
-      return t.startsWith('-') && !t.startsWith('---');
-    })
-  );
+  return content.split(/\r?\n/).some((l) => l.trimStart().startsWith('@@'));
 }
 
 /** New file / “all additions” body: strip leading `+` / single space from diff-style lines. */
@@ -122,26 +105,51 @@ function applyUnifiedDiff(originalContent: string, patchContent: string): string
   const origLines = originalContent.split(/\r?\n/);
   const result: string[] = [];
   let origIdx = 0;
+  let i = 0;
 
-  for (const line of lines) {
-    const t = line.trimStart();
-    if (t.startsWith('@@')) continue;
-    if (t.startsWith('-')) {
+  while (i < lines.length) {
+    const header = lines[i].match(/^@@\s*-(\d+)(?:,(\d+))?\s*\+(\d+)(?:,(\d+))?\s*@@/);
+    if (!header) {
+      i++;
+      continue;
+    }
+
+    const oldStart = Math.max(1, Number(header[1]));
+    const targetOrigIdx = oldStart - 1;
+
+    while (origIdx < targetOrigIdx && origIdx < origLines.length) {
+      result.push(origLines[origIdx]);
       origIdx++;
-    } else if (t.startsWith('+')) {
-      result.push(t.slice(1));
-    } else if (t.startsWith(' ') && t.length > 1) {
-      result.push(t.slice(1));
-      origIdx++;
-    } else if (line.trim() === '') {
-      result.push('');
-    } else {
-      if (origIdx < origLines.length) {
-        result.push(origLines[origIdx]);
+    }
+
+    i++;
+    while (i < lines.length && !lines[i].startsWith('@@')) {
+      const line = lines[i];
+
+      if (line.startsWith(' ')) {
+        const expected = line.slice(1);
+        if (origLines[origIdx] !== expected) {
+          throw new Error(`Patch context mismatch at line ${origIdx + 1}`);
+        }
+        result.push(expected);
         origIdx++;
+      } else if (line.startsWith('-')) {
+        const expected = line.slice(1);
+        if (origLines[origIdx] !== expected) {
+          throw new Error(`Patch removal mismatch at line ${origIdx + 1}`);
+        }
+        origIdx++;
+      } else if (line.startsWith('+')) {
+        result.push(line.slice(1));
+      } else if (line === '\\ No newline at end of file') {
+        // Ignore diff metadata line.
+      } else if (line.trim() === '') {
+        throw new Error('Invalid unified diff line: blank lines inside hunks must use a prefix');
       } else {
-        result.push(line);
+        throw new Error(`Invalid unified diff line: ${line}`);
       }
+
+      i++;
     }
   }
 
@@ -156,7 +164,7 @@ function applyUnifiedDiff(originalContent: string, patchContent: string): string
 /**
  * Apply a patch to file content.
  * - `create`: write body (strip `+` lines if present).
- * - `update`: if body looks like unified diff, merge; else replace whole file (handles models that omit @@/-+).
+ * - `update`: apply real unified diff hunks; reject unsafe whole-file replacements for existing files.
  */
 export function applyPatch(originalContent: string, patch: ParsedPatch): string {
   const { content, operation = 'update' } = patch;
@@ -184,7 +192,7 @@ export function applyPatch(originalContent: string, patch: ParsedPatch): string 
     return originalContent;
   }
 
-  if (!isUnifiedDiffBody(content)) {
+  if (!hasUnifiedDiffHunks(content)) {
     const nonEmpty = lines.filter((l) => l.trim() !== '');
     const onlyPlusStyle =
       nonEmpty.length > 0 &&
@@ -195,6 +203,11 @@ export function applyPatch(originalContent: string, patch: ParsedPatch): string 
     if (onlyPlusStyle && nonEmpty.some((l) => l.trimStart().startsWith('+'))) {
       return stripDiffAdditions(content);
     }
+
+    if (originalContent.length > 0) {
+      throw new Error('Unsafe update patch for existing file: use @@ hunks instead of full-file replacement');
+    }
+
     return content;
   }
 

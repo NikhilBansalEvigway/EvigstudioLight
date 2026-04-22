@@ -13,8 +13,14 @@ export interface AgentAction {
   error?: string;
 }
 
+export interface ReadTarget {
+  path: string;
+  startLine?: number;
+  endLine?: number;
+}
+
 export type ParsedAgentTools = {
-  readFiles: string[];
+  readFiles: ReadTarget[];
   listDirs: string[];
   writeFiles: { path: string; content: string }[];
   deletePaths: string[];
@@ -35,8 +41,68 @@ function normalizeToolPath(raw: string): string {
   return p;
 }
 
+function normalizeLineNumber(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function readTargetKey(target: ReadTarget): string {
+  return `${target.path}:${target.startLine ?? ''}:${target.endLine ?? ''}`;
+}
+
+function parseReadTarget(raw: string): ReadTarget | null {
+  const trimmed = raw.trim().replace(/^[`'"]+|[`'"]+$/g, '');
+  const match = trimmed.match(/^(.*?)(?:#L(\d+)(?:-L?(\d+))?)?$/i);
+  if (!match) return null;
+
+  const path = normalizeToolPath(match[1] ?? '');
+  if (!path) return null;
+
+  const startLine = normalizeLineNumber(match[2]);
+  const endLineRaw = normalizeLineNumber(match[3]);
+  if (!startLine) {
+    return { path };
+  }
+
+  return {
+    path,
+    startLine,
+    endLine: endLineRaw && endLineRaw >= startLine ? endLineRaw : startLine,
+  };
+}
+
+function formatReadLabel(target: ReadTarget): string {
+  if (!target.startLine) return target.path;
+  const endLine = target.endLine ?? target.startLine;
+  return `${target.path}#L${target.startLine}-L${endLine}`;
+}
+
+function formatReadChunk(target: ReadTarget, content: string): string {
+  const lines = content.split(/\r?\n/);
+  const totalLines = lines.length;
+  const maxLines = 220;
+  const startLine = Math.min(Math.max(1, target.startLine ?? 1), totalLines);
+  const requestedEnd = target.endLine ?? (startLine + maxLines - 1);
+  const endLine = Math.max(startLine, Math.min(totalLines, requestedEnd));
+  const visibleLines = lines.slice(startLine - 1, endLine);
+  const numbered = visibleLines.map((line, index) => `${startLine + index}: ${line}`).join('\n');
+
+  const notes = [`Showing lines ${startLine}-${endLine} of ${totalLines}.`];
+  if (endLine < totalLines) {
+    const nextEnd = Math.min(totalLines, endLine + maxLines);
+    notes.push(`Continue with: *** Read File: ${target.path}#L${endLine + 1}-L${nextEnd}`);
+  }
+  if (startLine > 1) {
+    const prevStart = Math.max(1, startLine - maxLines);
+    notes.push(`Earlier lines: *** Read File: ${target.path}#L${prevStart}-L${startLine - 1}`);
+  }
+
+  return `${notes.join(' ')}\n\n\`\`\`\n${numbered}${numbered ? '\n' : ''}\`\`\``;
+}
+
 export function parseToolCalls(text: string): ParsedAgentTools {
-  const readFiles: string[] = [];
+  const readFiles: ReadTarget[] = [];
   const listDirs: string[] = [];
   const writeFiles: { path: string; content: string }[] = [];
   const deletePaths: string[] = [];
@@ -46,8 +112,10 @@ export function parseToolCalls(text: string): ParsedAgentTools {
 
   READ_RE.lastIndex = 0;
   while ((m = READ_RE.exec(text)) !== null) {
-    const p = normalizeToolPath(m[1] ?? '');
-    if (p && !readFiles.includes(p)) readFiles.push(p);
+    const target = parseReadTarget(m[1] ?? '');
+    if (target && !readFiles.some((existing) => readTargetKey(existing) === readTargetKey(target))) {
+      readFiles.push(target);
+    }
   }
 
   LIST_RE.lastIndex = 0;
@@ -97,8 +165,6 @@ export function hasGatherTools(t: ParsedAgentTools): boolean {
   return t.readFiles.length > 0 || t.listDirs.length > 0;
 }
 
-const MAX_FILE_CHARS = 2000;
-
 export interface AgentToolResult {
   textFeedback: string;
   actions: AgentAction[];
@@ -111,20 +177,16 @@ export async function executeAgentTools(
   const parts: string[] = [];
   const actions: AgentAction[] = [];
 
-  for (const path of tools.readFiles) {
+  for (const target of tools.readFiles) {
+    const label = formatReadLabel(target);
     try {
-      let content = await readFile(workspaceHandle, path);
-      if (content.length > MAX_FILE_CHARS) {
-        content =
-          content.slice(0, MAX_FILE_CHARS) +
-          `\n\n… [truncated, ${content.length} chars total]`;
-      }
-      parts.push(`### Read File: ${path}\n\`\`\`\n${content}\n\`\`\``);
-      actions.push({ type: 'read', path, success: true });
+      const content = await readFile(workspaceHandle, target.path);
+      parts.push(`### Read File: ${label}\n${formatReadChunk(target, content)}`);
+      actions.push({ type: 'read', path: label, success: true });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      parts.push(`### Read File: ${path}\n(Error: could not read — ${msg})`);
-      actions.push({ type: 'read', path, success: false, error: msg });
+      parts.push(`### Read File: ${label}\n(Error: could not read — ${msg})`);
+      actions.push({ type: 'read', path: label, success: false, error: msg });
     }
   }
 
@@ -168,8 +230,7 @@ export async function executeAgentTools(
 
   for (const { oldPath, newPath } of tools.renamePaths) {
     try {
-      const newName = newPath.split('/').pop() ?? newPath;
-      await renameFileOrDir(workspaceHandle, oldPath, newName);
+      await renameFileOrDir(workspaceHandle, oldPath, newPath);
       parts.push(`### Rename File: ${oldPath} -> ${newPath}\n(Renamed successfully)`);
       actions.push({ type: 'rename', path: `${oldPath} -> ${newPath}`, success: true });
     } catch (e) {

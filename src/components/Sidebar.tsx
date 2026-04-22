@@ -1,10 +1,38 @@
 import { useAppStore } from '@/store/useAppStore';
 import { chatMatchesSearch, groupChatsForSidebar } from '@/lib/chatFilters';
+import { useAuth } from '@/contexts/AuthContext';
 import { toast } from 'sonner';
-import { Plus, MessageSquare, Trash2, Search, Pencil, Check, X, Lock } from 'lucide-react';
+import { Plus, MessageSquare, Trash2, Search, Pencil, Check, X, Lock, Globe2, Users } from 'lucide-react';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { canDeleteChat, canWriteChat, type Chat } from '@/types';
 import { format } from 'date-fns';
+
+type SidebarFilter = 'all' | 'mine' | 'shared' | 'group' | 'locked';
+
+const SIDEBAR_FILTERS: Array<{ id: SidebarFilter; label: string }> = [
+  { id: 'all', label: 'All' },
+  { id: 'mine', label: 'Mine' },
+  { id: 'shared', label: 'Shared' },
+  { id: 'group', label: 'Team' },
+  { id: 'locked', label: 'Locked' },
+];
+
+function matchesSidebarFilter(chat: Chat, filter: SidebarFilter, userId: string | null): boolean {
+  const privacy = chat.privacy ?? 'private';
+
+  switch (filter) {
+    case 'mine':
+      return chat.ownerId ? chat.ownerId === userId : canWriteChat(chat);
+    case 'shared':
+      return privacy === 'shared';
+    case 'group':
+      return privacy === 'group';
+    case 'locked':
+      return !canWriteChat(chat);
+    default:
+      return true;
+  }
+}
 
 type ChatRowProps = {
   chat: Chat;
@@ -35,6 +63,7 @@ function ChatRow({
 }: ChatRowProps) {
   const canWrite = canWriteChat(chat);
   const canDelete = canDeleteChat(chat);
+  const privacy = chat.privacy ?? 'private';
 
   return (
     <div
@@ -90,6 +119,22 @@ function ChatRow({
               {chat.ownerDisplayName ? `${chat.ownerDisplayName} · ` : ''}
               {format(chat.updatedAt, 'MMM d, HH:mm')}
             </span>
+            <div className="mt-1 flex flex-wrap items-center gap-1">
+              <span className="inline-flex items-center gap-1 rounded-full border border-border/70 bg-background px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-muted-foreground">
+                {privacy === 'shared' ? <Globe2 className="h-2.5 w-2.5" /> : privacy === 'group' ? <Users className="h-2.5 w-2.5" /> : <Lock className="h-2.5 w-2.5" />}
+                {privacy === 'shared' ? 'Shared' : privacy === 'group' ? 'Team' : 'Private'}
+              </span>
+              {chat.groupName && (
+                <span className="rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary">
+                  {chat.groupName}
+                </span>
+              )}
+              {!canWrite && (
+                <span className="rounded-full border border-border/70 bg-muted px-1.5 py-0.5 text-[9px] text-muted-foreground">
+                  Read only
+                </span>
+              )}
+            </div>
           </div>
           <div className="flex items-center gap-0.5">
             {!canWrite && <Lock className="w-3 h-3 text-muted-foreground" />}
@@ -125,15 +170,18 @@ function ChatRow({
 }
 
 export function Sidebar() {
+  const { user } = useAuth();
   const { chats, activeChatId, createChat, selectChat, deleteChat, renameChat } = useAppStore();
   const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState<SidebarFilter>('all');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
   const editInputRef = useRef<HTMLInputElement>(null);
 
-  const filtered = search.trim()
-    ? chats.filter((c) => chatMatchesSearch(c, search))
-    : chats;
+  const filtered = chats.filter((c) => {
+    if (!matchesSidebarFilter(c, filter, user?.id ?? null)) return false;
+    return search.trim() ? chatMatchesSearch(c, search) : true;
+  });
   const { noThread, threads } = groupChatsForSidebar(filtered);
 
   const startRename = useCallback((chatId: string, currentTitle: string) => {
@@ -199,6 +247,22 @@ export function Sidebar() {
             placeholder="Search title, tags, messages…"
             className="bg-transparent outline-none flex-1 text-foreground placeholder:text-muted-foreground"
           />
+        </div>
+        <div className="mt-2 flex flex-wrap gap-1">
+          {SIDEBAR_FILTERS.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              onClick={() => setFilter(option.id)}
+              className={`rounded-full border px-2 py-0.5 text-[10px] transition-colors ${
+                filter === option.id
+                  ? 'border-primary/30 bg-primary/10 text-primary'
+                  : 'border-border/70 bg-background text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              {option.label}
+            </button>
+          ))}
         </div>
       </div>
 

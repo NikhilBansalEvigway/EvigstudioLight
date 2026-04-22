@@ -1,10 +1,11 @@
 import { useAppStore } from '@/store/useAppStore';
+import { useAuth } from '@/contexts/AuthContext';
 import { FileTree } from '@/components/FileTree';
-import { pickDirectory, buildFileTree, isFileSystemAccessSupported, writeFile, getFileExtension } from '@/lib/fsWorkspace';
+import { pickDirectory, buildFileTree, getFileSystemAccessStatus, writeFile, getFileExtension } from '@/lib/fsWorkspace';
 import { SYSTEM_PROMPT } from '@/types';
-import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus, X } from 'lucide-react';
+import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus, X, Copy, Users } from 'lucide-react';
 import { toast } from 'sonner';
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useTheme } from 'next-themes';
 import Editor from '@monaco-editor/react';
 
@@ -23,23 +24,120 @@ function getMonacoLanguage(filePath: string): string {
   return map[ext] || 'plaintext';
 }
 
+type SharedWorkspaceRow = {
+  id: string;
+  label: string;
+  rootPath: string;
+  groupId: string;
+  groupName: string;
+};
+
 export function WorkspacePane() {
   const {
     rightPaneTab, setRightPaneTab,
     workspaceHandle, setWorkspaceHandle, setFileTree,
-    openEditorTabs, activeFilePath, activeFileContent, setActiveFileContent, setActiveEditorFile, closeEditorFile,
+    openEditorTabs, activeFilePath, activeFileContent, setActiveFileContent, setActiveEditorFile, closeEditorFile, markEditorFileSaved,
     contextFiles, toggleContextFile, clearContextFiles,
   } = useAppStore();
+  const { serverAvailable, user } = useAuth();
 
   const { resolvedTheme } = useTheme();
   const [newFileName, setNewFileName] = useState('');
   const [showNewFile, setShowNewFile] = useState(false);
+  const [sharedWorkspaces, setSharedWorkspaces] = useState<SharedWorkspaceRow[]>([]);
+  const [loadingSharedWorkspaces, setLoadingSharedWorkspaces] = useState(false);
 
-  const fsSupported = isFileSystemAccessSupported();
+  const fsAccessStatus = getFileSystemAccessStatus();
+  const fsSupported = fsAccessStatus.supported;
+  const dirtyTabs = openEditorTabs.filter((tab) => tab.content !== tab.savedContent);
+  const activeTab = openEditorTabs.find((tab) => tab.path === activeFilePath) ?? null;
+  const activeDirty = !!activeTab && activeTab.content !== activeTab.savedContent;
+
+  useEffect(() => {
+    if (dirtyTabs.length === 0) return;
+
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [dirtyTabs.length]);
+
+  useEffect(() => {
+    if (rightPaneTab !== 'context' || !serverAvailable || !user) {
+      if (!serverAvailable || !user) {
+        setSharedWorkspaces([]);
+      }
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      setLoadingSharedWorkspaces(true);
+      try {
+        const groupResponse = await fetch('/api/groups', { credentials: 'include' });
+        if (!groupResponse.ok) throw new Error('Could not load groups');
+
+        const groupData = (await groupResponse.json()) as {
+          groups?: Array<{ id: string; name: string }>;
+        };
+        const groups = Array.isArray(groupData.groups) ? groupData.groups : [];
+        const workspaceLists = await Promise.all(
+          groups.map(async (group) => {
+            const response = await fetch(`/api/groups/${group.id}/workspaces`, { credentials: 'include' });
+            if (!response.ok) return [] as SharedWorkspaceRow[];
+
+            const data = (await response.json()) as {
+              workspaces?: Array<{ id: string; label: string; rootPath: string; groupId: string }>;
+            };
+
+            return (data.workspaces ?? []).map((workspace) => ({
+              id: workspace.id,
+              label: workspace.label,
+              rootPath: workspace.rootPath,
+              groupId: workspace.groupId,
+              groupName: group.name,
+            }));
+          }),
+        );
+
+        if (!cancelled) {
+          setSharedWorkspaces(workspaceLists.flat());
+        }
+      } catch {
+        if (!cancelled) {
+          setSharedWorkspaces([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoadingSharedWorkspaces(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [rightPaneTab, serverAvailable, user]);
+
+  const handleSavePath = useCallback(async (path: string) => {
+    const state = useAppStore.getState();
+    if (!state.workspaceHandle) throw new Error('No workspace folder open');
+
+    const tab = state.openEditorTabs.find((entry) => entry.path === path);
+    if (!tab) return false;
+    if (tab.content === tab.savedContent) return false;
+
+    await writeFile(state.workspaceHandle, path, tab.content);
+    markEditorFileSaved(path, tab.content);
+    return true;
+  }, [markEditorFileSaved]);
 
   const handleOpenFolder = async () => {
     if (!fsSupported) {
-      toast.error('File System Access API not supported. Use Chrome or Edge.');
+      toast.error(fsAccessStatus.message ?? 'File System Access API not supported.');
       return;
     }
     const handle = await pickDirectory();
@@ -61,13 +159,42 @@ export function WorkspacePane() {
   const handleSave = async () => {
     if (!workspaceHandle || !activeFilePath) return;
     try {
-      await writeFile(workspaceHandle, activeFilePath, activeFileContent);
+      const saved = await handleSavePath(activeFilePath);
+      if (!saved) return;
       toast.success(`Saved ${activeFilePath} ✅`);
-      handleRefresh();
+      await handleRefresh();
     } catch (err: any) {
       toast.error(`Save failed: ${err.message}`);
     }
   };
+
+  const handleSaveAll = useCallback(async () => {
+    if (dirtyTabs.length === 0) return;
+
+    try {
+      let savedCount = 0;
+      for (const tab of dirtyTabs) {
+        if (await handleSavePath(tab.path)) {
+          savedCount += 1;
+        }
+      }
+      if (savedCount > 0) {
+        toast.success(`Saved ${savedCount} file${savedCount === 1 ? '' : 's'} ✅`);
+        await handleRefresh();
+      }
+    } catch (err: any) {
+      toast.error(`Save all failed: ${err.message}`);
+    }
+  }, [dirtyTabs, handleRefresh, handleSavePath]);
+
+  const handleCloseTab = useCallback((path: string) => {
+    const tab = openEditorTabs.find((entry) => entry.path === path);
+    const isDirty = !!tab && tab.content !== tab.savedContent;
+    if (isDirty && !window.confirm(`Discard unsaved changes in ${path}?`)) {
+      return;
+    }
+    closeEditorFile(path);
+  }, [closeEditorFile, openEditorTabs]);
 
   const handleCreateFile = async () => {
     if (!workspaceHandle || !newFileName.trim()) return;
@@ -150,7 +277,7 @@ export function WorkspacePane() {
             {!fsSupported && (
               <div className="flex items-start gap-2 border-b border-warning/20 bg-warning/10 px-3 py-2 text-[10px]">
                 <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-warning" />
-                <span className="text-warning">File System Access requires Chrome or Edge. Firefox/Safari not supported.</span>
+                <span className="text-warning">{fsAccessStatus.message}</span>
               </div>
             )}
             {showNewFile && workspaceHandle && (
@@ -190,27 +317,30 @@ export function WorkspacePane() {
                       const shortName = tab.path.split('/').pop() ?? tab.path;
                       return (
                         <div
-                          key={tab.path}
-                          className={`group inline-flex max-w-[220px] shrink-0 items-center gap-1 rounded-xl border px-2 py-1 text-[10px] transition-colors ${
-                            isActive
-                              ? 'border-primary/30 bg-primary/10 text-primary'
-                              : 'border-border/70 bg-background text-muted-foreground hover:border-primary/20 hover:text-foreground'
-                          }`}
-                        >
-                          <button
-                            type="button"
-                            onClick={() => setActiveEditorFile(tab.path)}
-                            className="min-w-0 flex-1 truncate text-left"
-                            title={tab.path}
+                            key={tab.path}
+                            className={`group inline-flex max-w-[220px] shrink-0 items-center gap-1 rounded-xl border px-2 py-1 text-[10px] transition-colors ${
+                              isActive
+                                ? 'border-primary/30 bg-primary/10 text-primary'
+                                : 'border-border/70 bg-background text-muted-foreground hover:border-primary/20 hover:text-foreground'
+                            }`}
                           >
-                            {shortName}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => closeEditorFile(tab.path)}
-                            className="rounded p-0.5 text-current/70 transition-colors hover:bg-background/70 hover:text-foreground"
-                            title={`Close ${tab.path}`}
-                          >
+                            <button
+                              type="button"
+                              onClick={() => setActiveEditorFile(tab.path)}
+                              className="min-w-0 flex-1 truncate text-left"
+                              title={tab.path}
+                            >
+                              <span className="inline-flex min-w-0 items-center gap-1">
+                                {tab.content !== tab.savedContent && <span className="h-1.5 w-1.5 rounded-full bg-warning" />}
+                                <span className="truncate">{shortName}</span>
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleCloseTab(tab.path)}
+                              className="rounded p-0.5 text-current/70 transition-colors hover:bg-background/70 hover:text-foreground"
+                              title={`Close ${tab.path}`}
+                            >
                             <X className="h-3 w-3" />
                           </button>
                         </div>
@@ -219,13 +349,27 @@ export function WorkspacePane() {
                   </div>
                 )}
                 <div className="flex items-center justify-between px-3 py-1.5 border-b border-border">
-                  <span className="text-[10px] text-muted-foreground truncate">{activeFilePath}</span>
-                  <button
-                    onClick={handleSave}
-                    className="flex items-center gap-1 px-2 py-0.5 rounded bg-accent/15 text-accent text-[10px] hover:bg-accent/25 transition-colors"
-                  >
-                    <Save className="w-3 h-3" /> Save
-                  </button>
+                  <div className="min-w-0">
+                    <span className="text-[10px] text-muted-foreground truncate">{activeFilePath}</span>
+                    {activeDirty && <div className="text-[10px] text-warning">Unsaved changes</div>}
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {dirtyTabs.length > 0 && (
+                      <button
+                        onClick={() => void handleSaveAll()}
+                        className="flex items-center gap-1 px-2 py-0.5 rounded border border-border/70 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+                      >
+                        Save all ({dirtyTabs.length})
+                      </button>
+                    )}
+                    <button
+                      onClick={() => void handleSave()}
+                      disabled={!activeDirty}
+                      className="flex items-center gap-1 px-2 py-0.5 rounded bg-accent/15 text-accent text-[10px] hover:bg-accent/25 transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <Save className="w-3 h-3" /> Save
+                    </button>
+                  </div>
                 </div>
                 <div className="flex-1 min-h-0">
                   <Editor
@@ -315,6 +459,51 @@ export function WorkspacePane() {
 
         {rightPaneTab === 'context' && (
           <div className="p-3 space-y-2">
+            {serverAvailable && user && (
+              <div className="space-y-2 rounded-xl border border-border/70 bg-card/80 p-3">
+                <div className="flex items-center gap-2">
+                  <Users className="h-3.5 w-3.5 text-primary" />
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
+                    Shared Team Paths
+                  </span>
+                </div>
+                {loadingSharedWorkspaces ? (
+                  <p className="text-xs text-muted-foreground">Loading shared workspace references…</p>
+                ) : sharedWorkspaces.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No shared workspace references are available for your teams yet.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {sharedWorkspaces.map((workspace) => (
+                      <div key={workspace.id} className="rounded-lg border border-border/70 bg-background px-3 py-2 text-xs">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="font-medium text-foreground">{workspace.label}</div>
+                            <div className="text-[10px] text-primary">{workspace.groupName}</div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void navigator.clipboard.writeText(workspace.rootPath);
+                              toast.success(`Copied ${workspace.label}`);
+                            }}
+                            className="inline-flex items-center gap-1 rounded-md border border-border/70 px-2 py-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+                            title={`Copy ${workspace.rootPath}`}
+                          >
+                            <Copy className="h-3 w-3" />
+                            Copy
+                          </button>
+                        </div>
+                        <div className="mt-2 break-all rounded-md bg-secondary px-2 py-1.5 text-[11px] text-muted-foreground">
+                          {workspace.rootPath}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             <div className="flex items-center justify-between">
               <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">Injected Files</span>
               {contextFiles.length > 0 && (

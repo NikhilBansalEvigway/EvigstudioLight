@@ -1,12 +1,15 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { useAppStore } from '@/store/useAppStore';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Logo } from '@/components/Logo';
 import { toast } from 'sonner';
+
+const REMEMBER_ME_KEY = 'evigstudio.remembered-login';
 
 export default function Login() {
   const navigate = useNavigate();
@@ -17,7 +20,23 @@ export default function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
+  const [rememberMe, setRememberMe] = useState(false);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(REMEMBER_ME_KEY);
+      if (!saved) return;
+
+      const parsed = JSON.parse(saved) as { email?: string };
+      if (typeof parsed.email !== 'string') return;
+
+      setEmail(parsed.email);
+      setRememberMe(true);
+    } catch {
+      window.localStorage.removeItem(REMEMBER_ME_KEY);
+    }
+  }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -30,7 +49,7 @@ export default function Login() {
       const path = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
       const body =
         mode === 'login'
-          ? { email, password }
+          ? { email, password, rememberMe }
           : { email, password, displayName: displayName || email.split('@')[0] };
 
       const r = await fetch(path, {
@@ -44,6 +63,14 @@ export default function Login() {
       if (!r.ok) {
         toast.error(data.error || 'Request failed');
         return;
+      }
+
+      if (mode === 'login') {
+        if (rememberMe) {
+          window.localStorage.setItem(REMEMBER_ME_KEY, JSON.stringify({ email }));
+        } else {
+          window.localStorage.removeItem(REMEMBER_ME_KEY);
+        }
       }
 
       await refresh();
@@ -122,6 +149,24 @@ export default function Login() {
               <p className="text-[10px] text-muted-foreground">At least 8 characters. First registered user becomes admin.</p>
             )}
           </div>
+          {mode === 'login' && (
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="rememberMe"
+                checked={rememberMe}
+                onCheckedChange={(checked) => {
+                  const enabled = checked === true;
+                  setRememberMe(enabled);
+                  if (!enabled) {
+                    window.localStorage.removeItem(REMEMBER_ME_KEY);
+                  }
+                }}
+              />
+              <Label htmlFor="rememberMe" className="text-sm font-normal">
+                Remember my email and keep me signed in
+              </Label>
+            </div>
+          )}
           <Button type="submit" className="w-full" disabled={loading || !serverAvailable}>
             {loading ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}
           </Button>

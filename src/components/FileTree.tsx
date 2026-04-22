@@ -76,6 +76,16 @@ function countTreeStats(nodes: FileNode[]): TreeStats {
   return { files, directories };
 }
 
+function resolveRenamePath(currentPath: string, nextValue: string): string {
+  const trimmed = nextValue.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!trimmed) return currentPath;
+  if (trimmed.includes('/')) return trimmed;
+
+  const parts = currentPath.split('/');
+  parts[parts.length - 1] = trimmed;
+  return parts.join('/');
+}
+
 function filterTree(nodes: FileNode[], query: string): FileNode[] {
   const q = query.trim().toLowerCase();
   if (!q) return nodes;
@@ -159,16 +169,16 @@ function getFileVisual(name: string): { Icon: LucideIcon; iconClassName: string;
 }
 
 export function FileTree() {
-  const {
-    activeFilePath,
-    closeEditorFile,
-    contextFiles,
-    fileTree,
-    renameEditorFile,
-    setActiveFile,
-    setFileTree,
-    toggleContextFile,
-    workspaceHandle,
+    const {
+      activeFilePath,
+      closeEditorFile,
+      contextFiles,
+      fileTree,
+      renameWorkspacePathReferences,
+      setActiveFile,
+      setFileTree,
+      toggleContextFile,
+      workspaceHandle,
   } = useAppStore();
 
   const [deleteTarget, setDeleteTarget] = useState<FileNode | null>(null);
@@ -217,15 +227,13 @@ export function FileTree() {
 
   const handleRename = useCallback(async () => {
     if (!renameTarget || !workspaceHandle || !renameName.trim()) return;
+    const nextPath = resolveRenamePath(renameTarget.path, renameName);
     try {
-      await renameFileOrDir(workspaceHandle, renameTarget.path, renameName.trim());
-      const parts = renameTarget.path.split('/');
-      parts[parts.length - 1] = renameName.trim();
-      const newPath = parts.join('/');
-      const content = await readFile(workspaceHandle, newPath);
-      renameEditorFile(renameTarget.path, newPath, content);
-      if (activeFilePath === renameTarget.path) {
-        setActiveFile(newPath, content);
+      await renameFileOrDir(workspaceHandle, renameTarget.path, nextPath);
+      renameWorkspacePathReferences(renameTarget.path, nextPath);
+      if (renameTarget.type === 'file' && activeFilePath === renameTarget.path) {
+        const content = await readFile(workspaceHandle, nextPath);
+        setActiveFile(nextPath, content);
       }
       await refreshTree();
     } catch (err: any) {
@@ -233,7 +241,7 @@ export function FileTree() {
     }
     setRenameTarget(null);
     setRenameName('');
-  }, [renameTarget, workspaceHandle, renameName, activeFilePath, renameEditorFile, setActiveFile, refreshTree]);
+  }, [renameTarget, workspaceHandle, renameName, activeFilePath, renameWorkspacePathReferences, setActiveFile, refreshTree]);
 
   const handleCreate = useCallback(async () => {
     if (!createState || !workspaceHandle || !createName.trim()) return;
@@ -395,19 +403,27 @@ export function FileTree() {
 
       <Dialog open={!!renameTarget} onOpenChange={(open) => { if (!open) { setRenameTarget(null); setRenameName(''); } }}>
         <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>Rename {renameTarget?.type === 'directory' ? 'folder' : 'file'}</DialogTitle>
-            <DialogDescription>Enter a new name for <strong>{renameTarget?.name}</strong></DialogDescription>
+            <DialogHeader>
+              <DialogTitle>Rename {renameTarget?.type === 'directory' ? 'folder' : 'file'}</DialogTitle>
+            <DialogDescription>
+              Use a new name to rename in place, or enter a workspace-relative path to move <strong>{renameTarget?.name}</strong>.
+            </DialogDescription>
           </DialogHeader>
           <Input
             value={renameName}
             onChange={(e) => setRenameName(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleRename()}
+            placeholder={renameTarget?.type === 'directory' ? 'new-folder or src/new-folder' : 'new-name.ext or src/new-name.ext'}
             autoFocus
           />
           <DialogFooter>
             <Button variant="outline" onClick={() => { setRenameTarget(null); setRenameName(''); }}>Cancel</Button>
-            <Button onClick={handleRename} disabled={!renameName.trim() || renameName === renameTarget?.name}>Rename</Button>
+            <Button
+              onClick={handleRename}
+              disabled={!renameName.trim() || resolveRenamePath(renameTarget?.path ?? '', renameName) === (renameTarget?.path ?? '')}
+            >
+              Rename / Move
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -505,6 +521,14 @@ function TreeNode({
             </button>
             <button
               type="button"
+              onClick={() => onRename(node)}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-primary"
+              title="Rename or move folder"
+            >
+              <Pencil className="h-3 w-3" />
+            </button>
+            <button
+              type="button"
               onClick={() => onDelete(node)}
               className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-destructive"
               title="Delete folder"
@@ -583,7 +607,7 @@ function TreeNode({
               onRename(node);
             }}
             className="rounded-md p-1 text-muted-foreground opacity-0 transition-all group-hover:opacity-100 hover:bg-secondary hover:text-primary"
-            title="Rename file"
+            title="Rename or move file"
           >
             <Pencil className="h-3 w-3" />
           </button>
