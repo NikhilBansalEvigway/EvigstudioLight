@@ -100,9 +100,135 @@ function stripDiffAdditions(content: string): string {
     .join('\n');
 }
 
+type CompareMode = 'exact' | 'trimEnd' | 'trim' | 'collapseWs';
+
+function normalizeForCompare(line: string, mode: CompareMode): string {
+  if (mode === 'trim') return line.trim();
+  if (mode === 'trimEnd') return line.trimEnd();
+  if (mode === 'collapseWs') return line.trim().replace(/\s+/g, ' ');
+  return line;
+}
+
+function linesEqual(a: string, b: string, mode: CompareMode): boolean {
+  return normalizeForCompare(a, mode) === normalizeForCompare(b, mode);
+}
+
+function findNeedleCandidates(opts: {
+  haystack: string[];
+  needle: string[];
+  start: number;
+  end: number;
+  mode: CompareMode;
+}): number[] {
+  const { haystack, needle, mode } = opts;
+  const start = Math.max(0, Math.min(haystack.length, opts.start));
+  const end = Math.max(start, Math.min(haystack.length, opts.end));
+  if (needle.length === 0) return [start];
+
+  const maxIdx = end - needle.length;
+  const out: number[] = [];
+  for (let i = start; i <= maxIdx; i++) {
+    let ok = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (!linesEqual(haystack[i + j] ?? '', needle[j] ?? '', mode)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) out.push(i);
+  }
+  return out;
+}
+
+function pickBestCandidate(candidates: number[], hintIdx: number, mode: CompareMode): number {
+  if (candidates.length === 0) throw new Error('No candidates');
+  if (candidates.length === 1) return candidates[0];
+
+  // Be conservative for whitespace-insensitive matching: if multiple places match, fail.
+  if (mode === 'trim' || mode === 'collapseWs') {
+    throw new Error('Ambiguous patch hunk location (multiple whitespace-insensitive matches)');
+  }
+
+  let best = candidates[0];
+  let bestDist = Math.abs(best - hintIdx);
+  for (let i = 1; i < candidates.length; i++) {
+    const idx = candidates[i];
+    const dist = Math.abs(idx - hintIdx);
+    if (dist < bestDist) {
+      best = idx;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
+function extractHunkOldLines(hunkLines: string[]): string[] {
+  const out: string[] = [];
+  for (const line of hunkLines) {
+    if (line.startsWith(' ') || line.startsWith('-')) out.push(line.slice(1));
+  }
+  return out;
+}
+
+function extractHunkNewLines(hunkLines: string[]): string[] {
+  const out: string[] = [];
+  for (const line of hunkLines) {
+    if (line.startsWith(' ') || line.startsWith('+')) out.push(line.slice(1));
+  }
+  return out;
+}
+
+function locateNeedle(opts: {
+  haystack: string[];
+  needle: string[];
+  minStart: number;
+  hintIdx: number;
+  mode: CompareMode;
+}): number | null {
+  const { haystack, needle, minStart, hintIdx, mode } = opts;
+  const SEARCH_BACK = 80;
+  const SEARCH_FWD = 220;
+
+  const windowStart = Math.max(minStart, hintIdx - SEARCH_BACK);
+  const windowEnd = Math.min(haystack.length, hintIdx + SEARCH_FWD);
+
+  const windowCandidates = findNeedleCandidates({
+    haystack,
+    needle,
+    start: windowStart,
+    end: windowEnd,
+    mode,
+  });
+  if (windowCandidates.length > 0) {
+    try {
+      return pickBestCandidate(windowCandidates, hintIdx, mode);
+    } catch {
+      // Ambiguous match for whitespace-insensitive modes.
+      return null;
+    }
+  }
+
+  const fullCandidates = findNeedleCandidates({
+    haystack,
+    needle,
+    start: minStart,
+    end: haystack.length,
+    mode,
+  });
+  if (fullCandidates.length === 0) return null;
+  if (fullCandidates.length === 1) return fullCandidates[0];
+
+  try {
+    return pickBestCandidate(fullCandidates, hintIdx, mode);
+  } catch {
+    return null;
+  }
+}
+
 function applyUnifiedDiff(originalContent: string, patchContent: string): string {
   const lines = patchContent.split(/\r?\n/);
   const origLines = originalContent.split(/\r?\n/);
+  const eol = originalContent.includes('\r\n') ? '\r\n' : '\n';
   const result: string[] = [];
   let origIdx = 0;
   let i = 0;
@@ -115,32 +241,137 @@ function applyUnifiedDiff(originalContent: string, patchContent: string): string
     }
 
     const oldStart = Math.max(1, Number(header[1]));
-    const targetOrigIdx = oldStart - 1;
 
-    while (origIdx < targetOrigIdx && origIdx < origLines.length) {
+    i++;
+    const hunkLines: string[] = [];
+    while (i < lines.length && !lines[i].startsWith('@@')) {
+      hunkLines.push(lines[i]);
+      i++;
+    }
+
+    const hintIdx = Math.max(origIdx, Math.min(origLines.length, oldStart - 1));
+    const oldNeedle = extractHunkOldLines(hunkLines);
+    const newNeedle = extractHunkNewLines(hunkLines);
+
+    type HunkLocation = { startIdx: number; mode: CompareMode; status: 'apply' | 'already_applied' };
+
+    const locateHunk = (): HunkLocation | null => {
+      const modes: CompareMode[] = ['exact', 'trimEnd', 'trim', 'collapseWs'];
+
+      // 1) Prefer locating by old content, but allow anchoring on a contiguous slice.
+      // This helps when some removed lines differ (e.g. already edited) but surrounding lines still exist.
+      const MAX_SLICE = 12;
+      for (const mode of modes) {
+        const n = oldNeedle.length;
+        const maxLen = Math.min(MAX_SLICE, n);
+
+        // Try longer slices first to reduce ambiguity.
+        for (let len = maxLen; len >= 2; len--) {
+          let best: { startIdx: number; dist: number } | null = null;
+          for (let s = 0; s + len <= n; s++) {
+            const slice = oldNeedle.slice(s, s + len);
+            const sliceHint = hintIdx + s;
+            const matchAt = locateNeedle({
+              haystack: origLines,
+              needle: slice,
+              minStart: origIdx,
+              hintIdx: sliceHint,
+              mode,
+            });
+            if (matchAt == null) continue;
+            const startIdx = matchAt - s;
+            if (startIdx < origIdx) continue;
+            const dist = Math.abs(startIdx - hintIdx);
+            if (!best || dist < best.dist) best = { startIdx, dist };
+          }
+          if (best) return { startIdx: best.startIdx, mode, status: 'apply' };
+        }
+
+        // If nothing matched with longer slices, allow a single-line anchor.
+        // For whitespace-insensitive modes, locateNeedle() will return null if the match is ambiguous.
+        if (n > 0) {
+          let best: { startIdx: number; dist: number } | null = null;
+          for (let s = 0; s < n; s++) {
+            const slice = [oldNeedle[s]];
+            const sliceHint = hintIdx + s;
+            const matchAt = locateNeedle({
+              haystack: origLines,
+              needle: slice,
+              minStart: origIdx,
+              hintIdx: sliceHint,
+              mode,
+            });
+            if (matchAt == null) continue;
+            const startIdx = matchAt - s;
+            if (startIdx < origIdx) continue;
+            const dist = Math.abs(startIdx - hintIdx);
+            if (!best || dist < best.dist) best = { startIdx, dist };
+          }
+          if (best) return { startIdx: best.startIdx, mode, status: 'apply' };
+        }
+      }
+
+      // 2) If old content can't be found, the patch might already be applied.
+      // Detect by locating the post-hunk lines in the file and treat as a no-op.
+      for (const mode of modes) {
+        const matchAt = locateNeedle({
+          haystack: origLines,
+          needle: newNeedle,
+          minStart: origIdx,
+          hintIdx,
+          mode,
+        });
+        if (matchAt != null) {
+          return { startIdx: matchAt, mode, status: 'already_applied' };
+        }
+      }
+
+      return null;
+    };
+
+    const located = locateHunk();
+    if (!located) {
+      throw new Error(`Patch context mismatch near original line ${oldStart}`);
+    }
+
+    while (origIdx < located.startIdx && origIdx < origLines.length) {
       result.push(origLines[origIdx]);
       origIdx++;
     }
 
-    i++;
-    while (i < lines.length && !lines[i].startsWith('@@')) {
-      const line = lines[i];
+    if (located.status === 'already_applied') {
+      const end = Math.min(origLines.length, origIdx + newNeedle.length);
+      for (; origIdx < end; origIdx++) {
+        result.push(origLines[origIdx]);
+      }
+      continue;
+    }
 
+    // Apply hunk into a scratch buffer. If it fails but the "new" lines already match,
+    // treat it as already applied.
+    const hunkOut: string[] = [];
+    let tempOrigIdx = origIdx;
+    let failed = false;
+    for (const line of hunkLines) {
       if (line.startsWith(' ')) {
         const expected = line.slice(1);
-        if (origLines[origIdx] !== expected) {
-          throw new Error(`Patch context mismatch at line ${origIdx + 1}`);
+        const actual = origLines[tempOrigIdx] ?? '';
+        if (!linesEqual(actual, expected, located.mode)) {
+          failed = true;
+          break;
         }
-        result.push(expected);
-        origIdx++;
+        hunkOut.push(actual);
+        tempOrigIdx++;
       } else if (line.startsWith('-')) {
         const expected = line.slice(1);
-        if (origLines[origIdx] !== expected) {
-          throw new Error(`Patch removal mismatch at line ${origIdx + 1}`);
+        const actual = origLines[tempOrigIdx] ?? '';
+        if (!linesEqual(actual, expected, located.mode)) {
+          failed = true;
+          break;
         }
-        origIdx++;
+        tempOrigIdx++;
       } else if (line.startsWith('+')) {
-        result.push(line.slice(1));
+        hunkOut.push(line.slice(1));
       } else if (line === '\\ No newline at end of file') {
         // Ignore diff metadata line.
       } else if (line.trim() === '') {
@@ -148,9 +379,28 @@ function applyUnifiedDiff(originalContent: string, patchContent: string): string
       } else {
         throw new Error(`Invalid unified diff line: ${line}`);
       }
-
-      i++;
     }
+
+    if (failed) {
+      const alreadyAt = locateNeedle({
+        haystack: origLines,
+        needle: newNeedle,
+        minStart: origIdx,
+        hintIdx: located.startIdx,
+        mode: located.mode,
+      });
+      if (alreadyAt === origIdx) {
+        const end = Math.min(origLines.length, origIdx + newNeedle.length);
+        for (; origIdx < end; origIdx++) {
+          result.push(origLines[origIdx]);
+        }
+        continue;
+      }
+      throw new Error(`Patch context mismatch at line ${tempOrigIdx + 1}`);
+    }
+
+    result.push(...hunkOut);
+    origIdx = tempOrigIdx;
   }
 
   while (origIdx < origLines.length) {
@@ -158,7 +408,7 @@ function applyUnifiedDiff(originalContent: string, patchContent: string): string
     origIdx++;
   }
 
-  return result.join('\n');
+  return result.join(eol);
 }
 
 /**
