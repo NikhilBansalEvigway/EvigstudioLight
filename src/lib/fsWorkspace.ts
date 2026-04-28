@@ -186,7 +186,7 @@ export function getFileSystemAccessStatus(): FileSystemAccessStatus {
 
 export async function pickDirectory(): Promise<FileSystemDirectoryHandle | null> {
   try {
-    return await (window as any).showDirectoryPicker({ mode: 'readwrite' });
+    return await (window as any).showDirectoryPicker({ id: 'evigstudio-workspace', mode: 'readwrite' });
   } catch (err: any) {
     if (err.name === 'AbortError') return null;
     throw err;
@@ -262,6 +262,10 @@ export async function buildWorkspaceTree(workspaceRoots: WorkspaceRoot[]): Promi
   );
 
   return roots.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+}
+
+export function removeWorkspaceRootFromTree(nodes: FileNode[], rootId: string): FileNode[] {
+  return nodes.filter((node) => node.workspaceRootId !== rootId);
 }
 
 export async function buildFileTree(

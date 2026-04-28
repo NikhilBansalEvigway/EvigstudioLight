@@ -10,6 +10,7 @@ import { Logo } from '@/components/Logo';
 import { toast } from 'sonner';
 
 const REMEMBER_ME_KEY = 'evigstudio.remembered-login';
+const NETWORK_ERROR_MESSAGE = 'Network error. Check your connection and try again.';
 
 export default function Login() {
   const navigate = useNavigate();
@@ -22,6 +23,7 @@ export default function Login() {
   const [displayName, setDisplayName] = useState('');
   const [rememberMe, setRememberMe] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [authMessage, setAuthMessage] = useState<string | null>(null);
 
   useEffect(() => {
     try {
@@ -40,8 +42,11 @@ export default function Login() {
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setAuthMessage(null);
     if (!serverAvailable) {
-      toast.error('Team server is not reachable. Start the API on port 3001 (see README), then refresh.');
+      const message = 'Team server is not reachable. Start the API on port 3001 (see README), then refresh.';
+      setAuthMessage(message);
+      toast.error(message);
       return;
     }
     setLoading(true);
@@ -58,10 +63,15 @@ export default function Login() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      const data = (await r.json()) as { error?: string };
+      const data = (await r.json().catch(() => ({}))) as { error?: string };
 
       if (!r.ok) {
-        toast.error(data.error || 'Request failed');
+        const message =
+          mode === 'login' && r.status === 401
+            ? 'No account was found for those details, or the password is incorrect.'
+            : data.error || 'Request failed';
+        setAuthMessage(message);
+        toast.error(message);
         return;
       }
 
@@ -77,7 +87,8 @@ export default function Login() {
       toast.success(mode === 'login' ? 'Signed in' : 'Account created');
       navigate('/', { replace: true });
     } catch {
-      toast.error('Network error');
+      setAuthMessage(NETWORK_ERROR_MESSAGE);
+      toast.error(NETWORK_ERROR_MESSAGE);
     } finally {
       setLoading(false);
     }
@@ -111,6 +122,11 @@ export default function Login() {
         </div>
 
         <form onSubmit={submit} className="space-y-4">
+          {authMessage && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {authMessage}
+            </div>
+          )}
           {mode === 'register' && (
             <div className="space-y-2">
               <Label htmlFor="displayName">Display name</Label>
@@ -175,7 +191,10 @@ export default function Login() {
         <button
           type="button"
           className="w-full text-xs text-muted-foreground hover:text-primary transition-colors"
-          onClick={() => setMode(mode === 'login' ? 'register' : 'login')}
+          onClick={() => {
+            setAuthMessage(null);
+            setMode(mode === 'login' ? 'register' : 'login');
+          }}
         >
           {mode === 'login' ? 'Need an account? Register' : 'Have an account? Sign in'}
         </button>

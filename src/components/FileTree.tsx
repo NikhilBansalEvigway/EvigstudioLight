@@ -48,6 +48,7 @@ import {
   trashWorkspacePath,
   getFileExtension,
   readWorkspaceFile,
+  removeWorkspaceRootFromTree,
   renameWorkspacePath,
 } from '@/lib/fsWorkspace';
 import { useAppStore } from '@/store/useAppStore';
@@ -253,7 +254,6 @@ export function FileTree() {
     } catch (err: any) {
       console.error('Refresh tree failed:', err);
       toast.error(`Could not refresh file tree: ${err?.message ?? String(err)}`);
-      setFileTree([]);
     }
   }, [workspaceRoots, setFileTree]);
 
@@ -269,16 +269,31 @@ export function FileTree() {
 
     try {
       if (deleteTarget.isWorkspaceRoot) {
-        if (workspaceRoots.length === 1) {
+        const state = useAppStore.getState();
+        const rootId = deleteTarget.workspaceRootId;
+        const root = rootId ? state.workspaceRoots.find((entry) => entry.id === rootId) : null;
+
+        if (!rootId || !root) {
+          throw new Error('Workspace folder was already removed');
+        }
+
+        if (state.workspaceRoots.length === 1) {
           clearWorkspace();
         } else {
-          removeWorkspacePathReferences(deleteTarget.path);
-          removeWorkspaceRoot(deleteTarget.workspaceRootId ?? '');
-          const nextRoots = workspaceRoots.filter((root) => root.id !== deleteTarget.workspaceRootId);
-          const tree = await buildWorkspaceTree(nextRoots);
-          setFileTree(tree);
+          const nextRoots = state.workspaceRoots.filter((entry) => entry.id !== rootId);
+          removeWorkspacePathReferences(root.label);
+          removeWorkspaceRoot(rootId);
+          setFileTree(removeWorkspaceRootFromTree(state.fileTree, rootId));
+
+          try {
+            const tree = await buildWorkspaceTree(nextRoots);
+            setFileTree(tree);
+          } catch (err: any) {
+            console.error('Refresh tree after removing workspace root failed:', err);
+            toast.error(`Removed ${root.label}, but could not refresh the remaining tree: ${err?.message ?? String(err)}`);
+          }
         }
-        toast.success(`Removed ${deleteTarget.name} from the workspace`);
+        toast.success(`Removed ${root.label} from the workspace`);
       } else {
         if (mode === 'trash') {
           await trashWorkspacePath(workspaceRoots, deleteTarget.path);

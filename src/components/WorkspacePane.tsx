@@ -7,6 +7,7 @@ import {
   getFileExtension,
   getUniqueWorkspaceLabel,
   pickDirectory,
+  removeWorkspaceRootFromTree,
   writeWorkspaceFile,
 } from '@/lib/fsWorkspace';
 import { SYSTEM_PROMPT } from '@/types';
@@ -152,6 +153,7 @@ export function WorkspacePane() {
       toast.error(fsAccessStatus.message ?? 'File System Access API not supported.');
       return;
     }
+    toast.message('EvigStudio is requesting folder access. Approve the browser prompt to import files.');
     const handle = await pickDirectory();
     if (handle) {
       const currentRoots = useAppStore.getState().workspaceRoots;
@@ -207,8 +209,14 @@ export function WorkspacePane() {
 
     const nextRoots = state.workspaceRoots.filter((entry) => entry.id !== rootId);
     removeWorkspaceRoot(rootId);
-    const tree = await buildWorkspaceTree(nextRoots);
-    setFileTree(tree);
+    setFileTree(removeWorkspaceRootFromTree(state.fileTree, rootId));
+    try {
+      const tree = await buildWorkspaceTree(nextRoots);
+      setFileTree(tree);
+    } catch (err: any) {
+      console.error('Refresh tree after removing workspace root failed:', err);
+      toast.error(`Removed ${root.label}, but could not refresh the remaining tree: ${err?.message ?? String(err)}`);
+    }
     toast.success(`Removed ${root.label} from the workspace`);
   }, [clearWorkspace, removeWorkspacePathReferences, removeWorkspaceRoot, setFileTree]);
 
