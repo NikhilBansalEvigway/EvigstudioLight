@@ -4,8 +4,8 @@ services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
-    ports:
-      - "5434:5432"
+    # ports:
+    #   - "5434:5432"
     environment:
       POSTGRES_USER: evigstudio
       POSTGRES_PASSWORD: evigstudio
