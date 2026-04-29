@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseToolCalls } from '@/lib/agentTools';
+import { hasMutationTools, parseToolCalls, stripToolMarkers } from '@/lib/agentTools';
 
 describe('parseToolCalls', () => {
   it('parses plain and ranged read-file requests', () => {
@@ -20,5 +20,42 @@ describe('parseToolCalls', () => {
     expect(parsed.readFiles).toEqual([
       { path: 'src/main.tsx', startLine: 42, endLine: 42 },
     ]);
+  });
+
+  it('parses exact edit-file search and replace blocks', () => {
+    const parsed = parseToolCalls([
+      '*** Edit File: src/App.tsx',
+      '*** Begin Search',
+      'const title = "Old";',
+      '*** End Search',
+      '*** Begin Replace',
+      'const title = "New";',
+      '*** End Replace',
+    ].join('\n'));
+
+    expect(parsed.editFiles).toEqual([
+      {
+        path: 'src/App.tsx',
+        search: 'const title = "Old";',
+        replace: 'const title = "New";',
+      },
+    ]);
+    expect(hasMutationTools(parsed)).toBe(true);
+  });
+
+  it('strips edit-file tool markers from assistant display text', () => {
+    const text = [
+      'I will update the title.',
+      '*** Edit File: src/App.tsx',
+      '*** Begin Search',
+      'old',
+      '*** End Search',
+      '*** Begin Replace',
+      'new',
+      '*** End Replace',
+      'Done.',
+    ].join('\n');
+
+    expect(stripToolMarkers(text)).toBe('I will update the title.\n\nDone.');
   });
 });

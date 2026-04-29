@@ -8,7 +8,7 @@ import {
 import type { WorkspaceRoot } from '@/types';
 
 export interface AgentAction {
-  type: 'read' | 'write' | 'delete' | 'rename' | 'list';
+  type: 'read' | 'edit' | 'write' | 'delete' | 'rename' | 'list';
   path: string;
   success: boolean;
   error?: string;
@@ -23,6 +23,7 @@ export interface ReadTarget {
 export type ParsedAgentTools = {
   readFiles: ReadTarget[];
   listDirs: string[];
+  editFiles: { path: string; search: string; replace: string }[];
   writeFiles: { path: string; content: string }[];
   deletePaths: string[];
   renamePaths: { oldPath: string; newPath: string }[];
@@ -33,6 +34,17 @@ const LIST_RE = /^\s*\*\*\*\s*List Directory:\s*(.+)$/gim;
 const DELETE_RE = /^\s*\*\*\*\s*Delete Path:\s*(.+)$/gim;
 const RENAME_RE = /^\s*\*\*\*\s*Rename File:\s*(.+?)\s*->\s*(.+)$/gim;
 const WRITE_RE = /^\s*\*\*\*\s*Write File:\s*(.+)$/gim;
+
+function countOccurrences(content: string, search: string): number {
+  if (!search) return 0;
+  let count = 0;
+  let index = 0;
+  while ((index = content.indexOf(search, index)) !== -1) {
+    count += 1;
+    index += search.length;
+  }
+  return count;
+}
 
 function normalizeToolPath(raw: string): string {
   let p = raw.trim();
@@ -105,6 +117,7 @@ function formatReadChunk(target: ReadTarget, content: string): string {
 export function parseToolCalls(text: string): ParsedAgentTools {
   const readFiles: ReadTarget[] = [];
   const listDirs: string[] = [];
+  const editFiles: { path: string; search: string; replace: string }[] = [];
   const writeFiles: { path: string; content: string }[] = [];
   const deletePaths: string[] = [];
   const renamePaths: { oldPath: string; newPath: string }[] = [];
@@ -138,6 +151,17 @@ export function parseToolCalls(text: string): ParsedAgentTools {
     if (oldPath && newPath) renamePaths.push({ oldPath, newPath });
   }
 
+  // Edit File blocks: exact one-occurrence search/replace against current file contents.
+  const editBlockRe =
+    /^\s*\*\*\*\s*Edit File:\s*(.+)\r?\n\s*\*\*\*\s*Begin Search\r?\n([\s\S]*?)\r?\n\s*\*\*\*\s*End Search\r?\n\s*\*\*\*\s*Begin Replace\r?\n([\s\S]*?)\r?\n\s*\*\*\*\s*End Replace/gim;
+  editBlockRe.lastIndex = 0;
+  while ((m = editBlockRe.exec(text)) !== null) {
+    const p = normalizeToolPath(m[1] ?? '');
+    const search = m[2] ?? '';
+    const replace = m[3] ?? '';
+    if (p && search) editFiles.push({ path: p, search, replace });
+  }
+
   // Write File blocks: *** Write File: path\n...content...\n*** End Write
   const writeBlockRe =
     /^\s*\*\*\*\s*Write File:\s*(.+)\r?\n([\s\S]*?)\r?\n\s*\*\*\*\s*End Write/gim;
@@ -148,17 +172,22 @@ export function parseToolCalls(text: string): ParsedAgentTools {
     if (p) writeFiles.push({ path: p, content });
   }
 
-  return { readFiles, listDirs, writeFiles, deletePaths, renamePaths };
+  return { readFiles, listDirs, editFiles, writeFiles, deletePaths, renamePaths };
 }
 
 export function hasAgentTools(t: ParsedAgentTools): boolean {
   return (
     t.readFiles.length > 0 ||
     t.listDirs.length > 0 ||
+    t.editFiles.length > 0 ||
     t.writeFiles.length > 0 ||
     t.deletePaths.length > 0 ||
     t.renamePaths.length > 0
   );
+}
+
+export function hasMutationTools(t: ParsedAgentTools): boolean {
+  return t.editFiles.length > 0 || t.writeFiles.length > 0 || t.deletePaths.length > 0 || t.renamePaths.length > 0;
 }
 
 /** Only read/list tools that need a follow-up turn (not mutating ops). */
@@ -171,9 +200,16 @@ export interface AgentToolResult {
   actions: AgentAction[];
 }
 
+export interface ExecuteAgentToolsOptions {
+  onFileWritten?: (path: string, content: string) => void;
+  onPathDeleted?: (path: string) => void;
+  onPathRenamed?: (oldPath: string, newPath: string) => void;
+}
+
 export async function executeAgentTools(
   workspaceRoots: WorkspaceRoot[],
   tools: ParsedAgentTools,
+  options: ExecuteAgentToolsOptions = {},
 ): Promise<AgentToolResult> {
   const parts: string[] = [];
   const actions: AgentAction[] = [];
@@ -205,9 +241,33 @@ export async function executeAgentTools(
     }
   }
 
+  for (const { path, search, replace } of tools.editFiles) {
+    try {
+      const current = await readWorkspaceFile(workspaceRoots, path);
+      const matches = countOccurrences(current, search);
+      if (matches === 0) {
+        throw new Error('Search text was not found in the current file');
+      }
+      if (matches > 1) {
+        throw new Error(`Search text matched ${matches} times; provide a more specific block`);
+      }
+
+      const next = current.replace(search, replace);
+      await writeWorkspaceFile(workspaceRoots, path, next);
+      options.onFileWritten?.(path, next);
+      parts.push(`### Edit File: ${path}\n(Edited successfully, replaced ${search.length} chars with ${replace.length} chars)`);
+      actions.push({ type: 'edit', path, success: true });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      parts.push(`### Edit File: ${path}\n(Error: ${msg})`);
+      actions.push({ type: 'edit', path, success: false, error: msg });
+    }
+  }
+
   for (const { path, content } of tools.writeFiles) {
     try {
       await writeWorkspaceFile(workspaceRoots, path, content);
+      options.onFileWritten?.(path, content);
       parts.push(`### Write File: ${path}\n(Written successfully, ${content.length} chars)`);
       actions.push({ type: 'write', path, success: true });
     } catch (e) {
@@ -220,6 +280,7 @@ export async function executeAgentTools(
   for (const path of tools.deletePaths) {
     try {
       await deleteWorkspacePath(workspaceRoots, path);
+      options.onPathDeleted?.(path);
       parts.push(`### Delete Path: ${path}\n(Deleted successfully)`);
       actions.push({ type: 'delete', path, success: true });
     } catch (e) {
@@ -232,6 +293,7 @@ export async function executeAgentTools(
   for (const { oldPath, newPath } of tools.renamePaths) {
     try {
       await renameWorkspacePath(workspaceRoots, oldPath, newPath);
+      options.onPathRenamed?.(oldPath, newPath);
       parts.push(`### Rename File: ${oldPath} -> ${newPath}\n(Renamed successfully)`);
       actions.push({ type: 'rename', path: `${oldPath} -> ${newPath}`, success: true });
     } catch (e) {
@@ -254,6 +316,10 @@ export function stripToolMarkers(text: string): string {
   let cleaned = text;
   cleaned = cleaned.replace(/^\s*\*\*\*\s*Read File:\s*.+$/gim, '');
   cleaned = cleaned.replace(/^\s*\*\*\*\s*List Directory:\s*.+$/gim, '');
+  cleaned = cleaned.replace(
+    /^\s*\*\*\*\s*Edit File:\s*.+\r?\n[\s\S]*?\r?\n\s*\*\*\*\s*End Replace/gim,
+    '',
+  );
   cleaned = cleaned.replace(/^\s*\*\*\*\s*Delete Path:\s*.+$/gim, '');
   cleaned = cleaned.replace(/^\s*\*\*\*\s*Rename File:\s*.+$/gim, '');
   cleaned = cleaned.replace(

@@ -7,11 +7,11 @@ import {
   getFileExtension,
   getUniqueWorkspaceLabel,
   pickDirectory,
-  removeWorkspaceRootFromTree,
+  workspaceRootsMatch,
   writeWorkspaceFile,
 } from '@/lib/fsWorkspace';
 import { SYSTEM_PROMPT } from '@/types';
-import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus, X, Copy, Users } from 'lucide-react';
+import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus, X, Copy, Users, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useTheme } from 'next-themes';
@@ -43,7 +43,7 @@ type SharedWorkspaceRow = {
 export function WorkspacePane() {
   const {
     rightPaneTab, setRightPaneTab,
-    workspaceRoots, clearWorkspace, removeWorkspacePathReferences, removeWorkspaceRoot, setFileTree,
+    workspaceRoots, clearWorkspace, setFileTree,
     openEditorTabs, activeFilePath, activeFileContent, setActiveFileContent, setActiveEditorFile, closeEditorFile, markEditorFileSaved,
     contextFiles, toggleContextFile, clearContextFiles,
   } = useAppStore();
@@ -54,6 +54,7 @@ export function WorkspacePane() {
   const [showNewFile, setShowNewFile] = useState(false);
   const [sharedWorkspaces, setSharedWorkspaces] = useState<SharedWorkspaceRow[]>([]);
   const [loadingSharedWorkspaces, setLoadingSharedWorkspaces] = useState(false);
+  const [workspaceTreeLoading, setWorkspaceTreeLoading] = useState(false);
 
   const fsAccessStatus = getFileSystemAccessStatus();
   const fsSupported = fsAccessStatus.supported;
@@ -65,6 +66,7 @@ export function WorkspacePane() {
   // Monaco keybindings are registered once; keep callbacks fresh.
   const saveActiveRef = useRef<() => void>(() => {});
   const saveAllRef = useRef<() => void>(() => {});
+  const treeRequestIdRef = useRef(0);
 
   useEffect(() => {
     if (dirtyTabs.length === 0) return;
@@ -166,59 +168,56 @@ export function WorkspacePane() {
 
       const label = getUniqueWorkspaceLabel(currentRoots, handle.name);
       const nextRoots = [...currentRoots, { id: crypto.randomUUID(), label, handle }];
-      useAppStore.getState().setWorkspaceRoots(nextRoots);
-      const tree = await buildWorkspaceTree(nextRoots);
-      setFileTree(tree);
-      toast.success(`${currentRoots.length === 0 ? 'Opened' : 'Added'}: ${label}`);
+      const requestId = ++treeRequestIdRef.current;
+      setWorkspaceTreeLoading(true);
+      try {
+        const tree = await buildWorkspaceTree(nextRoots);
+        if (treeRequestIdRef.current !== requestId) return;
+        if (!workspaceRootsMatch(useAppStore.getState().workspaceRoots, currentRoots)) {
+          toast.message('Workspace changed while the folder was loading. Add it again if needed.');
+          return;
+        }
+        useAppStore.getState().setWorkspaceRoots(nextRoots);
+        setFileTree(tree);
+        toast.success(`${currentRoots.length === 0 ? 'Opened' : 'Added'}: ${label}`);
+      } catch (err: any) {
+        if (treeRequestIdRef.current === requestId) {
+          toast.error(`Could not open ${label}: ${err?.message ?? String(err)}`);
+        }
+      } finally {
+        if (treeRequestIdRef.current === requestId) {
+          setWorkspaceTreeLoading(false);
+        }
+      }
     }
   };
 
   const handleRefresh = useCallback(async () => {
     const roots = useAppStore.getState().workspaceRoots;
     if (roots.length === 0) {
+      treeRequestIdRef.current += 1;
+      setWorkspaceTreeLoading(false);
       setFileTree([]);
       return;
     }
 
-    const tree = await buildWorkspaceTree(roots);
-    setFileTree(tree);
-  }, [setFileTree]);
-
-  const handleRemoveRoot = useCallback(async (rootId: string) => {
-    const state = useAppStore.getState();
-    const root = state.workspaceRoots.find((entry) => entry.id === rootId);
-    if (!root) return;
-
-    const affectedDirtyTabs = state.openEditorTabs.filter(
-      (tab) => tab.path === root.label || tab.path.startsWith(`${root.label}/`),
-    ).filter((tab) => tab.content !== tab.savedContent);
-
-    if (affectedDirtyTabs.length > 0) {
-      const confirmed = window.confirm(
-        `Remove ${root.label} from the workspace and close ${affectedDirtyTabs.length} unsaved tab${affectedDirtyTabs.length === 1 ? '' : 's'}?`,
-      );
-      if (!confirmed) return;
-    }
-
-    removeWorkspacePathReferences(root.label);
-    if (state.workspaceRoots.length === 1) {
-      clearWorkspace();
-      toast.success(`Removed ${root.label} from the workspace`);
-      return;
-    }
-
-    const nextRoots = state.workspaceRoots.filter((entry) => entry.id !== rootId);
-    removeWorkspaceRoot(rootId);
-    setFileTree(removeWorkspaceRootFromTree(state.fileTree, rootId));
+    const requestId = ++treeRequestIdRef.current;
+    setWorkspaceTreeLoading(true);
     try {
-      const tree = await buildWorkspaceTree(nextRoots);
-      setFileTree(tree);
+      const tree = await buildWorkspaceTree(roots);
+      if (treeRequestIdRef.current === requestId && workspaceRootsMatch(useAppStore.getState().workspaceRoots, roots)) {
+        setFileTree(tree);
+      }
     } catch (err: any) {
-      console.error('Refresh tree after removing workspace root failed:', err);
-      toast.error(`Removed ${root.label}, but could not refresh the remaining tree: ${err?.message ?? String(err)}`);
+      if (treeRequestIdRef.current === requestId) {
+        toast.error(`Could not refresh file tree: ${err?.message ?? String(err)}`);
+      }
+    } finally {
+      if (treeRequestIdRef.current === requestId) {
+        setWorkspaceTreeLoading(false);
+      }
     }
-    toast.success(`Removed ${root.label} from the workspace`);
-  }, [clearWorkspace, removeWorkspacePathReferences, removeWorkspaceRoot, setFileTree]);
+  }, [setFileTree]);
 
   const handleSave = async () => {
     if (!hasWorkspace || !activeFilePath) return;
@@ -321,18 +320,20 @@ export function WorkspacePane() {
               <div className="flex flex-wrap items-center gap-1.5">
                 <button
                   onClick={handleOpenFolder}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-primary/20 bg-primary/10 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-primary transition-all hover:-translate-y-0.5 hover:bg-primary/15"
+                  disabled={workspaceTreeLoading}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-primary/20 bg-primary/10 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-primary transition-all hover:-translate-y-0.5 hover:bg-primary/15 disabled:cursor-wait disabled:opacity-60 disabled:hover:translate-y-0"
                 >
-                  <FolderOpen className="h-3.5 w-3.5" />
-                  {hasWorkspace ? 'Add Folder' : 'Open Folder'}
+                  {workspaceTreeLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FolderOpen className="h-3.5 w-3.5" />}
+                  {workspaceTreeLoading ? 'Loading' : hasWorkspace ? 'Add Folder' : 'Open Folder'}
                 </button>
                 {hasWorkspace && (
                   <>
                     <button
                       onClick={handleRefresh}
-                      className="rounded-xl border border-border/70 bg-background px-2.5 py-1.5 text-[10px] font-medium text-muted-foreground transition-all hover:border-primary/20 hover:text-foreground"
+                      disabled={workspaceTreeLoading}
+                      className="rounded-xl border border-border/70 bg-background px-2.5 py-1.5 text-[10px] font-medium text-muted-foreground transition-all hover:border-primary/20 hover:text-foreground disabled:cursor-wait disabled:opacity-60"
                     >
-                      Refresh
+                      {workspaceTreeLoading ? 'Refreshing' : 'Refresh'}
                     </button>
                     <button
                       onClick={() => setShowNewFile(!showNewFile)}
@@ -351,6 +352,8 @@ export function WorkspacePane() {
                         if (dirtyTabs.length > 0 && !window.confirm(`Clear the workspace and close ${dirtyTabs.length} open tab${dirtyTabs.length === 1 ? '' : 's'}?`)) {
                           return;
                         }
+                        treeRequestIdRef.current += 1;
+                        setWorkspaceTreeLoading(false);
                         clearWorkspace();
                         toast.success('Cleared workspace folders');
                       }}
@@ -380,28 +383,24 @@ export function WorkspacePane() {
                 <button onClick={handleCreateFile} className="rounded-xl bg-accent/15 px-3 py-2 text-[10px] font-semibold text-accent transition-colors hover:bg-accent/25">Create</button>
               </div>
             )}
-            {hasWorkspace && (
-              <div className="border-b border-border/60 px-2 py-1.5 text-[10px] text-muted-foreground">
-                <div className="flex flex-wrap gap-1.5">
-                  {workspaceRoots.map((root) => (
-                    <div key={root.id} className="inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-background px-2.5 py-1">
-                      <FolderOpen className="h-3 w-3 text-primary" />
-                      <span className="max-w-[180px] truncate font-medium text-foreground/90">{root.label}</span>
-                      <button
-                        type="button"
-                        onClick={() => void handleRemoveRoot(root.id)}
-                        className="rounded-full p-0.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-destructive"
-                        title={`Remove ${root.label} from workspace`}
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
+            {workspaceTreeLoading && (
+              <div className="flex items-center gap-2 border-b border-border/60 bg-primary/5 px-3 py-2 text-[10px] text-primary">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                <span>{hasWorkspace ? 'Refreshing workspace files...' : 'Loading workspace folder...'}</span>
               </div>
             )}
             <div className="flex-1 overflow-y-auto">
-              <FileTree />
+              {workspaceTreeLoading && !hasWorkspace ? (
+                <div className="flex h-full items-center justify-center p-4 text-center">
+                  <div className="w-full max-w-[240px] rounded-2xl border border-dashed border-primary/25 bg-primary/5 px-5 py-7 text-primary">
+                    <Loader2 className="mx-auto mb-3 h-7 w-7 animate-spin" />
+                    <p className="text-sm font-semibold">Loading workspace</p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">Reading folder contents. Large folders can take a moment.</p>
+                  </div>
+                </div>
+              ) : (
+                <FileTree />
+              )}
             </div>
           </div>
         )}

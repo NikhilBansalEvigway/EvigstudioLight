@@ -268,6 +268,16 @@ export function removeWorkspaceRootFromTree(nodes: FileNode[], rootId: string): 
   return nodes.filter((node) => node.workspaceRootId !== rootId);
 }
 
+export function workspaceRootsMatch(
+  currentRoots: Array<Pick<WorkspaceRoot, 'id'>>,
+  expectedRoots: Array<Pick<WorkspaceRoot, 'id'>>,
+): boolean {
+  return (
+    currentRoots.length === expectedRoots.length &&
+    currentRoots.every((root, index) => root.id === expectedRoots[index]?.id)
+  );
+}
+
 export async function buildFileTree(
   dirHandle: FileSystemDirectoryHandle,
   path = ''

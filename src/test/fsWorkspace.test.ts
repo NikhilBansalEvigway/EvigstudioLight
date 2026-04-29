@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { getFileSystemAccessStatus, getUniqueWorkspaceLabel, resolveWorkspacePath } from '@/lib/fsWorkspace';
+import { getFileSystemAccessStatus, getUniqueWorkspaceLabel, resolveWorkspacePath, workspaceRootsMatch } from '@/lib/fsWorkspace';
 import type { WorkspaceRoot } from '@/types';
 
 const originalPicker = (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker;
@@ -97,5 +97,11 @@ describe('workspace path helpers', () => {
     expect(() => resolveWorkspacePath(roots, 'src/index.ts')).toThrow(
       'Path must start with a workspace folder: frontend, backend',
     );
+  });
+
+  it('matches workspace roots by ordered ids before applying async tree results', () => {
+    expect(workspaceRootsMatch(roots, roots)).toBe(true);
+    expect(workspaceRootsMatch(roots.slice(1), roots)).toBe(false);
+    expect(workspaceRootsMatch([roots[1], roots[0]], roots)).toBe(false);
   });
 });

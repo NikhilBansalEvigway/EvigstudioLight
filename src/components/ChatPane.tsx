@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { useAppStore } from '@/store/useAppStore';
 import { chatCompletion, type ChatMessage as LLMMessage } from '@/lib/llmClient';
 import {
@@ -13,6 +13,7 @@ import {
   parseToolCalls,
   hasAgentTools,
   hasGatherTools,
+  hasMutationTools,
   executeAgentTools,
   type AgentAction,
 } from '@/lib/agentTools';
@@ -33,8 +34,11 @@ import {
 } from '@/types';
 import { getChatPersistenceMode, persistenceSaveChat } from '@/lib/chatPersistence';
 import { ChatToolbar } from '@/components/ChatToolbar';
+import { getLastUserContextRefPaths, getMessageContextRefPaths } from '@/lib/chatContext';
+import { collectDirectoryFilePaths, findMentionNode, summarizeDirectory, type MentionEntry } from '@/lib/fileMentions';
+import { isWorkspaceEditRequest } from '@/lib/workspaceIntent';
 import { useSpeechDictation } from '@/hooks/useSpeechDictation';
-import { Send, ImagePlus, Loader2, StopCircle, FileCode, X, Mic, Bot, MessageSquare, Lock } from 'lucide-react';
+import { Send, ImagePlus, Loader2, StopCircle, FileCode, X, Mic, Bot, MessageSquare, Lock, FolderOpen } from 'lucide-react';
 import { toast } from 'sonner';
 
 const KEY_PROJECT_FILES = [
@@ -94,8 +98,31 @@ export function ChatPane() {
   const isLocked = activeChat ? !canWriteChat(activeChat) : false;
   const chatMode = activeChat?.mode ?? 'agent';
   const isAgent = chatMode === 'agent';
+  const mentionStats = useMemo(() => {
+    let files = 0;
+    let folders = 0;
+    let stale = 0;
+    let folderFiles = 0;
+    for (const path of mentionedFiles) {
+      const node = findMentionNode(fileTree, path);
+      if (!node) {
+        stale += 1;
+      } else if (node.type === 'directory') {
+        folders += 1;
+        folderFiles += collectDirectoryFilePaths(node, 1_000).length;
+      } else {
+        files += 1;
+      }
+    }
+    return { files, folders, stale, folderFiles };
+  }, [fileTree, mentionedFiles]);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUp = useRef(false);
+
+  useEffect(() => {
+    if (fileTree.length === 0 || mentionedFiles.length === 0) return;
+    setMentionedFiles((prev) => prev.filter((path) => !!findMentionNode(fileTree, path)));
+  }, [fileTree, mentionedFiles.length]);
 
   useEffect(() => {
     const container = scrollContainerRef.current;
@@ -141,22 +168,92 @@ export function ChatPane() {
 
     const included = new Set<string>();
     const parts: string[] = [];
+    const stats = { attachedFiles: 0, attachedFolders: 0, staleRefs: 0, truncatedFiles: 0, omittedFiles: 0 };
 
     const MAX_TREE_CHARS = 30_000;
     const MAX_FILE_CHARS_AUTO = 2_000;
-    const MAX_FILE_CHARS_EXPLICIT = 8_000;
+    const MAX_FILE_CHARS_EXPLICIT = 60_000;
+    const MAX_FOLDER_FILE_CONTENTS = 8;
     const MAX_TOTAL_CONTEXT_CHARS = 120_000;
 
-    const truncate = (content: string, maxChars: number) =>
-      content.length > maxChars ? `${content.slice(0, maxChars)}\n\n… [truncated]` : content;
+    const truncate = (content: string, maxChars: number) => ({
+      text: content.length > maxChars ? `${content.slice(0, maxChars)}\n\n... [truncated]` : content,
+      truncated: content.length > maxChars,
+    });
 
     const totalChars = () => parts.reduce((sum, part) => sum + part.length, 0);
     const canAdd = (nextPart: string) => totalChars() + nextPart.length <= MAX_TOTAL_CONTEXT_CHARS;
 
+    const addFileContext = async (path: string, heading: string, maxChars: number, required = false) => {
+      if (included.has(path)) return true;
+      included.add(path);
+      try {
+        const content = await readWorkspaceFile(workspaceRoots, path);
+        const truncated = truncate(content, maxChars);
+        if (truncated.truncated) stats.truncatedFiles += 1;
+        const block = `### ${heading}: ${path}\n\`\`\`\n${truncated.text}\n\`\`\``;
+        if (!canAdd(block)) {
+          stats.omittedFiles += 1;
+          return false;
+        }
+        parts.push(block);
+        if (required) stats.attachedFiles += 1;
+        return true;
+      } catch {
+        const block = `### ${heading}: ${path}\n(Could not read file)`;
+        if (!canAdd(block)) {
+          stats.omittedFiles += 1;
+          return false;
+        }
+        parts.push(block);
+        return false;
+      }
+    };
+
+    const addFolderContext = async (path: string) => {
+      const node = findMentionNode(fileTree, path);
+      if (!node || node.type !== 'directory') {
+        stats.staleRefs += 1;
+        return;
+      }
+
+      stats.attachedFolders += 1;
+      const listing = summarizeDirectory(node);
+      const block = `### Folder: ${path}\n\`\`\`\n${listing || '(empty)'}\n\`\`\``;
+      if (canAdd(block)) {
+        parts.push(block);
+      }
+
+      const folderFiles = collectDirectoryFilePaths(node, MAX_FOLDER_FILE_CONTENTS);
+      for (const filePath of folderFiles) {
+        await addFileContext(filePath, `File from @folder ${path}`, MAX_FILE_CHARS_AUTO);
+      }
+    };
+
+    const mentionedRefs = [...new Set(messageMentionedFiles)];
+    for (const path of mentionedRefs) {
+      const node = findMentionNode(fileTree, path);
+      if (!node) {
+        const readFromPath = await addFileContext(path, '@ file (not in current tree)', MAX_FILE_CHARS_EXPLICIT, true);
+        if (!readFromPath) stats.staleRefs += 1;
+        continue;
+      }
+      if (node.type === 'directory') {
+        await addFolderContext(path);
+      } else {
+        await addFileContext(path, '@ file', MAX_FILE_CHARS_EXPLICIT, true);
+      }
+    }
+
+    const pinnedContextFiles = contextFiles.filter((path) => !mentionedRefs.includes(path));
+    for (const path of pinnedContextFiles) {
+      await addFileContext(path, 'Pinned context file', MAX_FILE_CHARS_EXPLICIT);
+    }
+
     const treeStr = fileTree.length ? serializeFileTree(fileTree) : '';
     if (treeStr) {
       const tree = truncate(treeStr, MAX_TREE_CHARS);
-      const block = `## Project structure (file paths)\n\`\`\`\n${tree}\n\`\`\``;
+      const block = `## Project structure (file paths)\n\`\`\`\n${tree.text}\n\`\`\``;
       if (canAdd(block)) {
         parts.push(block);
       }
@@ -166,65 +263,27 @@ export function ChatPane() {
       KEY_PROJECT_FILES.map((rel) => buildWorkspacePath(root.label, rel)),
     );
     for (const path of keyProjectPaths) {
-      try {
-        let content = await readWorkspaceFile(workspaceRoots, path);
-        included.add(path);
-        content = truncate(content, MAX_FILE_CHARS_AUTO);
-        const block = `### Key file: ${path}\n\`\`\`\n${content}\n\`\`\``;
-        if (!canAdd(block)) break;
-        parts.push(block);
-      } catch {
-        /* optional */
-      }
+      await addFileContext(path, 'Key file', MAX_FILE_CHARS_AUTO);
     }
 
     for (const path of patchedPathsRef.current) {
-      if (included.has(path)) continue;
-      try {
-        let content = await readWorkspaceFile(workspaceRoots, path);
-        included.add(path);
-        content = truncate(content, MAX_FILE_CHARS_AUTO);
-        const block = `### Recently edited in this chat: ${path}\n\`\`\`\n${content}\n\`\`\``;
-        if (!canAdd(block)) break;
-        parts.push(block);
-      } catch {
-        /* skip */
-      }
+      await addFileContext(path, 'Recently edited in this chat', MAX_FILE_CHARS_AUTO);
     }
 
-    const allFiles = [...new Set([...contextFiles, ...messageMentionedFiles])];
-    let omittedFiles = 0;
-    for (const path of allFiles) {
-      if (included.has(path)) continue;
-      included.add(path);
-      try {
-        let content = await readWorkspaceFile(workspaceRoots, path);
-        content = truncate(content, MAX_FILE_CHARS_EXPLICIT);
-        const block = `### File: ${path}\n\`\`\`\n${content}\n\`\`\`\n`;
-        if (!canAdd(block)) {
-          omittedFiles += 1;
-          continue;
-        }
-        parts.push(block.trimEnd());
-      } catch {
-        const block = `### File: ${path}\n(Could not read file)`;
-        if (!canAdd(block)) {
-          omittedFiles += 1;
-          continue;
-        }
-        parts.push(block);
-      }
+    if (stats.omittedFiles > 0) {
+      parts.push(`(Omitted ${stats.omittedFiles} file(s) from context due to size limits. Add fewer files or mention specific paths/sections.)`);
     }
 
-    if (omittedFiles > 0) {
-      parts.push(`(Omitted ${omittedFiles} file(s) from context due to size limits. Add fewer files or mention specific paths/sections.)`);
+    if (stats.truncatedFiles > 0) {
+      parts.push('(One or more referenced files were truncated. If exact missing lines are needed, use *** Read File: path#Lstart-Lend. Do not ask the user to paste the file.)');
     }
 
     if (parts.length === 0) return [];
+    const summary = `Context summary: ${stats.attachedFiles} @ file(s), ${stats.attachedFolders} @ folder(s), ${stats.truncatedFiles} truncated file(s), ${stats.staleRefs} stale reference(s). Use the provided file contents and workspace tools; do not ask the user to provide these files again.`;
     return [
       {
         role: 'user' as const,
-        content: `Workspace context (use paths below as ground truth; do not invent paths that are not listed):\n\n${parts.join('\n\n')}`,
+        content: `Workspace context (use paths below as ground truth; do not invent paths that are not listed):\n${summary}\n\n${parts.join('\n\n')}`,
       },
     ];
   }, [workspaceRoots, fileTree, contextFiles]);
@@ -235,16 +294,15 @@ export function ChatPane() {
     setInput(value);
 
     const textBeforeCursor = value.slice(0, cursorPos);
-    const lastAtIdx = textBeforeCursor.lastIndexOf('@');
+    const mentionMatch = textBeforeCursor.match(/(^|\s)@([^@\n]*)$/);
 
-    if (lastAtIdx >= 0) {
-      const afterAt = textBeforeCursor.slice(lastAtIdx + 1);
-      if (!afterAt.includes('\n')) {
-        setShowMention(true);
-        setMentionQuery(afterAt);
-        setMentionStartIdx(lastAtIdx);
-        return;
-      }
+    if (mentionMatch) {
+      const prefix = mentionMatch[1] ?? '';
+      setShowMention(true);
+      setMentionQuery(mentionMatch[2] ?? '');
+      setMentionStartIdx(textBeforeCursor.length - (mentionMatch[2]?.length ?? 0) - 1);
+      if (prefix && !/\s/.test(prefix)) setMentionStartIdx(-1);
+      return;
     }
 
     setShowMention(false);
@@ -252,14 +310,15 @@ export function ChatPane() {
     setMentionStartIdx(-1);
   }, []);
 
-  const handleMentionSelect = useCallback((filePath: string) => {
-    setMentionedFiles(prev => prev.includes(filePath) ? prev : [...prev, filePath]);
+  const handleMentionSelect = useCallback((entry: MentionEntry) => {
+    setMentionedFiles(prev => prev.includes(entry.path) ? prev : [...prev, entry.path]);
 
     if (mentionStartIdx >= 0) {
       const before = input.slice(0, mentionStartIdx);
       const cursorPos = textareaRef.current?.selectionStart ?? input.length;
       const after = input.slice(cursorPos);
-      setInput(before + after);
+      const nextValue = `${before}${after}`.replace(/[ \t]{2,}/g, ' ');
+      setInput(nextValue);
     }
 
     setShowMention(false);
@@ -267,7 +326,7 @@ export function ChatPane() {
     setMentionStartIdx(-1);
 
     setTimeout(() => textareaRef.current?.focus(), 0);
-    toast.success(`Added @${filePath.split('/').pop()} to context`);
+    toast.success(`Added @${entry.name}${entry.type === 'directory' ? '/' : ''} to context`);
   }, [input, mentionStartIdx]);
 
   const removeMentionedFile = useCallback((filePath: string) => {
@@ -444,7 +503,12 @@ export function ChatPane() {
   }) => {
     const isAgentMode = chatMode === 'agent';
     const systemPrompt = isAgentMode ? AGENT_SYSTEM_PROMPT : CHAT_SYSTEM_PROMPT;
-    const contextMsgs = isAgentMode ? await buildContextMessages(mentionedFilePaths) : [];
+    const turnContextPaths = mentionedFilePaths.length > 0
+      ? mentionedFilePaths
+      : getLastUserContextRefPaths(baseMessages);
+    const shouldIncludeWorkspaceContext =
+      workspaceRoots.length > 0 && (isAgentMode || turnContextPaths.length > 0 || contextFiles.length > 0);
+    const contextMsgs = shouldIncludeWorkspaceContext ? await buildContextMessages(turnContextPaths) : [];
 
     const assistantMsg: Message = {
       id: crypto.randomUUID(),
@@ -502,14 +566,27 @@ export function ChatPane() {
           break;
         }
 
-        const { textFeedback, actions } = await executeAgentTools(roots, tools);
+        const { textFeedback, actions } = await executeAgentTools(roots, tools, {
+          onFileWritten: (path, content) => useAppStore.getState().syncEditorFileContent(path, content),
+          onPathDeleted: (path) => useAppStore.getState().removeWorkspacePathReferences(path),
+          onPathRenamed: (oldPath, newPath) => useAppStore.getState().renameWorkspacePathReferences(oldPath, newPath),
+        });
         allActions.push(...actions);
 
-        if (actions.some((action) => action.type === 'write' || action.type === 'delete' || action.type === 'rename')) {
+        if (actions.some((action) => action.type === 'edit' || action.type === 'write' || action.type === 'delete' || action.type === 'rename')) {
+          addPatchedPaths(
+            actions.flatMap((action) => {
+              if (!action.success) return [];
+              if (action.type === 'edit' || action.type === 'write' || action.type === 'delete') return [action.path];
+              if (action.type === 'rename') return [action.path.split(/\s*->\s*/)[1]].filter(Boolean) as string[];
+              return [];
+            }),
+          );
           await refreshFileTree();
         }
 
-        if (!hasGatherTools(tools)) break;
+        const continueAfterTools = hasGatherTools(tools) || hasMutationTools(tools);
+        if (!continueAfterTools) break;
 
         loopMessages = [
           { role: 'system', content: systemPrompt },
@@ -519,7 +596,7 @@ export function ChatPane() {
           {
             role: 'user',
             content:
-              'Tool results (use to continue; when ready, output patches in the required format):\n\n' +
+              'Tool results (inspect these results, then continue. If changes succeeded, summarize them briefly. If a tool failed, retry with corrected tool calls or explain the blocker. Do not output patch text for changes already applied by tools.):\n\n' +
               textFeedback,
           },
           { role: 'assistant', content: '' },
@@ -567,7 +644,7 @@ export function ChatPane() {
       setIsStreaming(false);
       abortRef.current = null;
     }
-  }, [addMessage, buildContextMessages, refreshFileTree, runAgentAutoApply, runDirectEditAutoApply, setIsStreaming, settings, updateLastAssistantMessage]);
+  }, [addMessage, addPatchedPaths, buildContextMessages, contextFiles.length, refreshFileTree, runAgentAutoApply, runDirectEditAutoApply, setIsStreaming, settings, updateLastAssistantMessage, workspaceRoots.length]);
 
   const handleSubmitMessageEdit = useCallback(async (messageId: string, nextText: string) => {
     const chatId = useAppStore.getState().activeChatId;
@@ -606,7 +683,7 @@ export function ChatPane() {
       chatMode: chat.mode,
       baseMessages: nextMessages,
       hasVision: false,
-      mentionedFilePaths: [],
+      mentionedFilePaths: getMessageContextRefPaths(updatedMessage),
     });
   }, [deriveChatTitle, isStreaming, runAssistantTurn, saveVersionSnapshot, trimMessageUiState, updateChatFields]);
 
@@ -641,7 +718,7 @@ export function ChatPane() {
       chatMode: chat.mode,
       baseMessages: nextMessages,
       hasVision: lastPrompt?.role === 'user' ? hasImages(lastPrompt) : false,
-      mentionedFilePaths: [],
+      mentionedFilePaths: lastPrompt?.role === 'user' ? getMessageContextRefPaths(lastPrompt) : [],
     });
   }, [deriveChatTitle, isStreaming, runAssistantTurn, saveVersionSnapshot, trimMessageUiState, updateChatFields]);
 
@@ -671,6 +748,27 @@ export function ChatPane() {
 
     const hasVision = images.length > 0;
     const mentionedFilePaths = mentionedFiles;
+    const hasWorkspaceContext = mentionedFilePaths.length > 0 || contextFiles.length > 0;
+    const shouldUseAgentForEdit =
+      currentMode === 'chat' &&
+      workspaceRoots.length > 0 &&
+      hasWorkspaceContext &&
+      isWorkspaceEditRequest(input);
+    const effectiveMode: ChatMode = shouldUseAgentForEdit ? 'agent' : currentMode;
+
+    if (shouldUseAgentForEdit) {
+      useAppStore.getState().setChatMode(chatId, 'agent');
+      toast.message('Switched to Agent mode so EvigStudio can edit the referenced file.');
+    }
+
+    const contextRefs = mentionedFilePaths.map((path) => {
+      const node = findMentionNode(fileTree, path);
+      return {
+        path,
+        type: node?.type ?? 'missing',
+        label: node?.name ?? path.split('/').pop() ?? path,
+      } satisfies NonNullable<Message['contextRefs']>[number];
+    });
     let userContent: string | ContentPart[];
     if (hasVision) {
       const parts: ContentPart[] = [];
@@ -688,6 +786,7 @@ export function ChatPane() {
       role: 'user',
       content: userContent,
       timestamp: Date.now(),
+      ...(contextRefs.length > 0 ? { contextRefs } : {}),
     };
 
     addMessage(chatId, userMsg);
@@ -705,7 +804,7 @@ export function ChatPane() {
           body: JSON.stringify({
             chatId,
             chatTitle: useAppStore.getState().chats.find((c) => c.id === chatId)?.title ?? null,
-            chatMode: currentMode,
+            chatMode: effectiveMode,
             model: settings.textModel,
             preview: getMessageText(userMsg).slice(0, 500),
             promptLength: getMessageText(userMsg).length,
@@ -721,7 +820,7 @@ export function ChatPane() {
     const baseMessages = useAppStore.getState().chats.find((c) => c.id === chatId)?.messages ?? [userMsg];
     await runAssistantTurn({
       chatId,
-      chatMode: currentMode,
+      chatMode: effectiveMode,
       baseMessages,
       hasVision,
       mentionedFilePaths,
@@ -732,7 +831,10 @@ export function ChatPane() {
     mentionedFiles,
     activeChat,
     activeChatId,
+    contextFiles.length,
+    fileTree,
     isStreaming,
+    workspaceRoots.length,
     settings,
     createChat,
     addMessage,
@@ -868,23 +970,39 @@ export function ChatPane() {
 
       {/* Mentioned files pills */}
       {mentionedFiles.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 px-4 py-2 border-t border-border">
-          {mentionedFiles.map(filePath => (
-            <span
-              key={filePath}
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-primary/10 border border-primary/20 text-[11px] text-primary animate-fade-in"
-            >
-              <FileCode className="w-3 h-3" />
-              <span className="max-w-[120px] truncate">{filePath.split('/').pop()}</span>
-              <button
-                onClick={() => removeMentionedFile(filePath)}
-                className="ml-0.5 hover:text-destructive transition-colors"
-                title={`Remove ${filePath}`}
-              >
-                <X className="w-3 h-3" />
-              </button>
-            </span>
-          ))}
+        <div className="space-y-1 border-t border-border px-4 py-2">
+          <div className="text-[10px] text-muted-foreground">
+            Context ready: {mentionStats.files} file{mentionStats.files === 1 ? '' : 's'}
+            {mentionStats.folders > 0 ? `, ${mentionStats.folders} folder${mentionStats.folders === 1 ? '' : 's'} (${mentionStats.folderFiles} files)` : ''}
+            {mentionStats.stale > 0 ? `, ${mentionStats.stale} stale reference${mentionStats.stale === 1 ? '' : 's'} will be skipped` : ''}
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {mentionedFiles.map(filePath => {
+              const node = findMentionNode(fileTree, filePath);
+              const isFolder = node?.type === 'directory';
+              const label = node?.name ?? filePath.split('/').pop() ?? filePath;
+              return (
+                <span
+                  key={filePath}
+                  className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] animate-fade-in ${node
+                    ? 'border-primary/20 bg-primary/10 text-primary'
+                    : 'border-warning/30 bg-warning/10 text-warning'}`}
+                  title={node ? filePath : `${filePath} was not found in the current workspace tree`}
+                >
+                  {isFolder ? <FolderOpen className="w-3 h-3" /> : <FileCode className="w-3 h-3" />}
+                  <span className="max-w-[220px] truncate">{label}{isFolder ? '/' : ''}</span>
+                  <span className="hidden max-w-[280px] truncate text-[10px] opacity-70 sm:inline">{filePath}</span>
+                  <button
+                    onClick={() => removeMentionedFile(filePath)}
+                    className="ml-0.5 hover:text-destructive transition-colors"
+                    title={`Remove ${filePath}`}
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              );
+            })}
+          </div>
         </div>
       )}
 

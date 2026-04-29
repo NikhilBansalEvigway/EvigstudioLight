@@ -50,6 +50,7 @@ import {
   readWorkspaceFile,
   removeWorkspaceRootFromTree,
   renameWorkspacePath,
+  workspaceRootsMatch,
 } from '@/lib/fsWorkspace';
 import { useAppStore } from '@/store/useAppStore';
 import type { FileNode } from '@/types';
@@ -249,8 +250,11 @@ export function FileTree() {
       return;
     }
     try {
+      const roots = workspaceRoots;
       const tree = await buildWorkspaceTree(workspaceRoots);
-      setFileTree(tree);
+      if (workspaceRootsMatch(useAppStore.getState().workspaceRoots, roots)) {
+        setFileTree(tree);
+      }
     } catch (err: any) {
       console.error('Refresh tree failed:', err);
       toast.error(`Could not refresh file tree: ${err?.message ?? String(err)}`);
@@ -287,7 +291,9 @@ export function FileTree() {
 
           try {
             const tree = await buildWorkspaceTree(nextRoots);
-            setFileTree(tree);
+            if (workspaceRootsMatch(useAppStore.getState().workspaceRoots, nextRoots)) {
+              setFileTree(tree);
+            }
           } catch (err: any) {
             console.error('Refresh tree after removing workspace root failed:', err);
             toast.error(`Removed ${root.label}, but could not refresh the remaining tree: ${err?.message ?? String(err)}`);

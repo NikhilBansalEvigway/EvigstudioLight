@@ -74,6 +74,7 @@ export function ChatMessage({
     isAgent && message.role === 'assistant' && (agentActions?.length ?? 0) > 0;
   const showAutoAppliedBadges =
     isAgent && message.role === 'assistant' && !showAgentActionBadges && (autoAppliedPaths?.length ?? 0) > 0;
+  const contextRefs = message.contextRefs ?? [];
   const canCopyMessage = displayText.trim().length > 0 && !isEditing;
   const canEditMessage =
     !busy &&
@@ -224,6 +225,33 @@ export function ChatMessage({
           <MessageTtsBar rawMarkdown={displayText} />
         )}
 
+        {message.role === 'user' && contextRefs.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5 border-t border-border/60 pt-2">
+            <span className="mr-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Context
+            </span>
+            {contextRefs.map((ref) => {
+              const isFolder = ref.type === 'directory';
+              const missing = ref.type === 'missing';
+              return (
+                <button
+                  key={ref.path}
+                  type="button"
+                  onClick={() => !missing && !isFolder && onOpenFile?.(ref.path)}
+                  disabled={missing || isFolder || !onOpenFile}
+                  className={`inline-flex max-w-[260px] items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] transition-colors ${missing
+                    ? 'border-warning/30 bg-warning/10 text-warning'
+                    : 'border-primary/20 bg-primary/10 text-primary hover:bg-primary/15 disabled:hover:bg-primary/10'}`}
+                  title={missing ? `${ref.path} is no longer in the workspace tree` : ref.path}
+                >
+                  {isFolder ? <FolderOpen className="h-3 w-3" /> : <FileCode className="h-3 w-3" />}
+                  <span className="truncate">{ref.label ?? ref.path}{isFolder ? '/' : ''}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
         {/* Agent mode: compact action badges */}
         {showAgentActionBadges && (
           <div className="mt-2 flex flex-wrap gap-1.5">
@@ -312,6 +340,7 @@ export function ChatMessage({
 
 const ACTION_ICONS: Record<AgentAction['type'], React.ElementType> = {
   read: FileSearch,
+  edit: FileEdit,
   write: FileEdit,
   delete: Trash2,
   rename: ArrowRightLeft,
@@ -320,6 +349,7 @@ const ACTION_ICONS: Record<AgentAction['type'], React.ElementType> = {
 
 const ACTION_LABELS: Record<AgentAction['type'], string> = {
   read: 'Read',
+  edit: 'Edited',
   write: 'Wrote',
   delete: 'Deleted',
   rename: 'Renamed',
@@ -328,7 +358,7 @@ const ACTION_LABELS: Record<AgentAction['type'], string> = {
 
 function getOpenableActionPath(action: AgentAction): string | null {
   if (!action.success) return null;
-  if (action.type === 'read' || action.type === 'write') return action.path;
+  if (action.type === 'read' || action.type === 'edit' || action.type === 'write') return action.path;
   if (action.type === 'rename') {
     const parts = action.path.split(/\s*->\s*/);
     return parts[1] ?? null;
@@ -357,7 +387,7 @@ function AgentActionBadge({ action, onOpenFile }: { action: AgentAction; onOpenF
   const colorClass =
     action.type === 'delete'
       ? 'bg-warning/10 border-warning/20 text-warning'
-      : action.type === 'write'
+      : action.type === 'edit' || action.type === 'write'
         ? 'bg-accent/15 border-accent/20 text-accent'
         : 'bg-muted border-border text-muted-foreground';
 
