@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { getFileSystemAccessStatus, getUniqueWorkspaceLabel, resolveWorkspacePath, workspaceRootsMatch } from '@/lib/fsWorkspace';
-import type { WorkspaceRoot } from '@/types';
+import { buildWorkspaceTree, getFileSystemAccessStatus, getUniqueWorkspaceLabel, resolveWorkspacePath, workspaceRootsMatch } from '@/lib/fsWorkspace';
+import type { FileNode, WorkspaceRoot } from '@/types';
 
 const originalPicker = (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker;
 const originalSecureContext = window.isSecureContext;
@@ -22,6 +22,28 @@ function setSecureContext(value: boolean) {
     configurable: true,
     value,
   });
+}
+
+type MockHandle = {
+  kind: 'directory' | 'file';
+  entries?: () => AsyncGenerator<[string, MockHandle]>;
+  queryPermission?: () => Promise<'granted'>;
+};
+
+function mockFile(): MockHandle {
+  return { kind: 'file' };
+}
+
+function mockDirectory(entries: Record<string, MockHandle>): FileSystemDirectoryHandle {
+  return {
+    kind: 'directory',
+    queryPermission: async () => 'granted',
+    async *entries() {
+      for (const entry of Object.entries(entries)) {
+        yield entry;
+      }
+    },
+  } as unknown as FileSystemDirectoryHandle;
 }
 
 afterEach(() => {
@@ -103,5 +125,65 @@ describe('workspace path helpers', () => {
     expect(workspaceRootsMatch(roots, roots)).toBe(true);
     expect(workspaceRootsMatch(roots.slice(1), roots)).toBe(false);
     expect(workspaceRootsMatch([roots[1], roots[0]], roots)).toBe(false);
+  });
+
+  it('emits partial workspace trees while rebuilding selected roots', async () => {
+    const existingRoot: WorkspaceRoot = {
+      id: 'existing-root',
+      label: 'existing',
+      handle: mockDirectory({}) as FileSystemDirectoryHandle,
+    };
+    const newRoot: WorkspaceRoot = {
+      id: 'new-root',
+      label: 'new',
+      handle: mockDirectory({
+        src: mockDirectory({ 'App.tsx': mockFile() } as Record<string, MockHandle>) as unknown as MockHandle,
+        'README.md': mockFile(),
+      }),
+    };
+    const initialTree: FileNode[] = [
+      {
+        name: 'existing',
+        path: 'existing',
+        type: 'directory',
+        handle: existingRoot.handle,
+        workspaceRootId: existingRoot.id,
+        workspaceLabel: existingRoot.label,
+        relativePath: '',
+        isWorkspaceRoot: true,
+        children: [
+          {
+            name: 'old.txt',
+            path: 'existing/old.txt',
+            type: 'file',
+            handle: mockFile() as unknown as FileSystemFileHandle,
+            workspaceRootId: existingRoot.id,
+            workspaceLabel: existingRoot.label,
+            relativePath: 'old.txt',
+            isWorkspaceRoot: false,
+          },
+        ],
+      },
+    ];
+    const progressTrees: FileNode[][] = [];
+
+    const tree = await buildWorkspaceTree([existingRoot, newRoot], {
+      initialTree,
+      rebuildRootIds: [newRoot.id],
+      onProgress: (progressTree) => progressTrees.push(progressTree),
+    });
+
+    expect(progressTrees.length).toBeGreaterThan(1);
+    expect(progressTrees[0].find((node) => node.workspaceRootId === existingRoot.id)?.children?.[0]?.name).toBe('old.txt');
+    expect(progressTrees[0].find((node) => node.workspaceRootId === newRoot.id)?.children).toEqual([]);
+    expect(progressTrees.some((progressTree) => {
+      const nextRoot = progressTree.find((node) => node.workspaceRootId === newRoot.id);
+      return nextRoot?.children?.some((child) => child.name === 'src');
+    })).toBe(true);
+    expect(tree.find((node) => node.workspaceRootId === existingRoot.id)?.children?.[0]?.name).toBe('old.txt');
+    expect(tree.find((node) => node.workspaceRootId === newRoot.id)?.children?.map((child) => child.name)).toEqual([
+      'src',
+      'README.md',
+    ]);
   });
 });

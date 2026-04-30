@@ -167,21 +167,31 @@ export function WorkspacePane() {
       }
 
       const label = getUniqueWorkspaceLabel(currentRoots, handle.name);
-      const nextRoots = [...currentRoots, { id: crypto.randomUUID(), label, handle }];
+      const newRoot = { id: crypto.randomUUID(), label, handle };
+      const nextRoots = [...currentRoots, newRoot];
+      const currentTree = useAppStore.getState().fileTree;
       const requestId = ++treeRequestIdRef.current;
       setWorkspaceTreeLoading(true);
+      useAppStore.getState().setWorkspaceRoots(nextRoots);
       try {
-        const tree = await buildWorkspaceTree(nextRoots);
-        if (treeRequestIdRef.current !== requestId) return;
-        if (!workspaceRootsMatch(useAppStore.getState().workspaceRoots, currentRoots)) {
-          toast.message('Workspace changed while the folder was loading. Add it again if needed.');
-          return;
-        }
-        useAppStore.getState().setWorkspaceRoots(nextRoots);
+        const tree = await buildWorkspaceTree(nextRoots, {
+          initialTree: currentTree,
+          rebuildRootIds: [newRoot.id],
+          onProgress: (progressTree) => {
+            if (treeRequestIdRef.current === requestId && workspaceRootsMatch(useAppStore.getState().workspaceRoots, nextRoots)) {
+              setFileTree(progressTree);
+            }
+          },
+        });
+        if (treeRequestIdRef.current !== requestId || !workspaceRootsMatch(useAppStore.getState().workspaceRoots, nextRoots)) return;
         setFileTree(tree);
         toast.success(`${currentRoots.length === 0 ? 'Opened' : 'Added'}: ${label}`);
       } catch (err: any) {
         if (treeRequestIdRef.current === requestId) {
+          if (workspaceRootsMatch(useAppStore.getState().workspaceRoots, nextRoots)) {
+            useAppStore.getState().setWorkspaceRoots(currentRoots);
+            setFileTree(currentTree);
+          }
           toast.error(`Could not open ${label}: ${err?.message ?? String(err)}`);
         }
       } finally {
@@ -201,10 +211,18 @@ export function WorkspacePane() {
       return;
     }
 
+    const currentTree = useAppStore.getState().fileTree;
     const requestId = ++treeRequestIdRef.current;
     setWorkspaceTreeLoading(true);
     try {
-      const tree = await buildWorkspaceTree(roots);
+      const tree = await buildWorkspaceTree(roots, {
+        initialTree: currentTree,
+        onProgress: (progressTree) => {
+          if (treeRequestIdRef.current === requestId && workspaceRootsMatch(useAppStore.getState().workspaceRoots, roots)) {
+            setFileTree(progressTree);
+          }
+        },
+      });
       if (treeRequestIdRef.current === requestId && workspaceRootsMatch(useAppStore.getState().workspaceRoots, roots)) {
         setFileTree(tree);
       }

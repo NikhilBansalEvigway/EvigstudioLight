@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local generated documentation
+EVIGSTUDIO_FUTURE_IMPROVEMENTS.html
+EVIGSTUDIO_USE_CASES.html

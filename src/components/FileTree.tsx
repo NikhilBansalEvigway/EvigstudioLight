@@ -251,7 +251,14 @@ export function FileTree() {
     }
     try {
       const roots = workspaceRoots;
-      const tree = await buildWorkspaceTree(workspaceRoots);
+      const tree = await buildWorkspaceTree(roots, {
+        initialTree: useAppStore.getState().fileTree,
+        onProgress: (progressTree) => {
+          if (workspaceRootsMatch(useAppStore.getState().workspaceRoots, roots)) {
+            setFileTree(progressTree);
+          }
+        },
+      });
       if (workspaceRootsMatch(useAppStore.getState().workspaceRoots, roots)) {
         setFileTree(tree);
       }
@@ -290,7 +297,14 @@ export function FileTree() {
           setFileTree(removeWorkspaceRootFromTree(state.fileTree, rootId));
 
           try {
-            const tree = await buildWorkspaceTree(nextRoots);
+            const tree = await buildWorkspaceTree(nextRoots, {
+              initialTree: useAppStore.getState().fileTree,
+              onProgress: (progressTree) => {
+                if (workspaceRootsMatch(useAppStore.getState().workspaceRoots, nextRoots)) {
+                  setFileTree(progressTree);
+                }
+              },
+            });
             if (workspaceRootsMatch(useAppStore.getState().workspaceRoots, nextRoots)) {
               setFileTree(tree);
             }

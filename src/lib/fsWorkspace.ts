@@ -120,24 +120,134 @@ async function copyEntryBetweenDirectories(
   }
 }
 
-function annotateWorkspaceNodes(nodes: FileNode[], root: WorkspaceRoot): FileNode[] {
-  return nodes.map((node) => {
-    const relativePath = node.path;
-    const nextNode: FileNode = {
-      ...node,
-      path: buildWorkspacePath(root.label, relativePath),
-      relativePath,
+function sortFileNodesInPlace(nodes: FileNode[]): FileNode[] {
+  return nodes.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function cloneFileNodes(nodes: FileNode[]): FileNode[] {
+  return nodes.map((node) => ({
+    ...node,
+    children: node.children ? cloneFileNodes(node.children) : undefined,
+  }));
+}
+
+function createWorkspaceRootNode(root: WorkspaceRoot, children: FileNode[] = []): FileNode {
+  return {
+    name: root.label,
+    path: root.label,
+    type: 'directory' as const,
+    children,
+    handle: root.handle,
+    workspaceRootId: root.id,
+    workspaceLabel: root.label,
+    relativePath: '',
+    isWorkspaceRoot: true,
+  };
+}
+
+export type BuildWorkspaceTreeOptions = {
+  initialTree?: FileNode[];
+  onProgress?: (tree: FileNode[]) => void;
+  rebuildRootIds?: string[];
+};
+
+function createProgressEmitter(
+  getTree: () => FileNode[],
+  onProgress?: (tree: FileNode[]) => void,
+  intervalMs = 80,
+) {
+  let lastEmit = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  return (force = false) => {
+    if (!onProgress) return;
+    const emit = () => {
+      lastEmit = Date.now();
+      onProgress(cloneFileNodes(getTree()));
+    };
+
+    if (force) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      emit();
+      return;
+    }
+
+    const elapsed = Date.now() - lastEmit;
+    if (elapsed >= intervalMs) {
+      emit();
+      return;
+    }
+
+    if (!timer) {
+      timer = setTimeout(() => {
+        timer = null;
+        emit();
+      }, intervalMs - elapsed);
+    }
+  };
+}
+
+async function buildAnnotatedFileTree(
+  root: WorkspaceRoot,
+  dirHandle: FileSystemDirectoryHandle,
+  targetNodes: FileNode[],
+  emitProgress: () => void,
+  relativePath = '',
+): Promise<void> {
+  await ensurePermission(dirHandle, 'read');
+
+  for await (const [name, handle] of (dirHandle as any).entries()) {
+    const fullRelativePath = relativePath ? `${relativePath}/${name}` : name;
+
+    if (handle.kind === 'directory') {
+      if (name.startsWith('.') || name === 'node_modules') continue;
+
+      const directoryNode: FileNode = {
+        name,
+        path: buildWorkspacePath(root.label, fullRelativePath),
+        type: 'directory',
+        children: [],
+        handle,
+        relativePath: fullRelativePath,
+        workspaceRootId: root.id,
+        workspaceLabel: root.label,
+        isWorkspaceRoot: false,
+      };
+      targetNodes.push(directoryNode);
+      sortFileNodesInPlace(targetNodes);
+      emitProgress();
+
+      await buildAnnotatedFileTree(
+        root,
+        handle as FileSystemDirectoryHandle,
+        directoryNode.children ?? [],
+        emitProgress,
+        fullRelativePath,
+      );
+      sortFileNodesInPlace(directoryNode.children ?? []);
+      emitProgress();
+      continue;
+    }
+
+    targetNodes.push({
+      name,
+      path: buildWorkspacePath(root.label, fullRelativePath),
+      type: 'file',
+      handle,
+      relativePath: fullRelativePath,
       workspaceRootId: root.id,
       workspaceLabel: root.label,
       isWorkspaceRoot: false,
-    };
-
-    if (node.type === 'directory' && node.children) {
-      nextNode.children = annotateWorkspaceNodes(node.children, root);
-    }
-
-    return nextNode;
-  });
+    });
+    sortFileNodesInPlace(targetNodes);
+    emitProgress();
+  }
 }
 
 export function isFileSystemAccessSupported(): boolean {
@@ -243,25 +353,39 @@ export function resolveWorkspacePath(
   );
 }
 
-export async function buildWorkspaceTree(workspaceRoots: WorkspaceRoot[]): Promise<FileNode[]> {
-  const roots = await Promise.all(
+export async function buildWorkspaceTree(
+  workspaceRoots: WorkspaceRoot[],
+  options: BuildWorkspaceTreeOptions = {},
+): Promise<FileNode[]> {
+  const rebuildRootIds = new Set(options.rebuildRootIds ?? workspaceRoots.map((root) => root.id));
+  const roots = workspaceRoots.map((root) => {
+    const existingRoot = options.initialTree?.find((node) => node.workspaceRootId === root.id && node.isWorkspaceRoot);
+    return createWorkspaceRootNode(root, existingRoot?.children ? cloneFileNodes(existingRoot.children) : []);
+  });
+  const sortRoots = () => roots.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  const emitProgress = createProgressEmitter(() => sortRoots(), options.onProgress);
+
+  sortRoots();
+  emitProgress(true);
+
+  await Promise.all(
     workspaceRoots.map(async (root) => {
-      const children = annotateWorkspaceNodes(await buildFileTree(root.handle), root);
-      return {
-        name: root.label,
-        path: root.label,
-        type: 'directory' as const,
-        children,
-        handle: root.handle,
-        workspaceRootId: root.id,
-        workspaceLabel: root.label,
-        relativePath: '',
-        isWorkspaceRoot: true,
-      } satisfies FileNode;
+      if (!rebuildRootIds.has(root.id)) return;
+
+      const rootNode = roots.find((node) => node.workspaceRootId === root.id);
+      if (!rootNode) return;
+
+      rootNode.children = [];
+      emitProgress(true);
+      await buildAnnotatedFileTree(root, root.handle, rootNode.children, () => emitProgress());
+      sortFileNodesInPlace(rootNode.children);
+      emitProgress();
     }),
   );
 
-  return roots.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  sortRoots();
+  emitProgress(true);
+  return cloneFileNodes(roots);
 }
 
 export function removeWorkspaceRootFromTree(nodes: FileNode[], rootId: string): FileNode[] {
