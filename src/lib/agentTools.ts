@@ -3,7 +3,8 @@ import {
   listWorkspaceDirectoryContents,
   readWorkspaceFile,
   renameWorkspacePath,
-  writeWorkspaceFile,
+  workspaceFileExists,
+  writeWorkspaceFileVerified,
 } from '@/lib/fsWorkspace';
 import type { WorkspaceRoot } from '@/types';
 
@@ -34,6 +35,34 @@ const LIST_RE = /^\s*\*\*\*\s*List Directory:\s*(.+)$/gim;
 const DELETE_RE = /^\s*\*\*\*\s*Delete Path:\s*(.+)$/gim;
 const RENAME_RE = /^\s*\*\*\*\s*Rename File:\s*(.+?)\s*->\s*(.+)$/gim;
 const WRITE_RE = /^\s*\*\*\*\s*Write File:\s*(.+)$/gim;
+
+function looksLikePathLabel(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.length > 240) return false;
+  if (trimmed.includes('```')) return false;
+  return /^(?:[A-Za-z]:)?[\w.@~/-]+\.[A-Za-z0-9]+$/.test(trimmed);
+}
+
+export function sanitizeWrittenFileContent(content: string): string {
+  const normalized = content.replace(/^\uFEFF/, '');
+  const trimmed = normalized.trim();
+  if (!trimmed) return '';
+
+  const fencedOnly = trimmed.match(/^```[^\n`]*\n([\s\S]*?)\n```$/);
+  if (fencedOnly) {
+    return fencedOnly[1] ?? '';
+  }
+
+  const lines = normalized.split(/\r?\n/);
+  if (lines.length >= 3 && looksLikePathLabel(lines[0]) && /^```[^\n`]*\s*$/.test(lines[1].trim())) {
+    const endFenceIndex = lines.findIndex((line, index) => index > 1 && line.trim() === '```');
+    if (endFenceIndex > 1) {
+      return lines.slice(2, endFenceIndex).join('\n');
+    }
+  }
+
+  return content;
+}
 
 function countOccurrences(content: string, search: string): number {
   if (!search) return 0;
@@ -266,9 +295,11 @@ export async function executeAgentTools(
 
   for (const { path, content } of tools.writeFiles) {
     try {
-      await writeWorkspaceFile(workspaceRoots, path, content);
-      options.onFileWritten?.(path, content);
-      parts.push(`### Write File: ${path}\n(Written successfully, ${content.length} chars)`);
+      const sanitizedContent = sanitizeWrittenFileContent(content);
+      const existedBefore = await workspaceFileExists(workspaceRoots, path);
+      await writeWorkspaceFileVerified(workspaceRoots, path, sanitizedContent, { expectCreate: !existedBefore });
+      options.onFileWritten?.(path, sanitizedContent);
+      parts.push(`### Write File: ${path}\n(Written successfully, ${sanitizedContent.length} chars)`);
       actions.push({ type: 'write', path, success: true });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

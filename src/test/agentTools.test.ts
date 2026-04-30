@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { hasMutationTools, parseToolCalls, stripToolMarkers } from '@/lib/agentTools';
+import { hasMutationTools, parseToolCalls, sanitizeWrittenFileContent, stripToolMarkers } from '@/lib/agentTools';
 
 describe('parseToolCalls', () => {
   it('parses plain and ranged read-file requests', () => {
@@ -57,5 +57,17 @@ describe('parseToolCalls', () => {
     ].join('\n');
 
     expect(stripToolMarkers(text)).toBe('I will update the title.\n\nDone.');
+  });
+
+  it('strips markdown fences from write-file content', () => {
+    expect(
+      sanitizeWrittenFileContent(['```ts', 'export const answer = 42;', '```'].join('\n')),
+    ).toBe('export const answer = 42;');
+  });
+
+  it('strips filename labels before fenced write-file content', () => {
+    expect(
+      sanitizeWrittenFileContent(['src/example.ts', '```ts', 'export const answer = 42;', '```'].join('\n')),
+    ).toBe('export const answer = 42;');
   });
 });

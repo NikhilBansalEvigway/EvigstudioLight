@@ -1,5 +1,8 @@
 import type { FileNode, WorkspaceRoot } from '@/types';
 
+export const STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE =
+  'Workspace write could not be confirmed. This chat may be holding stale workspace state. Open a new chat, reopen the same workspace, and continue there.';
+
 /**
  * Sanitize a file path for use with the File System Access API.
  * Normalizes separators, removes leading/trailing slashes, and filters empty segments.
@@ -37,6 +40,15 @@ async function entryExists(dirHandle: FileSystemDirectoryHandle, name: string): 
     } catch {
       return false;
     }
+  }
+}
+
+async function fileExists(dirHandle: FileSystemDirectoryHandle, name: string): Promise<boolean> {
+  try {
+    await dirHandle.getFileHandle(name);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -463,6 +475,43 @@ export async function createFile(dirHandle: FileSystemDirectoryHandle, path: str
   await writeFile(dirHandle, path, '');
 }
 
+export async function workspaceFileExists(workspaceRoots: WorkspaceRoot[], path: string): Promise<boolean> {
+  const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
+  if (!relativePath) {
+    return true;
+  }
+
+  const parts = sanitizePath(relativePath);
+  if (parts.length === 0) return false;
+
+  let current: FileSystemDirectoryHandle = root.handle;
+  for (let i = 0; i < parts.length - 1; i++) {
+    try {
+      current = await current.getDirectoryHandle(parts[i]);
+    } catch {
+      return false;
+    }
+  }
+
+  return fileExists(current, parts[parts.length - 1]);
+}
+
+export async function writeWorkspaceFileVerified(
+  workspaceRoots: WorkspaceRoot[],
+  path: string,
+  content: string,
+  options?: { expectCreate?: boolean },
+): Promise<void> {
+  await writeWorkspaceFile(workspaceRoots, path, content);
+
+  if (options?.expectCreate) {
+    const exists = await workspaceFileExists(workspaceRoots, path);
+    if (!exists) {
+      throw new Error(`${STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE} File: ${path}`);
+    }
+  }
+}
+
 export async function createDirectory(dirHandle: FileSystemDirectoryHandle, path: string): Promise<void> {
   await ensurePermission(dirHandle, 'readwrite', { request: true });
   const parts = sanitizePath(path);
@@ -507,6 +556,11 @@ export async function createWorkspaceFile(workspaceRoots: WorkspaceRoot[], path:
   const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
   if (!relativePath) throw new Error(`Cannot create a file at workspace root: "${path}"`);
   await createFile(root.handle, relativePath);
+
+  const exists = await workspaceFileExists(workspaceRoots, path);
+  if (!exists) {
+    throw new Error(`${STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE} File: ${path}`);
+  }
 }
 
 export async function createWorkspaceDirectory(workspaceRoots: WorkspaceRoot[], path: string): Promise<void> {

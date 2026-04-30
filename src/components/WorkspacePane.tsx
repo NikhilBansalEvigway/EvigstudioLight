@@ -7,9 +7,16 @@ import {
   getFileExtension,
   getUniqueWorkspaceLabel,
   pickDirectory,
+  writeWorkspaceFileVerified,
   workspaceRootsMatch,
-  writeWorkspaceFile,
 } from '@/lib/fsWorkspace';
+import {
+  buildActiveDocumentAudit,
+  buildWorkspaceRootSummaries,
+  normalizeAuditPaths,
+  postWorkspaceAuditEvent,
+  workspaceFolderLabels,
+} from '@/lib/auditClient';
 import { SYSTEM_PROMPT } from '@/types';
 import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus, X, Copy, Users, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -45,7 +52,7 @@ export function WorkspacePane() {
     rightPaneTab, setRightPaneTab,
     workspaceRoots, clearWorkspace, setFileTree,
     openEditorTabs, activeFilePath, activeFileContent, setActiveFileContent, setActiveEditorFile, closeEditorFile, markEditorFileSaved,
-    contextFiles, toggleContextFile, clearContextFiles,
+    contextFiles, toggleContextFile, clearContextFiles, settings, fileTree,
   } = useAppStore();
   const { serverAvailable, user } = useAuth();
 
@@ -62,6 +69,35 @@ export function WorkspacePane() {
   const activeTab = openEditorTabs.find((tab) => tab.path === activeFilePath) ?? null;
   const activeDirty = !!activeTab && activeTab.content !== activeTab.savedContent;
   const hasWorkspace = workspaceRoots.length > 0;
+  const hasBackground = Boolean(settings.backgroundImageDataUrl);
+
+  const emitWorkspaceAudit = useCallback((input: {
+    event: 'open' | 'refresh' | 'clear' | 'context_update';
+    workspaceFolders?: string[];
+    addedFolder?: string | null;
+    changedPath?: string | null;
+    changeKind?: 'add' | 'remove' | 'clear' | null;
+    contextFiles?: string[];
+    trigger?: string | null;
+  }) => {
+    const state = useAppStore.getState();
+    const activeChat = state.chats.find((chat) => chat.id === state.activeChatId) ?? null;
+    void postWorkspaceAuditEvent({
+      event: input.event,
+      chatId: activeChat?.id ?? null,
+      chatTitle: activeChat?.title ?? null,
+      chatMode: activeChat?.mode ?? null,
+      workspaceFolders: input.workspaceFolders ?? workspaceFolderLabels(state.workspaceRoots),
+      contextFiles: input.contextFiles ?? normalizeAuditPaths(state.contextFiles, 50),
+      activeFilePath: state.activeFilePath,
+      addedFolder: input.addedFolder ?? null,
+      changedPath: input.changedPath ?? null,
+      changeKind: input.changeKind ?? null,
+      trigger: input.trigger ?? null,
+      workspaceRootSummaries: buildWorkspaceRootSummaries(state.workspaceRoots, state.fileTree),
+      activeDocument: buildActiveDocumentAudit(state.activeFilePath),
+    });
+  }, []);
 
   // Monaco keybindings are registered once; keep callbacks fresh.
   const saveActiveRef = useRef<() => void>(() => {});
@@ -186,6 +222,12 @@ export function WorkspacePane() {
         if (treeRequestIdRef.current !== requestId || !workspaceRootsMatch(useAppStore.getState().workspaceRoots, nextRoots)) return;
         setFileTree(tree);
         toast.success(`${currentRoots.length === 0 ? 'Opened' : 'Added'}: ${label}`);
+        emitWorkspaceAudit({
+          event: 'open',
+          workspaceFolders: workspaceFolderLabels(nextRoots),
+          addedFolder: label,
+          trigger: currentRoots.length === 0 ? 'open_folder' : 'add_folder',
+        });
       } catch (err: any) {
         if (treeRequestIdRef.current === requestId) {
           if (workspaceRootsMatch(useAppStore.getState().workspaceRoots, nextRoots)) {
@@ -226,6 +268,7 @@ export function WorkspacePane() {
       if (treeRequestIdRef.current === requestId && workspaceRootsMatch(useAppStore.getState().workspaceRoots, roots)) {
         setFileTree(tree);
       }
+      emitWorkspaceAudit({ event: 'refresh', workspaceFolders: workspaceFolderLabels(roots), trigger: 'refresh_button' });
     } catch (err: any) {
       if (treeRequestIdRef.current === requestId) {
         toast.error(`Could not refresh file tree: ${err?.message ?? String(err)}`);
@@ -292,7 +335,7 @@ export function WorkspacePane() {
   const handleCreateFile = async () => {
     if (!hasWorkspace || !newFileName.trim()) return;
     try {
-      await writeWorkspaceFile(workspaceRoots, newFileName.trim(), '');
+      await writeWorkspaceFileVerified(workspaceRoots, newFileName.trim(), '', { expectCreate: true });
       toast.success(`Created ${newFileName.trim()}`);
       setNewFileName('');
       setShowNewFile(false);
@@ -309,7 +352,7 @@ export function WorkspacePane() {
   ];
 
   return (
-    <div className="flex flex-col h-full bg-card">
+    <div className={`flex flex-col h-full ${hasBackground ? 'bg-card/74 backdrop-blur-md' : 'bg-card'}`}>
       {/* Tabs */}
       <div className="flex border-b border-border">
         {tabs.map(tab => (
@@ -370,11 +413,13 @@ export function WorkspacePane() {
                         if (dirtyTabs.length > 0 && !window.confirm(`Clear the workspace and close ${dirtyTabs.length} open tab${dirtyTabs.length === 1 ? '' : 's'}?`)) {
                           return;
                         }
-                        treeRequestIdRef.current += 1;
-                        setWorkspaceTreeLoading(false);
-                        clearWorkspace();
-                        toast.success('Cleared workspace folders');
-                      }}
+                         treeRequestIdRef.current += 1;
+                         setWorkspaceTreeLoading(false);
+                         const clearedFolders = workspaceFolderLabels(useAppStore.getState().workspaceRoots);
+                         clearWorkspace();
+                         emitWorkspaceAudit({ event: 'clear', workspaceFolders: clearedFolders, contextFiles: [], trigger: 'clear_button' });
+                         toast.success('Cleared workspace folders');
+                       }}
                       className="rounded-xl border border-border/70 bg-background px-2.5 py-1.5 text-[10px] font-medium text-muted-foreground transition-all hover:border-destructive/20 hover:text-destructive"
                     >
                       Clear
@@ -628,7 +673,15 @@ export function WorkspacePane() {
             <div className="flex items-center justify-between">
               <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">Injected Files</span>
               {contextFiles.length > 0 && (
-                <button onClick={clearContextFiles} className="text-[10px] text-destructive hover:underline">Clear all</button>
+                <button
+                  onClick={() => {
+                    clearContextFiles();
+                    emitWorkspaceAudit({ event: 'context_update', contextFiles: [], changeKind: 'clear', trigger: 'clear_context' });
+                  }}
+                  className="text-[10px] text-destructive hover:underline"
+                >
+                  Clear all
+                </button>
               )}
             </div>
             {contextFiles.length === 0 ? (
@@ -641,7 +694,22 @@ export function WorkspacePane() {
                   <div key={path} className="flex items-center gap-2 px-2 py-1 rounded bg-secondary text-xs">
                     <FileCode className="w-3 h-3 text-primary shrink-0" />
                     <span className="flex-1 truncate">{path}</span>
-                    <button onClick={() => toggleContextFile(path)} className="text-muted-foreground hover:text-destructive">×</button>
+                    <button
+                      onClick={() => {
+                        toggleContextFile(path);
+                        const nextContext = useAppStore.getState().contextFiles.filter((item) => item !== path);
+                        emitWorkspaceAudit({
+                          event: 'context_update',
+                          contextFiles: normalizeAuditPaths(nextContext, 50),
+                          changedPath: path,
+                          changeKind: 'remove',
+                          trigger: 'context_panel_remove',
+                        });
+                      }}
+                      className="text-muted-foreground hover:text-destructive"
+                    >
+                      ×
+                    </button>
                   </div>
                 ))}
               </div>

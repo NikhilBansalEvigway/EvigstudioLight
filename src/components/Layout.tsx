@@ -32,6 +32,9 @@ export function Layout() {
   const bgUrl = settings.backgroundImageDataUrl;
   const overlay = settings.backgroundOverlayOpacity ?? 0.88;
   const isLgUp = useIsLgUp();
+  const shellSurfaceClass = bgUrl ? 'bg-background/70 backdrop-blur-sm' : 'bg-background';
+  const sidebarSurfaceClass = bgUrl ? 'bg-sidebar/82 backdrop-blur-md' : 'bg-sidebar';
+  const workspaceSurfaceClass = bgUrl ? 'bg-card/78 backdrop-blur-md' : 'bg-card';
 
   useEffect(() => {
     const handleOnline = () => setOnline(true);
@@ -62,9 +65,7 @@ export function Layout() {
           />
         </>
       ) : null}
-      <div
-        className={`relative z-[2] flex min-h-0 flex-1 flex-col overflow-hidden ${!bgUrl ? 'bg-background' : ''}`}
-      >
+      <div className={`relative z-[2] flex min-h-0 flex-1 flex-col overflow-hidden ${!bgUrl ? 'bg-background' : ''}`}>
         <StatusBar />
         {isLgUp ? (
           <PanelGroup
@@ -76,7 +77,7 @@ export function Layout() {
             {showSidebar ? (
               <>
                 <Panel defaultSize={22} minSize={14} maxSize={42} className="min-h-0 min-w-0">
-                  <div className="flex h-full min-h-0 flex-col overflow-hidden bg-sidebar">
+                  <div className={`flex h-full min-h-0 flex-col overflow-hidden ${sidebarSurfaceClass}`}>
                     <Sidebar />
                   </div>
                 </Panel>
@@ -97,14 +98,12 @@ export function Layout() {
               className="min-h-0 min-w-0"
             >
               <div
-                className={
-                  showRightPane
-                    ? 'flex h-full min-h-0 flex-col overflow-hidden border-r border-border bg-background'
-                    : 'flex h-full min-h-0 flex-col overflow-hidden bg-background'
-                }
-              >
-                <ChatPane />
-              </div>
+                  className={showRightPane
+                    ? `flex h-full min-h-0 flex-col overflow-hidden border-r border-border ${shellSurfaceClass}`
+                    : `flex h-full min-h-0 flex-col overflow-hidden ${shellSurfaceClass}`}
+                >
+                  <ChatPane />
+                </div>
             </Panel>
             {showRightPane ? (
               <>
@@ -118,7 +117,7 @@ export function Layout() {
                   />
                 </PanelResizeHandle>
                 <Panel defaultSize={showSidebar ? 28 : 38} minSize={16} maxSize={52} className="min-h-0 min-w-0">
-                  <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
+                  <div className={`flex h-full min-h-0 flex-col overflow-hidden ${workspaceSurfaceClass}`}>
                     <WorkspacePane />
                   </div>
                 </Panel>
@@ -128,15 +127,15 @@ export function Layout() {
         ) : (
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             {showSidebar && (
-              <div className="flex max-h-[min(38vh,320px)] w-full shrink-0 flex-col overflow-hidden border-b border-border bg-sidebar">
+              <div className={`flex max-h-[min(38vh,320px)] w-full shrink-0 flex-col overflow-hidden border-b border-border ${sidebarSurfaceClass}`}>
                 <Sidebar />
               </div>
             )}
-            <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background">
+            <div className={`flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden ${shellSurfaceClass}`}>
               <ChatPane />
             </div>
             {showRightPane && (
-              <div className="flex max-h-[min(40vh,360px)] w-full shrink-0 flex-col overflow-hidden border-t border-border bg-card">
+              <div className={`flex max-h-[min(40vh,360px)] w-full shrink-0 flex-col overflow-hidden border-t border-border ${workspaceSurfaceClass}`}>
                 <WorkspacePane />
               </div>
             )}

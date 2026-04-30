@@ -52,6 +52,13 @@ import {
   renameWorkspacePath,
   workspaceRootsMatch,
 } from '@/lib/fsWorkspace';
+import {
+  buildActiveDocumentAudit,
+  buildWorkspaceRootSummaries,
+  normalizeAuditPaths,
+  postWorkspaceAuditEvent,
+  workspaceFolderLabels,
+} from '@/lib/auditClient';
 import { useAppStore } from '@/store/useAppStore';
 import type { FileNode } from '@/types';
 import { toast } from 'sonner';
@@ -196,7 +203,9 @@ function getFileVisual(name: string): { Icon: LucideIcon; iconClassName: string;
 
 export function FileTree() {
     const {
+      activeChatId,
       activeFilePath,
+      chats,
       contextFiles,
       fileTree,
       openEditorTabs,
@@ -209,6 +218,7 @@ export function FileTree() {
       toggleContextFile,
       workspaceRoots,
   } = useAppStore();
+  const activeChat = chats.find((chat) => chat.id === activeChatId) ?? null;
 
   const [deleteTarget, setDeleteTarget] = useState<FileNode | null>(null);
   const [renameTarget, setRenameTarget] = useState<FileNode | null>(null);
@@ -268,6 +278,49 @@ export function FileTree() {
     }
   }, [workspaceRoots, setFileTree]);
 
+  const emitWorkspaceAudit = useCallback((input: {
+    event: 'folder_remove' | 'context_update';
+    workspaceFolders?: string[];
+    contextFiles?: string[];
+    removedFolder?: string | null;
+    changedPath?: string | null;
+    changeKind?: 'add' | 'remove' | 'clear' | null;
+    trigger?: string | null;
+  }) => {
+    const state = useAppStore.getState();
+    void postWorkspaceAuditEvent({
+      event: input.event,
+      chatId: activeChat?.id ?? state.activeChatId ?? null,
+      chatTitle: activeChat?.title ?? null,
+      chatMode: activeChat?.mode ?? null,
+      workspaceFolders: input.workspaceFolders ?? workspaceFolderLabels(state.workspaceRoots),
+      contextFiles: input.contextFiles ?? normalizeAuditPaths(state.contextFiles, 50),
+      activeFilePath: state.activeFilePath,
+      removedFolder: input.removedFolder ?? null,
+      changedPath: input.changedPath ?? null,
+      changeKind: input.changeKind ?? null,
+      trigger: input.trigger ?? null,
+      workspaceRootSummaries: buildWorkspaceRootSummaries(state.workspaceRoots, state.fileTree),
+      activeDocument: buildActiveDocumentAudit(state.activeFilePath),
+    });
+  }, [activeChat]);
+
+  const handleToggleContext = useCallback((path: string) => {
+    const state = useAppStore.getState();
+    const wasIncluded = state.contextFiles.includes(path);
+    toggleContextFile(path);
+    const nextContextFiles = wasIncluded
+      ? state.contextFiles.filter((item) => item !== path)
+      : [...state.contextFiles, path];
+    emitWorkspaceAudit({
+      event: 'context_update',
+      contextFiles: normalizeAuditPaths(nextContextFiles, 50),
+      changedPath: path,
+      changeKind: wasIncluded ? 'remove' : 'add',
+      trigger: 'file_tree_toggle',
+    });
+  }, [emitWorkspaceAudit, toggleContextFile]);
+
   const handleDelete = useCallback(async (mode: 'trash' | 'delete') => {
     if (!deleteTarget) return;
 
@@ -290,11 +343,24 @@ export function FileTree() {
 
         if (state.workspaceRoots.length === 1) {
           clearWorkspace();
+          emitWorkspaceAudit({
+            event: 'folder_remove',
+            workspaceFolders: [],
+            contextFiles: [],
+            removedFolder: root.label,
+            trigger: 'workspace_root_remove',
+          });
         } else {
           const nextRoots = state.workspaceRoots.filter((entry) => entry.id !== rootId);
           removeWorkspacePathReferences(root.label);
           removeWorkspaceRoot(rootId);
           setFileTree(removeWorkspaceRootFromTree(state.fileTree, rootId));
+          emitWorkspaceAudit({
+            event: 'folder_remove',
+            workspaceFolders: workspaceFolderLabels(nextRoots),
+            removedFolder: root.label,
+            trigger: 'workspace_root_remove',
+          });
 
           try {
             const tree = await buildWorkspaceTree(nextRoots, {
@@ -334,6 +400,7 @@ export function FileTree() {
     affectedDirtyTabs.length,
     clearWorkspace,
     deleteTarget,
+    emitWorkspaceAudit,
     refreshTree,
     removeWorkspacePathReferences,
     removeWorkspaceRoot,
@@ -519,7 +586,7 @@ export function FileTree() {
                 activeFilePath={activeFilePath}
                 onFileClick={handleFileClick}
                 contextFiles={contextFiles}
-                onToggleContext={toggleContextFile}
+                onToggleContext={handleToggleContext}
                 onDelete={setDeleteTarget}
                 onRename={openRename}
                 onCreate={openCreate}

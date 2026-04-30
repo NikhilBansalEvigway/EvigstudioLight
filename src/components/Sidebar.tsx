@@ -171,7 +171,7 @@ function ChatRow({
 
 export function Sidebar() {
   const { user } = useAuth();
-  const { chats, activeChatId, createChat, selectChat, deleteChat, renameChat } = useAppStore();
+  const { chats, activeChatId, createChat, selectChat, deleteChat, renameChat, settings } = useAppStore();
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<SidebarFilter>('all');
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -183,6 +183,7 @@ export function Sidebar() {
     return search.trim() ? chatMatchesSearch(c, search) : true;
   });
   const { noThread, threads } = groupChatsForSidebar(filtered);
+  const hasBackground = Boolean(settings.backgroundImageDataUrl);
 
   const startRename = useCallback((chatId: string, currentTitle: string) => {
     setEditingId(chatId);
@@ -211,7 +212,7 @@ export function Sidebar() {
   }, [editingId]);
 
   return (
-    <div className="flex flex-col h-full bg-sidebar">
+    <div className={`flex flex-col h-full ${hasBackground ? 'bg-sidebar/78 backdrop-blur-md' : 'bg-sidebar'}`}>
       <div className="pane-header justify-between">
         <span>Chats</span>
         <button

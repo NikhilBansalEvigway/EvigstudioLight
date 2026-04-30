@@ -60,6 +60,7 @@ type AuditSummary = {
   denied: number;
   error: number;
   chatReads: number;
+  workspaceActivity: number;
   loginFailures: number;
   adminChanges: number;
   llmQueries: number;
@@ -108,11 +109,23 @@ type AuditMetadata = {
   details?: Record<string, unknown> | null;
 };
 
+type WorkspaceRootSummary = {
+  label?: string;
+  opaqueLabel?: boolean;
+  topLevelEntries?: unknown;
+};
+
+function readWorkspaceRootSummaries(metadata: AuditMetadata): WorkspaceRootSummary[] {
+  const raw = metadata.details?.workspaceRootSummaries;
+  return Array.isArray(raw) ? raw.filter((item): item is WorkspaceRootSummary => isRecord(item)) : [];
+}
+
 const AUDIT_ACTION_FILTERS = [
   { value: 'all', label: 'All actions' },
   { value: 'auth.', label: 'Auth' },
   { value: 'chat.', label: 'Chats' },
   { value: 'group.', label: 'Groups' },
+  { value: 'workspace.', label: 'Workspace' },
   { value: 'admin.', label: 'Admin' },
   { value: 'llm.', label: 'LLM' },
   { value: 'audit.', label: 'Audit' },
@@ -123,6 +136,7 @@ const AUDIT_RESOURCE_FILTERS = [
   { value: 'user', label: 'user' },
   { value: 'group', label: 'group' },
   { value: 'chat', label: 'chat' },
+  { value: 'workspace', label: 'workspace' },
   { value: 'group_workspace', label: 'group_workspace' },
   { value: 'llm_proxy', label: 'llm_proxy' },
   { value: 'audit_log', label: 'audit_log' },
@@ -164,9 +178,34 @@ function auditTargetLabel(log: AuditRow, metadata: AuditMetadata): string {
 }
 
 function auditSummary(log: AuditRow, metadata: AuditMetadata): string {
+  const workspaceFolders = Array.isArray(metadata.details?.workspaceFolders)
+    ? metadata.details.workspaceFolders.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    : [];
+  const workspaceRootSummaries = readWorkspaceRootSummaries(metadata);
   const fields = metadata.change?.fields ?? [];
   if (fields.length > 0) {
     return `Changed ${fields.join(', ')}`;
+  }
+  if (log.action.startsWith('workspace.')) {
+    const firstRoot = workspaceRootSummaries[0];
+    const topLevelEntries = Array.isArray(firstRoot?.topLevelEntries)
+      ? firstRoot.topLevelEntries.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+    if (typeof metadata.details?.addedFolder === 'string') {
+      return `Added folder ${metadata.details.addedFolder}`;
+    }
+    if (typeof metadata.details?.removedFolder === 'string') {
+      return `Removed folder ${metadata.details.removedFolder}`;
+    }
+    if (typeof metadata.details?.changedPath === 'string' && typeof metadata.details?.changeKind === 'string') {
+      return `${metadata.details.changeKind} context ${metadata.details.changedPath}`;
+    }
+    if (firstRoot?.opaqueLabel && topLevelEntries.length > 0) {
+      return `Workspace top level: ${topLevelEntries.join(', ')}`;
+    }
+    if (workspaceFolders.length > 0) {
+      return `Folders: ${workspaceFolders.slice(0, 3).join(', ')}${workspaceFolders.length > 3 ? ` (+${workspaceFolders.length - 3})` : ''}`;
+    }
   }
   if (metadata.result?.reason) {
     return prettifyReason(metadata.result.reason);
@@ -175,7 +214,11 @@ function auditSummary(log: AuditRow, metadata: AuditMetadata): string {
     return `${metadata.access.mode}${metadata.access?.privacy ? ` · ${metadata.access.privacy}` : ''}`;
   }
   if (typeof metadata.details?.model === 'string') {
-    return `Model ${metadata.details.model}`;
+    const activeDocument = isRecord(metadata.details?.activeDocument) ? metadata.details.activeDocument : null;
+    const fileName = typeof activeDocument?.fileName === 'string' ? activeDocument.fileName : null;
+    return workspaceFolders.length > 0
+      ? `Model ${metadata.details.model}${fileName ? ` · ${fileName}` : ''} · folders ${workspaceFolders.slice(0, 2).join(', ')}${workspaceFolders.length > 2 ? '…' : ''}`
+      : `Model ${metadata.details.model}`;
   }
   if (typeof metadata.details?.name === 'string') {
     return String(metadata.details.name);
@@ -1162,9 +1205,9 @@ export default function AdminPage() {
                 </div>
               </div>
               <div className="rounded-md border border-border bg-card p-3 text-xs">
-                <div className="text-muted-foreground">Access</div>
-                <div className="mt-1 text-lg font-semibold">{auditMetrics.chatReads}</div>
-                <div className="mt-1 text-[11px] text-muted-foreground">chat reads in current filter window</div>
+                <div className="text-muted-foreground">Document Access</div>
+                <div className="mt-1 text-lg font-semibold">{auditMetrics.workspaceActivity}</div>
+                <div className="mt-1 text-[11px] text-muted-foreground">workspace events · chat reads {auditMetrics.chatReads}</div>
               </div>
               <div className="rounded-md border border-border bg-card p-3 text-xs">
                 <div className="text-muted-foreground">Risk Signals</div>

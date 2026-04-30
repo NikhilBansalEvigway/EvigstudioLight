@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { buildWorkspaceTree, getFileSystemAccessStatus, getUniqueWorkspaceLabel, resolveWorkspacePath, workspaceRootsMatch } from '@/lib/fsWorkspace';
+import {
+  STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE,
+  buildWorkspaceTree,
+  createWorkspaceFile,
+  getFileSystemAccessStatus,
+  getUniqueWorkspaceLabel,
+  resolveWorkspacePath,
+  workspaceFileExists,
+  workspaceRootsMatch,
+  writeWorkspaceFileVerified,
+} from '@/lib/fsWorkspace';
 import type { FileNode, WorkspaceRoot } from '@/types';
 
 const originalPicker = (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker;
@@ -44,6 +54,84 @@ function mockDirectory(entries: Record<string, MockHandle>): FileSystemDirectory
       }
     },
   } as unknown as FileSystemDirectoryHandle;
+}
+
+type MemoryFileNode = { kind: 'file'; content: string };
+type MemoryDirectoryNode = { kind: 'directory'; entries: Map<string, MemoryNode> };
+type MemoryNode = MemoryFileNode | MemoryDirectoryNode;
+
+function createMemoryDirectory(initialEntries?: Record<string, MemoryNode>): MemoryDirectoryNode {
+  return {
+    kind: 'directory',
+    entries: new Map(Object.entries(initialEntries ?? {})),
+  };
+}
+
+function createMemoryFile(content = ''): MemoryFileNode {
+  return { kind: 'file', content };
+}
+
+function createDirectoryHandle(node: MemoryDirectoryNode): FileSystemDirectoryHandle {
+  return {
+    kind: 'directory',
+    queryPermission: async () => 'granted',
+    requestPermission: async () => 'granted',
+    async getDirectoryHandle(name: string, options?: { create?: boolean }) {
+      const existing = node.entries.get(name);
+      if (existing?.kind === 'directory') {
+        return createDirectoryHandle(existing);
+      }
+      if (existing) {
+        throw new Error(`${name} is not a directory`);
+      }
+      if (options?.create) {
+        const next = createMemoryDirectory();
+        node.entries.set(name, next);
+        return createDirectoryHandle(next);
+      }
+      throw new Error(`Directory not found: ${name}`);
+    },
+    async getFileHandle(name: string, options?: { create?: boolean }) {
+      const existing = node.entries.get(name);
+      if (existing?.kind === 'file') {
+        return createFileHandle(existing);
+      }
+      if (existing) {
+        throw new Error(`${name} is not a file`);
+      }
+      if (options?.create) {
+        const next = createMemoryFile();
+        node.entries.set(name, next);
+        return createFileHandle(next);
+      }
+      throw new Error(`File not found: ${name}`);
+    },
+    async *entries() {
+      for (const [name, entry] of node.entries) {
+        yield [name, entry.kind === 'directory' ? createDirectoryHandle(entry) : createFileHandle(entry)] as const;
+      }
+    },
+  } as unknown as FileSystemDirectoryHandle;
+}
+
+function createFileHandle(node: MemoryFileNode): FileSystemFileHandle {
+  return {
+    kind: 'file',
+    async getFile() {
+      return {
+        text: async () => node.content,
+        arrayBuffer: async () => new TextEncoder().encode(node.content).buffer,
+      } as File;
+    },
+    async createWritable() {
+      return {
+        write: async (content: string) => {
+          node.content = content;
+        },
+        close: async () => {},
+      };
+    },
+  } as unknown as FileSystemFileHandle;
 }
 
 afterEach(() => {
@@ -185,5 +273,47 @@ describe('workspace path helpers', () => {
       'src',
       'README.md',
     ]);
+  });
+
+  it('confirms a newly created workspace file exists after writing', async () => {
+    const rootNode = createMemoryDirectory();
+    const root: WorkspaceRoot = {
+      id: 'root-1',
+      label: 'frontend',
+      handle: createDirectoryHandle(rootNode),
+    };
+
+    await writeWorkspaceFileVerified([root], 'src/App.tsx', 'export {}', { expectCreate: true });
+
+    await expect(workspaceFileExists([root], 'src/App.tsx')).resolves.toBe(true);
+  });
+
+  it('surfaces a stale-chat recovery message when file creation cannot be verified', async () => {
+    let createAttempted = false;
+    const root: WorkspaceRoot = {
+      id: 'root-1',
+      label: 'frontend',
+      handle: {
+        kind: 'directory',
+        queryPermission: async () => 'granted',
+        requestPermission: async () => 'granted',
+        async getDirectoryHandle() {
+          return this as unknown as FileSystemDirectoryHandle;
+        },
+        async getFileHandle(_name: string, options?: { create?: boolean }) {
+          if (options?.create && !createAttempted) {
+            createAttempted = true;
+            return {
+              async createWritable() {
+                return { write: async () => {}, close: async () => {} };
+              },
+            } as unknown as FileSystemFileHandle;
+          }
+          throw new Error('File not found');
+        },
+      } as FileSystemDirectoryHandle,
+    };
+
+    await expect(createWorkspaceFile([root], 'ghost.txt')).rejects.toThrow(STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE);
   });
 });

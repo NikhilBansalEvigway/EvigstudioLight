@@ -7,6 +7,7 @@ import {
   deleteWorkspacePath,
   readWorkspaceFile,
   serializeFileTree,
+  STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE,
   writeWorkspaceFile,
 } from '@/lib/fsWorkspace';
 import {
@@ -37,6 +38,12 @@ import { ChatToolbar } from '@/components/ChatToolbar';
 import { getLastUserContextRefPaths, getMessageContextRefPaths } from '@/lib/chatContext';
 import { collectDirectoryFilePaths, findMentionNode, summarizeDirectory, type MentionEntry } from '@/lib/fileMentions';
 import { isWorkspaceEditRequest } from '@/lib/workspaceIntent';
+import {
+  buildActiveDocumentAudit,
+  buildWorkspaceRootSummaries,
+  normalizeAuditPaths,
+  workspaceFolderLabels,
+} from '@/lib/auditClient';
 import { useSpeechDictation } from '@/hooks/useSpeechDictation';
 import { Send, ImagePlus, Loader2, StopCircle, FileCode, X, Mic, Bot, MessageSquare, Lock, FolderOpen } from 'lucide-react';
 import { toast } from 'sonner';
@@ -573,6 +580,13 @@ export function ChatPane() {
         });
         allActions.push(...actions);
 
+        const staleWriteFailure = actions.find(
+          (action) => !action.success && action.error?.includes(STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE),
+        );
+        if (staleWriteFailure) {
+          toast.error(STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE);
+        }
+
         if (actions.some((action) => action.type === 'edit' || action.type === 'write' || action.type === 'delete' || action.type === 'rename')) {
           addPatchedPaths(
             actions.flatMap((action) => {
@@ -806,12 +820,17 @@ export function ChatPane() {
             chatTitle: useAppStore.getState().chats.find((c) => c.id === chatId)?.title ?? null,
             chatMode: effectiveMode,
             model: settings.textModel,
-            preview: getMessageText(userMsg).slice(0, 500),
-            promptLength: getMessageText(userMsg).length,
-            imageCount: images.length,
-            mentionedFileCount: mentionedFilePaths.length,
-          }),
-        });
+              preview: getMessageText(userMsg).slice(0, 500),
+              promptLength: getMessageText(userMsg).length,
+              imageCount: images.length,
+              mentionedFileCount: mentionedFilePaths.length,
+              workspaceFolders: workspaceFolderLabels(workspaceRoots),
+              contextFiles: normalizeAuditPaths(contextFiles, 50),
+              mentionedFiles: normalizeAuditPaths(mentionedFilePaths, 50),
+              workspaceRootSummaries: buildWorkspaceRootSummaries(workspaceRoots, fileTree),
+              activeDocument: buildActiveDocumentAudit(useAppStore.getState().activeFilePath),
+            }),
+          });
       } catch {
         /* optional audit */
       }

@@ -2,6 +2,7 @@ import { useAppStore } from '@/store/useAppStore';
 import { testConnection } from '@/lib/llmClient';
 import { DEFAULT_SETTINGS } from '@/types';
 import type { UiThemePresetId } from '@/types';
+import { useAuth } from '@/contexts/AuthContext';
 import { UI_THEME_PRESETS, MAX_BRAND_LOGO_BYTES, MAX_BACKGROUND_BYTES } from '@/lib/uiThemes';
 import { X, RotateCcw, Loader2, CheckCircle, XCircle, ImageIcon } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
@@ -11,6 +12,7 @@ import { isSpeechRecognitionSupported } from '@/lib/speechStt';
 
 export function SettingsDialog() {
   const { settings, setSettings, showSettings, setShowSettings, setLMConnected } = useAppStore();
+  const { user } = useAuth();
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const logoInputRef = useRef<HTMLInputElement>(null);
@@ -22,6 +24,12 @@ export function SettingsDialog() {
     sync();
     return subscribeVoicesChanged(sync);
   }, []);
+
+  useEffect(() => {
+    if (showSettings && user?.role !== 'admin') {
+      setShowSettings(false);
+    }
+  }, [showSettings, user, setShowSettings]);
 
   const readImageFile = (file: File, maxBytes: number): Promise<string | null> =>
     new Promise((resolve) => {
@@ -41,7 +49,7 @@ export function SettingsDialog() {
       r.readAsDataURL(file);
     });
 
-  if (!showSettings) return null;
+  if (!showSettings || user?.role !== 'admin') return null;
 
   const handleTest = async () => {
     setTesting(true);
@@ -155,6 +163,13 @@ export function SettingsDialog() {
                     </button>
                   )}
                 </div>
+                {settings.backgroundImageDataUrl && (
+                  <div
+                    className="h-20 rounded-lg border border-border/70 bg-cover bg-center bg-no-repeat"
+                    style={{ backgroundImage: `url(${settings.backgroundImageDataUrl})` }}
+                    aria-label="Background preview"
+                  />
+                )}
               </div>
             </div>
             <Field label={`Background overlay: ${Math.round((settings.backgroundOverlayOpacity ?? 0.88) * 100)}%`}>

@@ -36,9 +36,11 @@ export function StatusBar() {
   const logo = settings.brandLogoDataUrl;
   const { serverAvailable, user, logout } = useAuth();
   const { theme, setTheme } = useTheme();
+  const hasBackground = Boolean(settings.backgroundImageDataUrl);
+  const canOpenSettings = user?.role === 'admin';
 
   return (
-    <header className="flex h-10 min-h-10 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-2 sm:px-3">
+    <header className={`flex h-10 min-h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-2 sm:px-3 ${hasBackground ? 'bg-card/82 backdrop-blur-md' : 'bg-card'}`}>
       <div className="flex min-w-0 items-center gap-2 sm:gap-3">
         <Tooltip>
           <TooltipTrigger asChild>
@@ -148,9 +150,11 @@ export function StatusBar() {
             <LogOut className="w-4 h-4" />
           </Button>
         )}
-        <button onClick={() => setShowSettings(true)} className="p-1 hover:text-primary transition-colors" title="Settings">
-          <Settings className="w-4 h-4" />
-        </button>
+        {canOpenSettings && (
+          <button onClick={() => setShowSettings(true)} className="p-1 hover:text-primary transition-colors" title="Settings">
+            <Settings className="w-4 h-4" />
+          </button>
+        )}
         <Tooltip>
           <TooltipTrigger asChild>
             <button
