@@ -60,6 +60,27 @@ set_compose_cmd() {
   exit 1
 }
 
+retry() {
+  local attempts="$1"
+  local delay_seconds="$2"
+  shift 2
+
+  local attempt=1
+  until "$@"; do
+    local exit_code=$?
+    if [[ "$attempt" -ge "$attempts" ]]; then
+      return "$exit_code"
+    fi
+    printf 'Attempt %d/%d failed. Retrying in %ss...\n' "$attempt" "$attempts" "$delay_seconds" >&2
+    sleep "$delay_seconds"
+    attempt=$((attempt + 1))
+  done
+}
+
+compose_up_build() {
+  (cd "$ROOT_DIR" && "${COMPOSE[@]}" up -d --build)
+}
+
 if ! command -v docker >/dev/null 2>&1; then
   printf 'Docker was not found. Install Docker and run this script again.\n' >&2
   exit 1
@@ -84,7 +105,7 @@ APP_URL="https://${SYSTEM_IP}"
 set_env_value "APP_HOST" "$SYSTEM_IP"
 set_env_value "APP_URL" "$APP_URL"
 set_env_value "PUBLIC_APP_URL" "$APP_URL"
-set_env_value "LM_STUDIO_URL" "http://${SYSTEM_IP}:1234"
+set_env_value "LLM_ORCHESTRATOR_URL" "http://llm-orch:3013"
 
 COMPOSE=()
 COMPOSE_DISPLAY=''
@@ -93,7 +114,13 @@ set_compose_cmd
 printf 'Detected system IP: %s\n' "$SYSTEM_IP"
 printf 'Starting EvigStudio services...\n'
 
-(cd "$ROOT_DIR" && "${COMPOSE[@]}" up -d --build)
+printf 'Pulling base images (with retries)...\n'
+retry 3 5 docker pull node:20-alpine
+retry 3 5 docker pull nginx:alpine
+retry 3 5 docker pull postgres:16-alpine
+
+printf 'Bringing up compose stack (with retries)...\n'
+retry 3 8 compose_up_build
 
 printf '\nEvigStudio services are starting.\n'
 printf 'Frontend: %s\n' "$APP_URL"

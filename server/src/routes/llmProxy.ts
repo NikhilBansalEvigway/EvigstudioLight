@@ -17,7 +17,10 @@ const HOP_BY_HOP = new Set([
 ]);
 
 function upstreamBase(): string {
-  return (process.env.LM_STUDIO_URL ?? 'http://127.0.0.1:1234').replace(/\/$/, '');
+  if (process.env.LLM_ORCHESTRATOR_URL) {
+    return process.env.LLM_ORCHESTRATOR_URL.replace(/\/$/, '');
+  }
+  return (process.env.LM_STUDIO_URL ?? 'http://llm-orch:3013').replace(/\/$/, '');
 }
 
 function maxConcurrent(): number {
@@ -37,6 +40,30 @@ function upstreamTimeoutMs(): number {
 
 function requireAuth(): boolean {
   return process.env.LLM_REQUIRE_AUTH === 'true' || process.env.LLM_REQUIRE_AUTH === '1';
+}
+
+function isTruthy(value: string | undefined, defaultValue = false): boolean {
+  if (value == null || value === '') return defaultValue;
+  const v = value.trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+function forceNonStreamForOrchestrator(): boolean {
+  return isTruthy(process.env.LLM_ORCHESTRATOR_FORCE_NON_STREAM, true);
+}
+
+function maxTokensCap(): number {
+  const n = Number(process.env.LLM_MAX_TOKENS_CAP ?? '65536');
+  return Number.isFinite(n) && n >= 256 ? Math.min(1_000_000, Math.floor(n)) : 65_536;
+}
+
+function isChatCompletionsPath(path: string): boolean {
+  return /\/chat\/completions$/.test(path);
+}
+
+function looksLikeOrchestrator(url: string): boolean {
+  const v = url.toLowerCase();
+  return v.includes('llm-orch') || v.includes('orchestrator');
 }
 
 /** Limit parallel upstream requests to LM Studio. */
@@ -106,6 +133,7 @@ llmProxyRoutes.all('*', async (c) => {
   const context = auditRequestContext(c);
   const path = requestPath(c);
   const startedAt = Date.now();
+  const currentUpstreamBase = upstreamBase();
 
   if (requireAuth()) {
     if (!user) {
@@ -114,9 +142,9 @@ llmProxyRoutes.all('*', async (c) => {
         resourceType: 'llm_proxy',
         resourceId: path,
         context,
-        target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+        target: { type: 'llm_proxy', id: path, label: currentUpstreamBase },
         result: { status: 'denied', code: 401, reason: 'auth_required' },
-        details: { path, upstreamBase: upstreamBase() },
+        details: { path, upstreamBase: currentUpstreamBase, method: c.req.method, latencyMs: Date.now() - startedAt },
       });
       return c.json({ error: 'Unauthorized', message: 'LLM proxy requires sign-in (LLM_REQUIRE_AUTH).' }, 401);
     }
@@ -126,6 +154,12 @@ llmProxyRoutes.all('*', async (c) => {
   const method = c.req.method;
   const headers = forwardRequestHeaders(c.req.raw.headers);
   const hasBody = method !== 'GET' && method !== 'HEAD';
+  const shouldNormalizeOrchestratorChatRequest =
+    hasBody &&
+    method === 'POST' &&
+    isChatCompletionsPath(path) &&
+    forceNonStreamForOrchestrator() &&
+    looksLikeOrchestrator(currentUpstreamBase);
 
   const waitMs = queueWaitMs();
   try {
@@ -145,11 +179,11 @@ llmProxyRoutes.all('*', async (c) => {
         resourceId: path,
         actor: auditActorSnapshot(user),
         context,
-        target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+        target: { type: 'llm_proxy', id: path, label: currentUpstreamBase },
         result: { status: 'error', code: 503, reason: 'queue_timeout' },
         details: {
           path,
-          upstreamBase: upstreamBase(),
+          upstreamBase: currentUpstreamBase,
           method,
           latencyMs: Date.now() - startedAt,
           queueWaitMs: waitMs,
@@ -178,13 +212,41 @@ llmProxyRoutes.all('*', async (c) => {
       : undefined;
 
   try {
+    let upstreamBody: BodyInit | null | undefined = undefined;
+    if (hasBody) {
+      if (shouldNormalizeOrchestratorChatRequest) {
+        const contentType = c.req.raw.headers.get('content-type') ?? '';
+        if (contentType.includes('application/json')) {
+          const raw = await c.req.text();
+          try {
+            const payload = JSON.parse(raw) as Record<string, unknown>;
+            if (payload.stream === true) {
+              payload.stream = false;
+            }
+            if (typeof payload.max_tokens === 'number' && payload.max_tokens > maxTokensCap()) {
+              payload.max_tokens = maxTokensCap();
+            }
+            upstreamBody = JSON.stringify(payload);
+            headers.set('content-type', 'application/json');
+            headers.delete('content-length');
+          } catch {
+            upstreamBody = raw;
+          }
+        } else {
+          upstreamBody = c.req.raw.body;
+        }
+      } else {
+        upstreamBody = c.req.raw.body;
+      }
+    }
+
     const init: RequestInit & { duplex?: 'half' } = {
       method,
       headers,
       signal: ctrl?.signal,
     };
     if (hasBody) {
-      init.body = c.req.raw.body;
+      init.body = upstreamBody;
       init.duplex = 'half';
     }
 
@@ -196,11 +258,11 @@ llmProxyRoutes.all('*', async (c) => {
       resourceId: path,
       actor: auditActorSnapshot(user),
       context,
-      target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+      target: { type: 'llm_proxy', id: path, label: currentUpstreamBase },
       result: { status: res.ok ? 'success' : 'error', code: res.status, reason: res.ok ? null : res.statusText },
       details: {
         path,
-        upstreamBase: upstreamBase(),
+        upstreamBase: currentUpstreamBase,
         method,
         latencyMs: Date.now() - startedAt,
       },
@@ -219,16 +281,16 @@ llmProxyRoutes.all('*', async (c) => {
         resourceId: path,
         actor: auditActorSnapshot(user),
         context,
-        target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+        target: { type: 'llm_proxy', id: path, label: currentUpstreamBase },
         result: { status: 'error', code: 504, reason: 'upstream_timeout' },
         details: {
           path,
-          upstreamBase: upstreamBase(),
+          upstreamBase: currentUpstreamBase,
           method,
           latencyMs: Date.now() - startedAt,
         },
       });
-      return c.json({ error: 'Upstream timeout', message: 'LM Studio did not respond in time.' }, 504);
+      return c.json({ error: 'Upstream timeout', message: 'LLM Orchestrator did not respond in time.' }, 504);
     }
     console.error('[llmProxy] upstream fetch failed', e);
     await writeStructuredAuditLog({
@@ -237,11 +299,11 @@ llmProxyRoutes.all('*', async (c) => {
       resourceId: path,
       actor: auditActorSnapshot(user),
       context,
-      target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+      target: { type: 'llm_proxy', id: path, label: currentUpstreamBase },
       result: { status: 'error', code: 502, reason: e instanceof Error ? e.message : 'fetch_failed' },
       details: {
         path,
-        upstreamBase: upstreamBase(),
+        upstreamBase: currentUpstreamBase,
         method,
         latencyMs: Date.now() - startedAt,
       },

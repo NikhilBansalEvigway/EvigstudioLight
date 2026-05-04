@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { useAppStore } from '@/store/useAppStore';
+import { useAuth } from '@/contexts/AuthContext';
 import { chatCompletion, type ChatMessage as LLMMessage } from '@/lib/llmClient';
 import {
   buildWorkspacePath,
@@ -58,6 +59,7 @@ const KEY_PROJECT_FILES = [
 ];
 
 export function ChatPane() {
+  const { user } = useAuth();
   const {
     chats, activeChatId, createChat, addMessage, updateLastAssistantMessage, updateChatFields, saveVersionSnapshot,
     settings, contextFiles, fileTree, isStreaming, setIsStreaming, workspaceRoots,
@@ -559,6 +561,7 @@ export function ChatPane() {
           useVision: hasVision && iter === 1,
           onToken: (full) => updateLastAssistantMessage(chatId, full),
           signal: abortRef.current!.signal,
+          headers: user ? { 'x-user-id': user.id, 'x-source-app': 'EvigStudio' } : {},
         });
 
         if (!isAgentMode) break;
@@ -650,7 +653,7 @@ export function ChatPane() {
       const name = err instanceof Error ? err.name : '';
       if (name !== 'AbortError') {
         const errorMsg = err instanceof Error ? err.message : 'Unknown error';
-        updateLastAssistantMessage(chatId, `Error: ${errorMsg}\n\nTips:\n- Check your local AI server is running\n- Verify the base URL in settings\n- Enable CORS in your AI server\n- Try a different model`);
+        updateLastAssistantMessage(chatId, `Error: ${errorMsg}\n\nTips:\n- Check LLMOrchestrator and worker containers are running\n- Verify Base URL is /api/llm/v1\n- Use a model listed by /api/llm/v1/models\n- If 502 persists, reduce max tokens in Settings and retry`);
         toast.error('Local AI request failed');
       }
     } finally {

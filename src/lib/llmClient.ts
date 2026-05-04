@@ -11,6 +11,7 @@ interface ChatCompletionOptions {
   useVision?: boolean;
   onToken?: (token: string) => void;
   signal?: AbortSignal;
+  headers?: Record<string, string>;
 }
 
 export async function testConnection(settings: AppSettings): Promise<{ ok: boolean; message: string }> {
@@ -48,8 +49,14 @@ export async function testConnection(settings: AppSettings): Promise<{ ok: boole
   }
 }
 
-export async function chatCompletion({ messages, settings, useVision, onToken, signal }: ChatCompletionOptions): Promise<string> {
+export async function chatCompletion({ messages, settings, useVision, onToken, signal, headers }: ChatCompletionOptions): Promise<string> {
   const model = useVision ? settings.visionModel : settings.textModel;
+
+  console.groupCollapsed('[EvigStudio] LLM Request Flow');
+  console.log('Target API:', settings.baseUrl);
+  console.log('Using server-configured LLM Orchestrator');
+  console.groupEnd();
+
   const body: any = {
     model: model === 'auto' ? undefined : model,
     messages,
@@ -58,20 +65,46 @@ export async function chatCompletion({ messages, settings, useVision, onToken, s
     stream: settings.stream,
   };
 
-  const res = await fetch(`${settings.baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(settings.apiKey ? { 'Authorization': `Bearer ${settings.apiKey}` } : {}),
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
+  console.log('[EvigStudio] Sending POST to:', `${settings.baseUrl}/chat/completions`);
+
+  const sendCompletion = (payload: any) =>
+    fetch(`${settings.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(settings.apiKey ? { 'Authorization': `Bearer ${settings.apiKey}` } : {}),
+        ...headers,
+      },
+      body: JSON.stringify(payload),
+      signal,
+    });
+
+  let res = await sendCompletion(body);
 
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`AI server error ${res.status}: ${text || res.statusText}`);
+    let text = await res.text().catch(() => '');
+
+    // LLMOrchestrator can fail on stream parsing for some backends; retry once with non-stream.
+    if (
+      settings.stream &&
+      res.status === 502 &&
+      /Expecting value: line 1 column 1/.test(text)
+    ) {
+      console.warn('[EvigStudio] Streaming failed in orchestrator, retrying with stream=false');
+      const retryBody = { ...body, stream: false };
+      res = await sendCompletion(retryBody);
+      if (!res.ok) {
+        text = await res.text().catch(() => '');
+        console.error('[EvigStudio] Retry failed:', res.status, text);
+        throw new Error(`AI server error ${res.status}: ${text || res.statusText}`);
+      }
+    } else {
+      console.error('[EvigStudio] Request failed:', res.status, text);
+      throw new Error(`AI server error ${res.status}: ${text || res.statusText}`);
+    }
   }
+
+  console.log('[EvigStudio] Response received successfully.');
 
   if (settings.stream && res.body) {
     return streamResponse(res.body, onToken);

@@ -28,11 +28,15 @@ services:
     environment:
       DATABASE_URL: postgresql://evigstudio:evigstudio@db:5432/evigstudio
       NODE_ENV: production
+      LLM_ORCHESTRATOR_URL: http://llm-orch:3013
     depends_on:
       db:
         condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - agent-net
 
   # ── Nginx + React frontend (HTTPS) ──────────────────────────────────────────
   frontend:
@@ -45,10 +49,15 @@ services:
       - "443:443"
     depends_on:
       - api
+    networks:
+      - default
+      - agent-net
 
 networks:
   default:
     name: evigstudio-net
+  agent-net:
+    external: true
 
 volumes:
   evigstudio_pgdata:

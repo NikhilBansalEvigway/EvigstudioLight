@@ -263,7 +263,7 @@ export function SettingsDialog() {
           <Section title="Local AI Connection">
             <p className="text-[10px] text-muted-foreground leading-relaxed">
               <strong className="text-foreground">Offline / LAN:</strong> Point the app at your team API&apos;s LLM proxy{' '}
-              <code className="text-primary">/api/llm/v1</code> (same host as the UI). LM Studio runs on the GPU machine; the API forwards to it with a concurrency limit so many users do not overload one GPU. No cloud inference.
+              <code className="text-primary">/api/llm/v1</code> (same host as the UI). Requests flow through your API to LLMOrchestrator, then onward to LM Studio with queueing/concurrency controls. No cloud inference.
             </p>
             <Field label="Base URL">
               <input value={settings.baseUrl} onChange={e => setSettings({ baseUrl: e.target.value })}
@@ -345,7 +345,7 @@ export function SettingsDialog() {
                 <code className="text-primary">/lmstudio</code> — bypasses server-side concurrency limits; use only for local troubleshooting.
               </p>
               <p>
-                <strong className="text-foreground">Custom host/port?</strong> Set <code className="text-primary">LM_STUDIO_URL</code> on the API host (see <code className="text-primary">server/.env.example</code>), not the browser Base URL.
+                <strong className="text-foreground">Custom host/port?</strong> Set <code className="text-primary">LLM_ORCHESTRATOR_URL</code> on the API host (see <code className="text-primary">server/.env.example</code>), not the browser Base URL.
               </p>
               <p>
                 <strong className="text-foreground">0 models?</strong> Load a model in LM Studio before testing the connection.
