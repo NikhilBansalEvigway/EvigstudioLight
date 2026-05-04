@@ -85,7 +85,41 @@ export async function exportChatAsPdf(chat: Chat): Promise<void> {
 export async function exportChatAsDocx(chat: Chat): Promise<void> {
   const docx = await import('docx');
   const { Document, Packer, Paragraph, TextRun, HeadingLevel } = docx;
-  const children: InstanceType<typeof Paragraph>[] = [
+
+  type DocxElement = 
+    | { type: 'text'; text: string; bold?: boolean; italic?: boolean }
+    | { type: 'code'; content: string };
+
+  function parseMarkdown(text: string): DocxElement[] {
+    const elements: DocxElement[] = [];
+    // Regex for code blocks: ```lang \n content \n ```
+    const codeBlockRegex = /```(\w*)\n([\s\S]*?)```/g;
+    let lastIndex = 0;
+    let match;
+
+    while ((match = codeBlockRegex.exec(text)) !== null) {
+      // Text before the code block
+      if (match.index > lastIndex) {
+        elements.push({ type: 'text', text: text.slice(lastIndex, match.index) });
+      }
+
+      // The code block itself
+      elements.push({ 
+        type: 'code', 
+        content: match[2].trim() 
+      });
+
+      lastIndex = codeBlockRegex.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+      elements.push({ type: 'text', text: text.slice(lastIndex) });
+    }
+
+    return elements;
+  }
+
+  const children: Paragraph[] = [
     new Paragraph({
       text: chat.title,
       heading: HeadingLevel.HEADING_1,
@@ -112,7 +146,31 @@ export async function exportChatAsDocx(chat: Chat): Promise<void> {
         ],
       }),
     );
-    children.push(new Paragraph({ text: getMessageText(m) }));
+
+    const messageText = getMessageText(m);
+    const elements = parseMarkdown(messageText);
+
+    for (const el of elements) {
+      if (el.type === 'text') {
+        children.push(new Paragraph({ text: el.text }));
+      } else if (el.type === 'code') {
+        // Create a single paragraph for the code block with monospace font
+        // We split by newline to handle line breaks in Word correctly
+        const lines = el.content.split('\n');
+        lines.forEach((line, idx) => {
+          children.push(new Paragraph({
+            children: [
+              new TextRun({
+                text: line || ' ', // Ensure empty lines have height
+                font: 'Courier New',
+                size: 20, // approx 10pt (docx uses half-points)
+              }),
+            ],
+            indent: { left: 720 }, // Indent code block by ~0.5 inch
+          }));
+        });
+      }
+    }
     children.push(new Paragraph({ text: '' }));
   }
 
