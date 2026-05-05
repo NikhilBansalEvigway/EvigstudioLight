@@ -49,6 +49,49 @@ function upstreamBase(): string {
   }
 }
 
+function withHost(base: string, host: string): string {
+  try {
+    const u = new URL(base);
+    u.hostname = host;
+    return u.toString().replace(/\/$/, '');
+  } catch {
+    return base.replace(/\/$/, '');
+  }
+}
+
+function orchestratorBaseCandidates(): string[] {
+  const configured =
+    process.env.LLM_ORCHESTRATOR_URL?.trim() ||
+    process.env.LLM_UPSTREAM_URL?.trim() ||
+    process.env.LM_STUDIO_URL?.trim() ||
+    'http://127.0.0.1:1234';
+
+  const out: string[] = [];
+  const add = (v: string | null | undefined) => {
+    const val = (v || '').trim().replace(/\/$/, '');
+    if (!val) return;
+    if (!out.includes(val)) out.push(val);
+  };
+
+  add(configured);
+  try {
+    const host = new URL(configured).hostname.toLowerCase();
+    if (host === '127.0.0.1' || host === 'localhost') {
+      add(withHost(configured, 'host.docker.internal'));
+    }
+  } catch {
+    // ignore malformed URL and continue with legacy defaults
+  }
+
+  // Legacy/known defaults for older orchestrator deployments.
+  add('http://llm-orch:3013');
+  add('http://host.docker.internal:3013');
+  add('http://host.docker.internal:4000');
+  add('http://127.0.0.1:4000');
+
+  return out;
+}
+
 function configuredUpstreamApiKey(): string | null {
   return (
     process.env.LLM_UPSTREAM_API_KEY?.trim() ||
@@ -113,10 +156,10 @@ class ConcurrencyGate {
 
 const gate = new ConcurrencyGate(maxConcurrent());
 
-function buildUpstreamUrl(c: { req: { url: string } }): string {
+function buildUpstreamUrlForBase(c: { req: { url: string } }, base: string): string {
   const u = new URL(c.req.url);
   const path = u.pathname.replace(/^\/api\/llm/, '') || '/';
-  return `${upstreamBase()}${path}${u.search}`;
+  return `${base.replace(/\/$/, '')}${path}${u.search}`;
 }
 
 function requestPath(c: { req: { url: string } }): string {
@@ -185,7 +228,6 @@ llmProxyRoutes.all('*', async (c) => {
     }
   }
 
-  const upstreamUrl = buildUpstreamUrl(c);
   const base = upstreamBase();
   const method = c.req.method;
   const headers = forwardRequestHeaders(c.req.raw.headers, base);
@@ -249,17 +291,39 @@ llmProxyRoutes.all('*', async (c) => {
       : undefined;
 
   try {
-    const init: RequestInit & { duplex?: 'half' } = {
-      method,
-      headers,
-      signal: ctrl?.signal,
+    const buildInit = (): RequestInit & { duplex?: 'half' } => {
+      const init: RequestInit & { duplex?: 'half' } = {
+        method,
+        headers,
+        signal: ctrl?.signal,
+      };
+      if (hasBody) {
+        init.body = c.req.raw.body;
+        init.duplex = 'half';
+      }
+      return init;
     };
-    if (hasBody) {
-      init.body = c.req.raw.body;
-      init.duplex = 'half';
+
+    const provider = llmProvider();
+    const basesToTry = provider === 'orchestrator' ? orchestratorBaseCandidates() : [base];
+    let res: Response | null = null;
+    let usedBase = base;
+    let lastNetworkError: unknown = null;
+    for (const candidateBase of basesToTry) {
+      const upstreamUrl = buildUpstreamUrlForBase(c, candidateBase);
+      try {
+        res = await fetch(upstreamUrl, buildInit());
+        usedBase = candidateBase;
+        break;
+      } catch (err) {
+        lastNetworkError = err;
+      }
     }
 
-    const res = await fetch(upstreamUrl, init);
+    if (!res) {
+      throw lastNetworkError instanceof Error ? lastNetworkError : new Error('fetch failed');
+    }
+
     const outHeaders = forwardResponseHeaders(res.headers);
     await writeStructuredAuditLog({
       action: 'llm.proxy',
@@ -267,13 +331,13 @@ llmProxyRoutes.all('*', async (c) => {
       resourceId: path,
         actor: auditActorSnapshot(user),
         context,
-        target: { type: 'llm_proxy', id: path, label: base },
+        target: { type: 'llm_proxy', id: path, label: usedBase },
         result: { status: res.ok ? 'success' : 'error', code: res.status, reason: res.ok ? null : res.statusText },
         details: {
           path,
           provider: llmProvider(),
           queueEnabled: useQueue,
-          upstreamBase: base,
+          upstreamBase: usedBase,
           method,
           latencyMs: Date.now() - startedAt,
         },
