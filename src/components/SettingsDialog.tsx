@@ -1,6 +1,6 @@
 import { useAppStore } from '@/store/useAppStore';
 import { testConnection } from '@/lib/llmClient';
-import { DEFAULT_SETTINGS } from '@/types';
+import { DEFAULT_SETTINGS, MAX_MAX_TOKENS, MAX_TOKENS_STEP, MIN_MAX_TOKENS, normalizeMaxTokens } from '@/types';
 import type { UiThemePresetId } from '@/types';
 import { useAuth } from '@/contexts/AuthContext';
 import { UI_THEME_PRESETS, MAX_BRAND_LOGO_BYTES, MAX_BACKGROUND_BYTES } from '@/lib/uiThemes';
@@ -18,6 +18,7 @@ export function SettingsDialog() {
   const logoInputRef = useRef<HTMLInputElement>(null);
   const bgInputRef = useRef<HTMLInputElement>(null);
   const [ttsVoices, setTtsVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const maxTokens = normalizeMaxTokens(settings.maxTokens);
 
   useEffect(() => {
     const sync = () => setTtsVoices(getSpeechVoices());
@@ -260,10 +261,9 @@ export function SettingsDialog() {
           </Section>
 
           {/* Connection */}
-          <Section title="Local AI Connection">
+          <Section title="LLM Connection">
             <p className="text-[10px] text-muted-foreground leading-relaxed">
-              <strong className="text-foreground">Offline / LAN:</strong> Point the app at your team API&apos;s LLM proxy{' '}
-              <code className="text-primary">/api/llm/v1</code> (same host as the UI). LM Studio runs on the GPU machine; the API forwards to it with a concurrency limit so many users do not overload one GPU. No cloud inference.
+              <strong className="text-foreground">Recommended:</strong> Keep Base URL at <code className="text-primary">/api/llm/v1</code>. The server&apos;s <code className="text-primary">server/.env</code> chooses whether that proxy targets queued orchestrator mode, direct LM Studio, or OpenRouter.
             </p>
             <Field label="Base URL">
               <input value={settings.baseUrl} onChange={e => setSettings({ baseUrl: e.target.value })}
@@ -306,9 +306,9 @@ export function SettingsDialog() {
                 onChange={e => setSettings({ temperature: parseFloat(e.target.value) })}
                 className="w-full accent-primary" />
             </Field>
-            <Field label={`Max Tokens: ${settings.maxTokens}`}>
-              <input type="range" min="256" max="8192" step="256" value={settings.maxTokens}
-                onChange={e => setSettings({ maxTokens: parseInt(e.target.value) })}
+            <Field label={`Max Tokens: ${maxTokens}`}>
+              <input type="range" min={MIN_MAX_TOKENS} max={MAX_MAX_TOKENS} step={MAX_TOKENS_STEP} value={maxTokens}
+                onChange={e => setSettings({ maxTokens: parseInt(e.target.value, 10) })}
                 className="w-full accent-primary" />
             </Field>
           </Section>
@@ -330,25 +330,23 @@ export function SettingsDialog() {
                 Max read/list iterations when in Agent mode (per-chat toggle controls agent vs plain chat).
               </p>
             </Field>
-            <Toggle label="Strict Offline Mode" desc="Block all non-LM-Studio network requests" checked={settings.strictOffline} onChange={v => setSettings({ strictOffline: v })} />
+            <Toggle label="Strict Offline Mode" desc="Prefer local/offline workflows in the UI" checked={settings.strictOffline} onChange={v => setSettings({ strictOffline: v })} />
           </Section>
 
           {/* CORS Help */}
           <Section title="Troubleshooting">
             <div className="text-[10px] text-muted-foreground space-y-1.5">
               <p>
-                <strong className="text-foreground">Can&apos;t connect?</strong> Start LM Studio with the local server (default port 1234). With the team app, set Base URL to{' '}
-                <code className="text-primary">/api/llm/v1</code> so requests go through the API proxy (Vite dev forwards <code className="text-primary">/api</code> to the Hono server).
+                <strong className="text-foreground">Can&apos;t connect?</strong> With the team app, keep Base URL at <code className="text-primary">/api/llm/v1</code> so requests go through the API proxy (Vite dev forwards <code className="text-primary">/api</code> to the Hono server).
               </p>
               <p>
-                <strong className="text-foreground">Direct to LM Studio (debug)?</strong> Optional Vite path <code className="text-primary">/lmstudio</code> still maps to 127.0.0.1:1234 with Base URL{' '}
-                <code className="text-primary">/lmstudio</code> — bypasses server-side concurrency limits; use only for local troubleshooting.
+                <strong className="text-foreground">Which provider is active?</strong> Set <code className="text-primary">LLM_PROVIDER</code> in <code className="text-primary">server/.env</code> to <code className="text-primary">orchestrator</code>, <code className="text-primary">lmstudio</code>, or <code className="text-primary">openrouter</code> and restart Docker.
               </p>
               <p>
-                <strong className="text-foreground">Custom host/port?</strong> Set <code className="text-primary">LM_STUDIO_URL</code> on the API host (see <code className="text-primary">server/.env.example</code>), not the browser Base URL.
+                <strong className="text-foreground">Direct LM Studio debug?</strong> Optional Vite path <code className="text-primary">/lmstudio</code> still maps to 127.0.0.1:1234 in dev only; use it only for local troubleshooting.
               </p>
               <p>
-                <strong className="text-foreground">0 models?</strong> Load a model in LM Studio before testing the connection.
+                <strong className="text-foreground">Provider URL or key?</strong> Set provider-specific URLs and optional server-side credentials in <code className="text-primary">server/.env.example</code>. OpenRouter also accepts a browser API key in this dialog.
               </p>
             </div>
           </Section>

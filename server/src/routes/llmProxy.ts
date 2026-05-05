@@ -4,6 +4,8 @@ import type { HonoEnv } from '../middleware/session.js';
 
 export const llmProxyRoutes = new Hono<HonoEnv>();
 
+type LLMProvider = 'lmstudio' | 'orchestrator' | 'openrouter';
+
 const HOP_BY_HOP = new Set([
   'connection',
   'keep-alive',
@@ -16,8 +18,51 @@ const HOP_BY_HOP = new Set([
   'host',
 ]);
 
+function llmProvider(): LLMProvider {
+  const raw = process.env.LLM_PROVIDER?.trim().toLowerCase();
+  if (raw === 'orchestrator' || raw === 'openrouter') return raw;
+  return 'lmstudio';
+}
+
 function upstreamBase(): string {
-  return (process.env.LM_STUDIO_URL ?? 'http://127.0.0.1:1234').replace(/\/$/, '');
+  switch (llmProvider()) {
+    case 'orchestrator':
+      return (
+        process.env.LLM_ORCHESTRATOR_URL?.trim() ||
+        process.env.LLM_UPSTREAM_URL?.trim() ||
+        process.env.LM_STUDIO_URL?.trim() ||
+        'http://127.0.0.1:1234'
+      ).replace(/\/$/, '');
+    case 'openrouter':
+      return (
+        process.env.OPENROUTER_URL?.trim() ||
+        process.env.LLM_UPSTREAM_URL?.trim() ||
+        'https://openrouter.ai/api'
+      ).replace(/\/$/, '');
+    case 'lmstudio':
+    default:
+      return (
+        process.env.LM_STUDIO_URL?.trim() ||
+        process.env.LLM_UPSTREAM_URL?.trim() ||
+        'http://127.0.0.1:1234'
+      ).replace(/\/$/, '');
+  }
+}
+
+function configuredUpstreamApiKey(): string | null {
+  return (
+    process.env.LLM_UPSTREAM_API_KEY?.trim() ||
+    process.env.OPENROUTER_API_KEY?.trim() ||
+    process.env.LLM_API_KEY?.trim() ||
+    null
+  );
+}
+
+function queueEnabled(): boolean {
+  const raw = process.env.LLM_ENABLE_QUEUE?.trim().toLowerCase();
+  if (raw === 'true' || raw === '1') return true;
+  if (raw === 'false' || raw === '0') return false;
+  return llmProvider() === 'orchestrator';
 }
 
 function maxConcurrent(): number {
@@ -79,7 +124,7 @@ function requestPath(c: { req: { url: string } }): string {
   return u.pathname.replace(/^\/api\/llm/, '') || '/';
 }
 
-function forwardRequestHeaders(src: Headers): Headers {
+function forwardRequestHeaders(src: Headers, base: string): Headers {
   const out = new Headers();
   src.forEach((value, key) => {
     const lower = key.toLowerCase();
@@ -87,6 +132,24 @@ function forwardRequestHeaders(src: Headers): Headers {
       out.set(key, value);
     }
   });
+
+  if (!out.has('authorization')) {
+    const apiKey = configuredUpstreamApiKey();
+    if (apiKey) {
+      out.set('Authorization', `Bearer ${apiKey}`);
+    }
+  }
+
+  if (llmProvider() === 'openrouter') {
+    const referer = process.env.OPENROUTER_SITE_URL?.trim() || process.env.PUBLIC_APP_URL?.trim() || process.env.APP_URL?.trim();
+    if (referer && !out.has('HTTP-Referer')) {
+      out.set('HTTP-Referer', referer);
+    }
+    if (!out.has('X-Title')) {
+      out.set('X-Title', process.env.OPENROUTER_APP_NAME?.trim() || 'EvigStudio');
+    }
+  }
+
   return out;
 }
 
@@ -123,49 +186,57 @@ llmProxyRoutes.all('*', async (c) => {
   }
 
   const upstreamUrl = buildUpstreamUrl(c);
+  const base = upstreamBase();
   const method = c.req.method;
-  const headers = forwardRequestHeaders(c.req.raw.headers);
+  const headers = forwardRequestHeaders(c.req.raw.headers, base);
   const hasBody = method !== 'GET' && method !== 'HEAD';
 
   const waitMs = queueWaitMs();
-  try {
-    await Promise.race([
-      gate.acquire(),
-      new Promise<never>((_, rej) => {
-        setTimeout(() => {
-          rej(Object.assign(new Error('LLM queue wait exceeded'), { name: 'QueueTimeout' }));
-        }, waitMs);
-      }),
-    ]);
-  } catch (e) {
-    if (e instanceof Error && e.name === 'QueueTimeout') {
-      await writeStructuredAuditLog({
-        action: 'llm.proxy',
-        resourceType: 'llm_proxy',
-        resourceId: path,
-        actor: auditActorSnapshot(user),
-        context,
-        target: { type: 'llm_proxy', id: path, label: upstreamBase() },
-        result: { status: 'error', code: 503, reason: 'queue_timeout' },
-        details: {
-          path,
-          upstreamBase: upstreamBase(),
-          method,
-          latencyMs: Date.now() - startedAt,
-          queueWaitMs: waitMs,
-        },
-      });
-      return c.json(
-        {
-          error: 'Too many concurrent LLM requests',
-          message: `Waited ${waitMs}ms for a slot. Increase LLM_MAX_CONCURRENT or LLM_QUEUE_WAIT_MS.`,
-          retryAfterSeconds: 5,
-        },
-        503,
-        { 'Retry-After': '5' },
-      );
+  const useQueue = queueEnabled();
+  let acquired = false;
+  if (useQueue) {
+    try {
+      await Promise.race([
+        gate.acquire(),
+        new Promise<never>((_, rej) => {
+          setTimeout(() => {
+            rej(Object.assign(new Error('LLM queue wait exceeded'), { name: 'QueueTimeout' }));
+          }, waitMs);
+        }),
+      ]);
+      acquired = true;
+    } catch (e) {
+      if (e instanceof Error && e.name === 'QueueTimeout') {
+        await writeStructuredAuditLog({
+          action: 'llm.proxy',
+          resourceType: 'llm_proxy',
+          resourceId: path,
+          actor: auditActorSnapshot(user),
+          context,
+          target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+          result: { status: 'error', code: 503, reason: 'queue_timeout' },
+          details: {
+            path,
+            provider: llmProvider(),
+            queueEnabled: useQueue,
+            upstreamBase: base,
+            method,
+            latencyMs: Date.now() - startedAt,
+            queueWaitMs: waitMs,
+          },
+        });
+        return c.json(
+          {
+            error: 'Too many concurrent LLM requests',
+            message: `Waited ${waitMs}ms for a slot. Increase LLM_MAX_CONCURRENT or LLM_QUEUE_WAIT_MS.`,
+            retryAfterSeconds: 5,
+          },
+          503,
+          { 'Retry-After': '5' },
+        );
+      }
+      throw e;
     }
-    throw e;
   }
 
   const timeoutMs = upstreamTimeoutMs();
@@ -194,16 +265,18 @@ llmProxyRoutes.all('*', async (c) => {
       action: 'llm.proxy',
       resourceType: 'llm_proxy',
       resourceId: path,
-      actor: auditActorSnapshot(user),
-      context,
-      target: { type: 'llm_proxy', id: path, label: upstreamBase() },
-      result: { status: res.ok ? 'success' : 'error', code: res.status, reason: res.ok ? null : res.statusText },
-      details: {
-        path,
-        upstreamBase: upstreamBase(),
-        method,
-        latencyMs: Date.now() - startedAt,
-      },
+        actor: auditActorSnapshot(user),
+        context,
+        target: { type: 'llm_proxy', id: path, label: base },
+        result: { status: res.ok ? 'success' : 'error', code: res.status, reason: res.ok ? null : res.statusText },
+        details: {
+          path,
+          provider: llmProvider(),
+          queueEnabled: useQueue,
+          upstreamBase: base,
+          method,
+          latencyMs: Date.now() - startedAt,
+        },
     });
     return new Response(res.body, {
       status: res.status,
@@ -219,16 +292,18 @@ llmProxyRoutes.all('*', async (c) => {
         resourceId: path,
         actor: auditActorSnapshot(user),
         context,
-        target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+        target: { type: 'llm_proxy', id: path, label: base },
         result: { status: 'error', code: 504, reason: 'upstream_timeout' },
         details: {
           path,
-          upstreamBase: upstreamBase(),
+          provider: llmProvider(),
+          queueEnabled: useQueue,
+          upstreamBase: base,
           method,
           latencyMs: Date.now() - startedAt,
         },
       });
-      return c.json({ error: 'Upstream timeout', message: 'LM Studio did not respond in time.' }, 504);
+      return c.json({ error: 'Upstream timeout', message: 'The configured LLM provider did not respond in time.' }, 504);
     }
     console.error('[llmProxy] upstream fetch failed', e);
     await writeStructuredAuditLog({
@@ -237,11 +312,13 @@ llmProxyRoutes.all('*', async (c) => {
       resourceId: path,
       actor: auditActorSnapshot(user),
       context,
-      target: { type: 'llm_proxy', id: path, label: upstreamBase() },
+      target: { type: 'llm_proxy', id: path, label: base },
       result: { status: 'error', code: 502, reason: e instanceof Error ? e.message : 'fetch_failed' },
       details: {
         path,
-        upstreamBase: upstreamBase(),
+        provider: llmProvider(),
+        queueEnabled: useQueue,
+        upstreamBase: base,
         method,
         latencyMs: Date.now() - startedAt,
       },
@@ -249,6 +326,8 @@ llmProxyRoutes.all('*', async (c) => {
     return c.json({ error: 'Upstream error', message: e instanceof Error ? e.message : 'fetch failed' }, 502);
   } finally {
     if (timer) clearTimeout(timer);
-    gate.release();
+    if (acquired) {
+      gate.release();
+    }
   }
 });

@@ -31,18 +31,21 @@ export async function testConnection(settings: AppSettings): Promise<{ ok: boole
       console.log('[EvigStudio] Parsed data:', data);
       const count = data?.data?.length ?? 0;
       if (count === 0) {
-        return { ok: true, message: `Connected (via ${settings.baseUrl}), but 0 models loaded. Load a model in LM Studio.` };
+        return { ok: true, message: `Connected (via ${settings.baseUrl}), but 0 models were returned. Check the configured provider and credentials.` };
       }
       return { ok: true, message: `Connected. ${count} model(s) available.` };
+    }
+    if (res.status === 401) {
+      return { ok: false, message: 'Unauthorized. Check the browser API key or the server-side upstream API key in server/.env.' };
     }
     return { ok: false, message: `Server returned ${res.status}: ${res.statusText}` };
   } catch (err: any) {
     console.error('[EvigStudio] Connection error:', err);
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-      return { ok: false, message: `Connection timed out. Use Base URL /api/llm/v1 when using the team server proxy (current: ${settings.baseUrl})` };
+      return { ok: false, message: `Connection timed out. Use Base URL /api/llm/v1 when using the server proxy (current: ${settings.baseUrl})` };
     }
     if (err.name === 'TypeError' && err.message?.includes('Failed to fetch')) {
-      return { ok: false, message: 'Cannot reach the LLM endpoint. Ensure the API is running and Base URL is /api/llm/v1 (or direct http://127.0.0.1:1234/v1 in Electron).' };
+      return { ok: false, message: 'Cannot reach the LLM endpoint. Ensure the API is running and Base URL is /api/llm/v1 (or a working direct endpoint in Electron).' };
     }
     return { ok: false, message: err.message || 'Unknown error' };
   }

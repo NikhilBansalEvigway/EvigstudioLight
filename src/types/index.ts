@@ -184,13 +184,23 @@ export interface AppSettings {
   agentMaxIterations: number;
 }
 
+export const MIN_MAX_TOKENS = 256;
+export const MAX_MAX_TOKENS = 81920;
+export const MAX_TOKENS_STEP = 256;
+
+export function normalizeMaxTokens(value: number): number {
+  if (!Number.isFinite(value)) return MAX_MAX_TOKENS;
+  const clamped = Math.min(MAX_MAX_TOKENS, Math.max(MIN_MAX_TOKENS, Math.round(value)));
+  return Math.round(clamped / MAX_TOKENS_STEP) * MAX_TOKENS_STEP;
+}
+
 export const DEFAULT_SETTINGS: AppSettings = {
   baseUrl: '/api/llm/v1',
   apiKey: '',
   textModel: 'auto',
   visionModel: 'auto',
   temperature: 0.2,
-  maxTokens: 2000000,
+  maxTokens: MAX_MAX_TOKENS,
   stream: true,
   directEditMode: true,
   strictOffline: true,

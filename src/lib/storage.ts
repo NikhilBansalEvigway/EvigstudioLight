@@ -1,7 +1,7 @@
 import { openDB, type IDBPDatabase } from 'idb';
 import type { Chat, AppSettings, WorkspaceSession } from '@/types';
 import { normalizeChat } from '@/types';
-import { DEFAULT_SETTINGS } from '@/types';
+import { DEFAULT_SETTINGS, normalizeMaxTokens } from '@/types';
 
 const DB_NAME = 'offline-dev-agent';
 const DB_VERSION = 3;
@@ -60,6 +60,7 @@ export async function loadSettings(): Promise<AppSettings> {
       return defaults;
     }
     const merged = { ...DEFAULT_SETTINGS, ...settings };
+    merged.maxTokens = normalizeMaxTokens(merged.maxTokens);
 
     // In Electron: ensure we use direct URL, not the proxy path
     // In browser: ensure we use the Hono proxy path (not raw LM Studio URL)

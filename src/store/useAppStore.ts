@@ -9,7 +9,13 @@ import type {
   Message,
   WorkspaceRoot,
 } from '@/types';
-import { DEFAULT_SETTINGS, canDeleteChat, canWriteChat, normalizeChat } from '@/types';
+import {
+  DEFAULT_SETTINGS,
+  canDeleteChat,
+  canWriteChat,
+  normalizeChat,
+  normalizeMaxTokens,
+} from '@/types';
 import { loadSettings, saveSettings } from '@/lib/storage';
 import { loadWorkspaceSession, saveWorkspaceSession, deleteWorkspaceSession } from '@/lib/storage';
 import { buildWorkspaceTree } from '@/lib/fsWorkspace';
@@ -110,6 +116,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   setSettings: (s) => {
     const newSettings = { ...get().settings, ...s };
+    newSettings.maxTokens = normalizeMaxTokens(newSettings.maxTokens);
     set({ settings: newSettings });
     saveSettings(newSettings);
   },
