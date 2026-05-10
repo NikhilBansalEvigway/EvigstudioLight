@@ -7,6 +7,7 @@ import {
   getFileExtension,
   getUniqueWorkspaceLabel,
   pickDirectory,
+  writeWorkspaceFile,
   writeWorkspaceFileVerified,
   workspaceRootsMatch,
 } from '@/lib/fsWorkspace';
