@@ -31,6 +31,11 @@ export function StatusBar() {
     showRightPane,
     setShowRightPane,
     settings,
+    contextBudgetChars,
+    contextUsedChars,
+    agentStep,
+    agentStepTotal,
+    isStreaming,
   } = useAppStore();
   const brand = settings.brandName?.trim() || 'EvigStudio';
   const logo = settings.brandLogoDataUrl;
@@ -38,6 +43,18 @@ export function StatusBar() {
   const { theme, setTheme } = useTheme();
   const hasBackground = Boolean(settings.backgroundImageDataUrl);
   const canOpenSettings = user?.role === 'admin';
+
+  const formatChars = (n: number) => {
+    const abs = Math.abs(n);
+    if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (abs >= 1_000) return `${Math.round(n / 1_000)}k`;
+    return `${n}`;
+  };
+
+  const safeBudget = Math.max(0, contextBudgetChars || 0);
+  const safeUsed = Math.max(0, contextUsedChars || 0);
+  const remaining = Math.max(0, safeBudget - safeUsed);
+  const ctxPct = safeBudget > 0 ? Math.min(100, Math.max(0, Math.round((safeUsed / safeBudget) * 100))) : 0;
 
   return (
     <header className={`flex h-10 min-h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-2 sm:px-3 ${hasBackground ? 'bg-card/82 backdrop-blur-md' : 'bg-card'}`}>
@@ -67,6 +84,37 @@ export function StatusBar() {
           )}
           <span className="truncate text-sm font-bold tracking-wide text-primary">{brand}</span>
         </div>
+      </div>
+
+      <div className="flex min-w-0 items-center gap-2">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div className="flex items-center gap-2 rounded-full border border-border/70 bg-muted/20 px-2 py-1">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Ctx</span>
+              <div className="h-1 w-12 sm:w-16 overflow-hidden rounded-full bg-muted">
+                <div className="h-full bg-primary/70" style={{ width: `${ctxPct}%` }} />
+              </div>
+              <span className="hidden md:inline text-[10px] font-medium text-muted-foreground">{formatChars(remaining)} left</span>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="max-w-[260px]">
+            Context budget (chars): {formatChars(safeUsed)} used / {formatChars(safeBudget)} total.
+          </TooltipContent>
+        </Tooltip>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div className={`flex items-center gap-2 rounded-full border px-2 py-1 ${agentStepTotal > 0 && isStreaming ? 'border-primary/25 bg-primary/5' : 'border-border/70 bg-muted/20'}`}>
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Agent</span>
+              <span className={`text-[10px] font-medium ${agentStepTotal > 0 && isStreaming ? 'text-primary' : 'text-muted-foreground'}`}>
+                {agentStepTotal > 0 && isStreaming ? `${agentStep}/${agentStepTotal}` : 'idle'}
+              </span>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="max-w-[260px]">
+            Agent loop steps this turn (max from settings).
+          </TooltipContent>
+        </Tooltip>
       </div>
 
       <div className="flex shrink-0 items-center gap-2 sm:gap-4">

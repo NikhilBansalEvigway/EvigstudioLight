@@ -5,6 +5,7 @@ import {
   buildWorkspacePath,
   buildWorkspaceTree,
   deleteWorkspacePath,
+  isWorkspacePathIgnored,
   readWorkspaceFile,
   serializeFileTree,
   STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE,
@@ -171,7 +172,10 @@ export function ChatPane() {
   }, []);
 
   const buildContextMessages = useCallback(async (messageMentionedFiles: string[] = []): Promise<{ role: 'user'; content: string }[]> => {
-    if (workspaceRoots.length === 0) return [];
+    if (workspaceRoots.length === 0) {
+      useAppStore.getState().setContextUsage(0, 120_000);
+      return [];
+    }
 
     const included = new Set<string>();
     const parts: string[] = [];
@@ -193,6 +197,10 @@ export function ChatPane() {
 
     const addFileContext = async (path: string, heading: string, maxChars: number, required = false) => {
       if (included.has(path)) return true;
+      if (isWorkspacePathIgnored(path)) {
+        stats.omittedFiles += 1;
+        return false;
+      }
       included.add(path);
       try {
         const content = await readWorkspaceFile(workspaceRoots, path);
@@ -218,6 +226,10 @@ export function ChatPane() {
     };
 
     const addFolderContext = async (path: string) => {
+      if (isWorkspacePathIgnored(path)) {
+        stats.omittedFiles += 1;
+        return;
+      }
       const node = findMentionNode(fileTree, path);
       if (!node || node.type !== 'directory') {
         stats.staleRefs += 1;
@@ -285,14 +297,14 @@ export function ChatPane() {
       parts.push('(One or more referenced files were truncated. If exact missing lines are needed, use *** Read File: path#Lstart-Lend. Do not ask the user to paste the file.)');
     }
 
-    if (parts.length === 0) return [];
+    if (parts.length === 0) {
+      useAppStore.getState().setContextUsage(0, MAX_TOTAL_CONTEXT_CHARS);
+      return [];
+    }
     const summary = `Context summary: ${stats.attachedFiles} @ file(s), ${stats.attachedFolders} @ folder(s), ${stats.truncatedFiles} truncated file(s), ${stats.staleRefs} stale reference(s). Use the provided file contents and workspace tools; do not ask the user to provide these files again.`;
-    return [
-      {
-        role: 'user' as const,
-        content: `Workspace context (use paths below as ground truth; do not invent paths that are not listed):\n${summary}\n\n${parts.join('\n\n')}`,
-      },
-    ];
+    const content = `Workspace context (use paths below as ground truth; do not invent paths that are not listed):\n${summary}\n\n${parts.join('\n\n')}`;
+    useAppStore.getState().setContextUsage(content.length, MAX_TOTAL_CONTEXT_CHARS);
+    return [{ role: 'user' as const, content }];
   }, [workspaceRoots, fileTree, contextFiles]);
 
   const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -532,6 +544,8 @@ export function ChatPane() {
       ? Math.min(10, Math.max(1, settings.agentMaxIterations ?? 5))
       : 1;
 
+    useAppStore.getState().setAgentStepProgress(0, isAgentMode ? maxIter : 0);
+
     const toApi = (message: Message): LLMMessage => ({ role: message.role, content: message.content });
 
     let loopMessages: LLMMessage[] = [
@@ -546,6 +560,9 @@ export function ChatPane() {
       const allActions: AgentAction[] = [];
 
       for (let iter = 1; iter <= maxIter; iter++) {
+        if (isAgentMode) {
+          useAppStore.getState().setAgentStepProgress(iter, maxIter);
+        }
         if (isAgentMode && iter > 1) {
           setAgentGatherStep(iter);
         }
@@ -656,6 +673,7 @@ export function ChatPane() {
     } finally {
       setAgentGatherStep(null);
       setIsStreaming(false);
+      useAppStore.getState().setAgentStepProgress(0, 0);
       abortRef.current = null;
     }
   }, [addMessage, addPatchedPaths, buildContextMessages, contextFiles.length, refreshFileTree, runAgentAutoApply, runDirectEditAutoApply, setIsStreaming, settings, updateLastAssistantMessage, workspaceRoots.length]);

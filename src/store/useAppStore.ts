@@ -110,6 +110,14 @@ interface AppState {
   // Streaming
   isStreaming: boolean;
   setIsStreaming: (v: boolean) => void;
+
+  // Budgets / telemetry (UI-only)
+  contextBudgetChars: number;
+  contextUsedChars: number;
+  setContextUsage: (usedChars: number, budgetChars: number) => void;
+  agentStep: number;
+  agentStepTotal: number;
+  setAgentStepProgress: (step: number, total: number) => void;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -691,6 +699,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   isStreaming: false,
   setIsStreaming: (v) => set({ isStreaming: v }),
+
+  contextBudgetChars: 120_000,
+  contextUsedChars: 0,
+  setContextUsage: (usedChars, budgetChars) =>
+    set({ contextUsedChars: Math.max(0, usedChars), contextBudgetChars: Math.max(0, budgetChars) }),
+  agentStep: 0,
+  agentStepTotal: 0,
+  setAgentStepProgress: (step, total) => set({ agentStep: Math.max(0, step), agentStepTotal: Math.max(0, total) }),
 }));
 
 // Debounced autosave of per-chat workspace session.

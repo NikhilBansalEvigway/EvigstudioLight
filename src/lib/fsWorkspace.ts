@@ -3,6 +3,41 @@ import type { FileNode, WorkspaceRoot } from '@/types';
 export const STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE =
   'Workspace write could not be confirmed. This chat may be holding stale workspace state. Open a new chat, reopen the same workspace, and continue there.';
 
+const IGNORED_DIR_NAMES = new Set([
+  'node_modules',
+  '__pycache__',
+  'venv',
+  '.venv',
+  'env',
+  '.env',
+  '.mypy_cache',
+  '.pytest_cache',
+  '.ruff_cache',
+  '.tox',
+  '.gradle',
+  '.idea',
+  '.vscode',
+  'dist',
+  'build',
+  'out',
+  'coverage',
+  '.next',
+  '.turbo',
+  '.cache',
+  'target',
+  'bin',
+  'obj',
+]);
+
+export function isWorkspacePathIgnored(path: string): boolean {
+  const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts.some((part) => part.startsWith('.') || IGNORED_DIR_NAMES.has(part));
+}
+
+function shouldSkipDirectory(name: string): boolean {
+  return name.startsWith('.') || IGNORED_DIR_NAMES.has(name);
+}
+
 /**
  * Sanitize a file path for use with the File System Access API.
  * Normalizes separators, removes leading/trailing slashes, and filters empty segments.
@@ -218,7 +253,7 @@ async function buildAnnotatedFileTree(
     const fullRelativePath = relativePath ? `${relativePath}/${name}` : name;
 
     if (handle.kind === 'directory') {
-      if (name.startsWith('.') || name === 'node_modules') continue;
+      if (shouldSkipDirectory(name)) continue;
 
       const directoryNode: FileNode = {
         name,
@@ -426,7 +461,7 @@ export async function buildFileTree(
 
     if (handle.kind === 'directory') {
       // Skip hidden dirs and node_modules
-      if (name.startsWith('.') || name === 'node_modules') continue;
+      if (shouldSkipDirectory(name)) continue;
       const children = await buildFileTree(handle as FileSystemDirectoryHandle, fullPath);
       nodes.push({ name, path: fullPath, type: 'directory', children, handle });
     } else {
