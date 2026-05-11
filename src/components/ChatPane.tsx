@@ -520,8 +520,14 @@ export function ChatPane() {
     hasVision: boolean;
     mentionedFilePaths?: string[];
   }) => {
+    if (getChatPersistenceMode() === 'server') {
+      await useAppStore.getState().refreshServerSystemPrompts();
+    }
     const isAgentMode = chatMode === 'agent';
-    const systemPrompt = isAgentMode ? AGENT_SYSTEM_PROMPT : CHAT_SYSTEM_PROMPT;
+    const sp = useAppStore.getState().serverSystemPrompts;
+    const systemPrompt = isAgentMode
+      ? (sp?.agent ?? AGENT_SYSTEM_PROMPT)
+      : (sp?.chat ?? CHAT_SYSTEM_PROMPT);
     const turnContextPaths = mentionedFilePaths.length > 0
       ? mentionedFilePaths
       : getLastUserContextRefPaths(baseMessages);

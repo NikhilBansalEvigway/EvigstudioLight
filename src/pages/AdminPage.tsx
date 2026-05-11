@@ -31,7 +31,22 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { toast } from 'sonner';
-import { ArrowLeft, ChevronLeft, ChevronRight, Download, KeyRound, Pencil, Plus, Search, Trash2 } from 'lucide-react';
+import {
+  ArrowLeft,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  History,
+  KeyRound,
+  Pencil,
+  Plus,
+  RotateCcw,
+  Search,
+  Trash2,
+} from 'lucide-react';
+import { Textarea } from '@/components/ui/textarea';
+import { AGENT_SYSTEM_PROMPT, CHAT_SYSTEM_PROMPT } from '@/types';
+import { useAppStore } from '@/store/useAppStore';
 
 type UserRow = Pick<AuthUser, 'id' | 'email' | 'displayName' | 'role'> & { createdAt?: string };
 
@@ -260,8 +275,11 @@ function compactDisplayValue(value: unknown): unknown {
 
 const PAGE_SIZES = [10, 20, 50];
 
+const PROMPT_HISTORY_PAGE_SIZE = 15;
+
 export default function AdminPage() {
   const { user, serverAvailable } = useAuth();
+  const refreshServerSystemPrompts = useAppStore((s) => s.refreshServerSystemPrompts);
 
   const [users, setUsers] = useState<UserRow[]>([]);
   const [userTotal, setUserTotal] = useState(0);
@@ -326,6 +344,13 @@ export default function AdminPage() {
   const [editGroupName, setEditGroupName] = useState('');
   const [editGroupDescription, setEditGroupDescription] = useState('');
   const [deleteGroup, setDeleteGroup] = useState<GroupRow | null>(null);
+
+  const [promptKind, setPromptKind] = useState<'chat' | 'agent'>('chat');
+  const [promptDraft, setPromptDraft] = useState('');
+  const [promptSaving, setPromptSaving] = useState(false);
+  const [promptHistory, setPromptHistory] = useState<Array<{ id: string; content: string; createdAt: string }>>([]);
+  const [promptHistoryTotal, setPromptHistoryTotal] = useState(0);
+  const [promptHistoryPage, setPromptHistoryPage] = useState(1);
 
   useEffect(() => {
     const t = window.setTimeout(() => setUserQuery(userSearchInput.trim()), 350);
@@ -432,6 +457,42 @@ export default function AdminPage() {
     setAuditRetentionDays(d.summary.retentionDays);
   }, [auditQuery, auditActionPrefix, auditResourceType, auditResultStatus, auditStart, auditEnd]);
 
+  const loadPromptPanel = useCallback(async () => {
+    if (!user || user.role !== 'admin' || !serverAvailable) return;
+    try {
+      const params = new URLSearchParams({
+        page: String(promptHistoryPage),
+        pageSize: String(PROMPT_HISTORY_PAGE_SIZE),
+        type: promptKind,
+      });
+      const [curRes, histRes] = await Promise.all([
+        fetch('/api/prompts', { credentials: 'include' }),
+        fetch(`/api/admin/prompts/history?${params}`, { credentials: 'include' }),
+      ]);
+      if (!curRes.ok || !histRes.ok) return;
+      const cur = (await curRes.json()) as {
+        chat: { content: string } | null;
+        agent: { content: string } | null;
+      };
+      const hist = (await histRes.json()) as {
+        prompts: Array<{ id: string; content: string; createdAt: string }>;
+        total: number;
+      };
+      const fallback = promptKind === 'chat' ? CHAT_SYSTEM_PROMPT : AGENT_SYSTEM_PROMPT;
+      const stored = promptKind === 'chat' ? cur.chat?.content : cur.agent?.content;
+      setPromptDraft(stored ?? fallback);
+      setPromptHistory(hist.prompts);
+      setPromptHistoryTotal(hist.total);
+    } catch {
+      toast.error('Could not load prompts');
+    }
+  }, [user, serverAvailable, promptKind, promptHistoryPage]);
+
+  useEffect(() => {
+    if (!user || !serverAvailable || user.role !== 'admin') return;
+    void loadPromptPanel();
+  }, [user, serverAvailable, user.role, promptKind, promptHistoryPage, loadPromptPanel]);
+
   useEffect(() => {
     if (!user || !serverAvailable || user.role !== 'admin') return;
     void loadUsersPicker();
@@ -487,6 +548,44 @@ export default function AdminPage() {
   const userTotalPages = Math.max(1, Math.ceil(userTotal / userPageSize));
   const groupTotalPages = Math.max(1, Math.ceil(groupTotal / groupPageSize));
   const auditTotalPages = Math.max(1, Math.ceil(auditTotal / auditPageSize));
+  const promptTotalPages = Math.max(1, Math.ceil(promptHistoryTotal / PROMPT_HISTORY_PAGE_SIZE));
+
+  const saveSystemPrompt = async () => {
+    setPromptSaving(true);
+    try {
+      const r = await fetch('/api/admin/prompts', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: promptKind, content: promptDraft }),
+      });
+      if (!r.ok) {
+        toast.error('Could not save prompt');
+        return;
+      }
+      toast.success('Saved. This prompt is used for the next LLM requests.');
+      await refreshServerSystemPrompts();
+      await loadPromptPanel();
+    } finally {
+      setPromptSaving(false);
+    }
+  };
+
+  const restoreSystemPromptVersion = async (sourceId: string) => {
+    const r = await fetch('/api/admin/prompts/restore', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: promptKind, sourcePromptId: sourceId }),
+    });
+    if (!r.ok) {
+      toast.error('Could not restore version');
+      return;
+    }
+    toast.success('Restored. This version is now active.');
+    await refreshServerSystemPrompts();
+    await loadPromptPanel();
+  };
 
   const changeRole = async (userId: string, role: AuthUser['role']) => {
     const r = await fetch(`/api/admin/users/${userId}/role`, {
@@ -817,6 +916,7 @@ export default function AdminPage() {
             <>
               <TabsTrigger value="users">Users &amp; roles</TabsTrigger>
               <TabsTrigger value="groups">Groups</TabsTrigger>
+              <TabsTrigger value="prompts">System prompts</TabsTrigger>
             </>
           )}
           <TabsTrigger value="audit">Audit log</TabsTrigger>
@@ -1116,6 +1216,130 @@ export default function AdminPage() {
                 </Button>
               </div>
             </form>
+          </TabsContent>
+        )}
+
+        {user.role === 'admin' && (
+          <TabsContent value="prompts" className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              Edit the system instructions sent to the model for <strong className="text-foreground">Chat</strong> vs{' '}
+              <strong className="text-foreground">Agent</strong> mode. Each save creates a new version; restore rolls
+              forward by copying an older version as the latest. All signed-in users pick up the active prompt on their
+              next request.
+            </p>
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="space-y-1">
+                <Label className="text-xs">Prompt kind</Label>
+                <Select
+                  value={promptKind}
+                  onValueChange={(v) => {
+                    setPromptKind(v as 'chat' | 'agent');
+                    setPromptHistoryPage(1);
+                  }}
+                >
+                  <SelectTrigger className="h-9 w-[200px] text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="chat">Chat mode</SelectItem>
+                    <SelectItem value="agent">Agent mode</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                className="gap-1"
+                disabled={promptSaving || !promptDraft.trim()}
+                onClick={() => void saveSystemPrompt()}
+              >
+                Save as new active version
+              </Button>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs">Active prompt (editable)</Label>
+              <Textarea
+                value={promptDraft}
+                onChange={(e) => setPromptDraft(e.target.value)}
+                className="min-h-[260px] font-mono text-xs leading-relaxed"
+                spellCheck={false}
+              />
+              <p className="text-[11px] text-muted-foreground">
+                If nothing has been stored yet for this kind, the textarea shows the built-in default from the app until
+                you save.
+              </p>
+            </div>
+            <div className="rounded-md border border-border bg-card overflow-hidden">
+              <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs font-medium bg-muted/30">
+                <History className="h-3.5 w-3.5" />
+                Version history (newest first)
+              </div>
+              <div className="divide-y divide-border">
+                {promptHistory.length === 0 ? (
+                  <div className="px-3 py-8 text-xs text-muted-foreground text-center">No saved versions yet.</div>
+                ) : (
+                  promptHistory.map((row, idx) => (
+                    <div
+                      key={row.id}
+                      className="px-3 py-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between"
+                    >
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="text-[11px] text-muted-foreground">
+                          {new Date(row.createdAt).toLocaleString()}
+                          {idx === 0 ? (
+                            <span className="text-primary"> · latest (active)</span>
+                          ) : (
+                            ''
+                          )}
+                        </div>
+                        <div className="text-xs font-mono text-muted-foreground whitespace-pre-wrap break-words max-h-24 overflow-hidden">
+                          {row.content.length > 360 ? `${row.content.slice(0, 360)}…` : row.content}
+                        </div>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0 gap-1 h-8 text-xs"
+                        onClick={() => void restoreSystemPromptVersion(row.id)}
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        Restore
+                      </Button>
+                    </div>
+                  ))
+                )}
+              </div>
+              {promptTotalPages > 1 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground">
+                  <span>
+                    {promptHistoryTotal} versions · page {promptHistoryPage} of {promptTotalPages}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8"
+                      disabled={promptHistoryPage <= 1}
+                      onClick={() => setPromptHistoryPage((p) => Math.max(1, p - 1))}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8"
+                      disabled={promptHistoryPage >= promptTotalPages}
+                      onClick={() => setPromptHistoryPage((p) => Math.min(promptTotalPages, p + 1))}
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
           </TabsContent>
         )}
 

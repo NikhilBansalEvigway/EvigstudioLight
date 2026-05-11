@@ -118,6 +118,10 @@ interface AppState {
   agentStep: number;
   agentStepTotal: number;
   setAgentStepProgress: (step: number, total: number) => void;
+
+  /** Team server: latest stored system prompts (null per kind = use bundled defaults in UI). */
+  serverSystemPrompts: { chat: string | null; agent: string | null } | null;
+  refreshServerSystemPrompts: () => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -707,6 +711,29 @@ export const useAppStore = create<AppState>((set, get) => ({
   agentStep: 0,
   agentStepTotal: 0,
   setAgentStepProgress: (step, total) => set({ agentStep: Math.max(0, step), agentStepTotal: Math.max(0, total) }),
+
+  serverSystemPrompts: null,
+  refreshServerSystemPrompts: async () => {
+    try {
+      const r = await fetch('/api/prompts', { credentials: 'include' });
+      if (!r.ok) {
+        set({ serverSystemPrompts: null });
+        return;
+      }
+      const d = (await r.json()) as {
+        chat: { content: string } | null;
+        agent: { content: string } | null;
+      };
+      set({
+        serverSystemPrompts: {
+          chat: d.chat?.content ?? null,
+          agent: d.agent?.content ?? null,
+        },
+      });
+    } catch {
+      set({ serverSystemPrompts: null });
+    }
+  },
 }));
 
 // Debounced autosave of per-chat workspace session.
