@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, Navigate } from 'react-router-dom';
 import { useAuth, type AuthUser } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
@@ -31,11 +31,46 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { toast } from 'sonner';
-import { ArrowLeft, ChevronLeft, ChevronRight, Download, KeyRound, Pencil, Plus, Search, Trash2 } from 'lucide-react';
+import {
+  ArrowLeft,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  History,
+  KeyRound,
+  Pencil,
+  Plus,
+  RotateCcw,
+  Search,
+  Trash2,
+} from 'lucide-react';
+import { Textarea } from '@/components/ui/textarea';
+import { AGENT_SYSTEM_PROMPT, CHAT_SYSTEM_PROMPT } from '@/types';
+import { useAppStore } from '@/store/useAppStore';
 
 type UserRow = Pick<AuthUser, 'id' | 'email' | 'displayName' | 'role'> & { createdAt?: string };
 
 type GroupRow = { id: string; name: string; description: string | null };
+
+type GroupMemberRow = {
+  userId: string;
+  roleInGroup: 'member' | 'lead';
+  email: string;
+  displayName: string;
+};
+
+type GroupWorkspaceRow = {
+  id: string;
+  groupId: string;
+  label: string;
+  rootPath: string;
+};
+
+type GroupSummaryRow = {
+  group: GroupRow;
+  members: GroupMemberRow[];
+  workspaces: GroupWorkspaceRow[];
+};
 
 type AuditRow = {
   id: string;
@@ -260,8 +295,11 @@ function compactDisplayValue(value: unknown): unknown {
 
 const PAGE_SIZES = [10, 20, 50];
 
+const PROMPT_HISTORY_PAGE_SIZE = 15;
+
 export default function AdminPage() {
   const { user, serverAvailable } = useAuth();
+  const refreshServerSystemPrompts = useAppStore((s) => s.refreshServerSystemPrompts);
 
   const [users, setUsers] = useState<UserRow[]>([]);
   const [userTotal, setUserTotal] = useState(0);
@@ -297,9 +335,15 @@ export default function AdminPage() {
   const [groupDescription, setGroupDescription] = useState('');
   const [addMemberGroupId, setAddMemberGroupId] = useState('');
   const [addMemberUserId, setAddMemberUserId] = useState('');
+  const [addMemberRole, setAddMemberRole] = useState<'member' | 'lead'>('member');
   const [wsGroupId, setWsGroupId] = useState('');
   const [wsLabel, setWsLabel] = useState('');
   const [wsPath, setWsPath] = useState('');
+  const [selectedGroupId, setSelectedGroupId] = useState('');
+  const [selectedGroupSummary, setSelectedGroupSummary] = useState<GroupSummaryRow | null>(null);
+  const [groupSummaryLoading, setGroupSummaryLoading] = useState(false);
+  const groupSummaryRequestIdRef = useRef(0);
+  const groupSummaryCacheRef = useRef<Record<string, GroupSummaryRow>>({});
 
   const [addUserOpen, setAddUserOpen] = useState(false);
   const [newUserEmail, setNewUserEmail] = useState('');
@@ -326,6 +370,13 @@ export default function AdminPage() {
   const [editGroupName, setEditGroupName] = useState('');
   const [editGroupDescription, setEditGroupDescription] = useState('');
   const [deleteGroup, setDeleteGroup] = useState<GroupRow | null>(null);
+
+  const [promptKind, setPromptKind] = useState<'chat' | 'agent'>('chat');
+  const [promptDraft, setPromptDraft] = useState('');
+  const [promptSaving, setPromptSaving] = useState(false);
+  const [promptHistory, setPromptHistory] = useState<Array<{ id: string; content: string; createdAt: string }>>([]);
+  const [promptHistoryTotal, setPromptHistoryTotal] = useState(0);
+  const [promptHistoryPage, setPromptHistoryPage] = useState(1);
 
   useEffect(() => {
     const t = window.setTimeout(() => setUserQuery(userSearchInput.trim()), 350);
@@ -398,6 +449,43 @@ export default function AdminPage() {
     setGroupTotal(d.total);
   }, [groupPage, groupPageSize, groupQuery]);
 
+  const loadGroupSummary = useCallback(async (groupId: string) => {
+    if (!groupId) {
+      setSelectedGroupSummary(null);
+      setGroupSummaryLoading(false);
+      return;
+    }
+
+    const cached = groupSummaryCacheRef.current[groupId] ?? null;
+    setSelectedGroupSummary(cached);
+    setGroupSummaryLoading(!cached);
+
+    const requestId = ++groupSummaryRequestIdRef.current;
+    try {
+      const r = await fetch(`/api/groups/${groupId}/summary`, { credentials: 'include' });
+      if (!r.ok) {
+        if (requestId === groupSummaryRequestIdRef.current && !cached) {
+          setSelectedGroupSummary(null);
+        }
+        return;
+      }
+
+      const d = (await r.json()) as GroupSummaryRow;
+      const normalized: GroupSummaryRow = {
+        group: d.group,
+        members: Array.isArray(d.members) ? d.members : [],
+        workspaces: Array.isArray(d.workspaces) ? d.workspaces : [],
+      };
+      groupSummaryCacheRef.current[groupId] = normalized;
+      if (requestId !== groupSummaryRequestIdRef.current) return;
+      setSelectedGroupSummary(normalized);
+    } finally {
+      if (requestId === groupSummaryRequestIdRef.current) {
+        setGroupSummaryLoading(false);
+      }
+    }
+  }, []);
+
   const loadAudit = useCallback(async () => {
     const params = new URLSearchParams({
       page: String(auditPage),
@@ -432,6 +520,42 @@ export default function AdminPage() {
     setAuditRetentionDays(d.summary.retentionDays);
   }, [auditQuery, auditActionPrefix, auditResourceType, auditResultStatus, auditStart, auditEnd]);
 
+  const loadPromptPanel = useCallback(async () => {
+    if (!user || user.role !== 'admin' || !serverAvailable) return;
+    try {
+      const params = new URLSearchParams({
+        page: String(promptHistoryPage),
+        pageSize: String(PROMPT_HISTORY_PAGE_SIZE),
+        type: promptKind,
+      });
+      const [curRes, histRes] = await Promise.all([
+        fetch('/api/prompts', { credentials: 'include' }),
+        fetch(`/api/admin/prompts/history?${params}`, { credentials: 'include' }),
+      ]);
+      if (!curRes.ok || !histRes.ok) return;
+      const cur = (await curRes.json()) as {
+        chat: { content: string } | null;
+        agent: { content: string } | null;
+      };
+      const hist = (await histRes.json()) as {
+        prompts: Array<{ id: string; content: string; createdAt: string }>;
+        total: number;
+      };
+      const fallback = promptKind === 'chat' ? CHAT_SYSTEM_PROMPT : AGENT_SYSTEM_PROMPT;
+      const stored = promptKind === 'chat' ? cur.chat?.content : cur.agent?.content;
+      setPromptDraft(stored ?? fallback);
+      setPromptHistory(hist.prompts);
+      setPromptHistoryTotal(hist.total);
+    } catch {
+      toast.error('Could not load prompts');
+    }
+  }, [user, serverAvailable, promptKind, promptHistoryPage]);
+
+  useEffect(() => {
+    if (!user || !serverAvailable || user.role !== 'admin') return;
+    void loadPromptPanel();
+  }, [user, serverAvailable, user.role, promptKind, promptHistoryPage, loadPromptPanel]);
+
   useEffect(() => {
     if (!user || !serverAvailable || user.role !== 'admin') return;
     void loadUsersPicker();
@@ -443,6 +567,28 @@ export default function AdminPage() {
     void loadUsers();
     void loadGroups();
   }, [user, serverAvailable, user.role, loadUsers, loadGroups]);
+
+  useEffect(() => {
+    if (groups.length === 0) {
+      groupSummaryRequestIdRef.current += 1;
+      groupSummaryCacheRef.current = {};
+      setSelectedGroupId('');
+      setSelectedGroupSummary(null);
+      return;
+    }
+
+    if (!selectedGroupId || !groups.some((g) => g.id === selectedGroupId)) {
+      const fallbackGroupId = groups[0].id;
+      setSelectedGroupId(fallbackGroupId);
+      setAddMemberGroupId((current) => current || fallbackGroupId);
+      setWsGroupId((current) => current || fallbackGroupId);
+    }
+  }, [groups, selectedGroupId]);
+
+  useEffect(() => {
+    if (!selectedGroupId) return;
+    void loadGroupSummary(selectedGroupId);
+  }, [selectedGroupId, loadGroupSummary]);
 
   useEffect(() => {
     if (!user || !serverAvailable) return;
@@ -487,6 +633,44 @@ export default function AdminPage() {
   const userTotalPages = Math.max(1, Math.ceil(userTotal / userPageSize));
   const groupTotalPages = Math.max(1, Math.ceil(groupTotal / groupPageSize));
   const auditTotalPages = Math.max(1, Math.ceil(auditTotal / auditPageSize));
+  const promptTotalPages = Math.max(1, Math.ceil(promptHistoryTotal / PROMPT_HISTORY_PAGE_SIZE));
+
+  const saveSystemPrompt = async () => {
+    setPromptSaving(true);
+    try {
+      const r = await fetch('/api/admin/prompts', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: promptKind, content: promptDraft }),
+      });
+      if (!r.ok) {
+        toast.error('Could not save prompt');
+        return;
+      }
+      toast.success('Saved. This prompt is used for the next LLM requests.');
+      await refreshServerSystemPrompts();
+      await loadPromptPanel();
+    } finally {
+      setPromptSaving(false);
+    }
+  };
+
+  const restoreSystemPromptVersion = async (sourceId: string) => {
+    const r = await fetch('/api/admin/prompts/restore', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: promptKind, sourcePromptId: sourceId }),
+    });
+    if (!r.ok) {
+      toast.error('Could not restore version');
+      return;
+    }
+    toast.success('Restored. This version is now active.');
+    await refreshServerSystemPrompts();
+    await loadPromptPanel();
+  };
 
   const changeRole = async (userId: string, role: AuthUser['role']) => {
     const r = await fetch(`/api/admin/users/${userId}/role`, {
@@ -659,6 +843,7 @@ export default function AdminPage() {
         description: groupDescription.trim() || undefined,
       }),
     });
+    const data = (await r.json().catch(() => ({}))) as { group?: GroupRow; error?: string };
     if (!r.ok) {
       toast.error('Could not create group');
       return;
@@ -666,6 +851,12 @@ export default function AdminPage() {
     toast.success('Group created');
     setGroupName('');
     setGroupDescription('');
+    const newGroupId = data.group?.id;
+    if (newGroupId) {
+      setSelectedGroupId(newGroupId);
+      setAddMemberGroupId(newGroupId);
+      setWsGroupId(newGroupId);
+    }
     void loadGroups();
     void loadGroupsPicker();
   };
@@ -689,6 +880,9 @@ export default function AdminPage() {
     toast.success('Group updated');
     setEditGroup(null);
     void loadGroups();
+    if (selectedGroupId === editGroup.id) {
+      void loadGroupSummary(editGroup.id);
+    }
   };
 
   const confirmDeleteGroup = async () => {
@@ -702,6 +896,11 @@ export default function AdminPage() {
       return;
     }
     toast.success('Group deleted');
+    delete groupSummaryCacheRef.current[deleteGroup.id];
+    if (selectedGroupId === deleteGroup.id) {
+      setSelectedGroupId('');
+      setSelectedGroupSummary(null);
+    }
     setDeleteGroup(null);
     void loadGroups();
     void loadGroupsPicker();
@@ -714,7 +913,7 @@ export default function AdminPage() {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: addMemberUserId, roleInGroup: 'member' }),
+      body: JSON.stringify({ userId: addMemberUserId, roleInGroup: addMemberRole }),
     });
     if (!r.ok) {
       toast.error('Could not add member');
@@ -722,6 +921,43 @@ export default function AdminPage() {
     }
     toast.success('Member added');
     setAddMemberUserId('');
+    if (selectedGroupId === addMemberGroupId) {
+      void loadGroupSummary(addMemberGroupId);
+    }
+  };
+
+  const updateMemberRole = async (groupId: string, userId: string, roleInGroup: 'member' | 'lead') => {
+    const r = await fetch(`/api/groups/${groupId}/members/${userId}`, {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roleInGroup }),
+    });
+    const data = (await r.json().catch(() => ({}))) as { error?: string };
+    if (!r.ok) {
+      toast.error(data.error || 'Could not update member role');
+      return;
+    }
+    toast.success('Member role updated');
+    if (selectedGroupId === groupId) {
+      void loadGroupSummary(groupId);
+    }
+  };
+
+  const removeMember = async (groupId: string, userId: string) => {
+    const r = await fetch(`/api/groups/${groupId}/members/${userId}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+    const data = (await r.json().catch(() => ({}))) as { error?: string };
+    if (!r.ok) {
+      toast.error(data.error || 'Could not remove member');
+      return;
+    }
+    toast.success('Member removed');
+    if (selectedGroupId === groupId) {
+      void loadGroupSummary(groupId);
+    }
   };
 
   const addWorkspaceShare = async (e: React.FormEvent) => {
@@ -740,6 +976,25 @@ export default function AdminPage() {
     toast.success('Workspace path recorded for the team');
     setWsLabel('');
     setWsPath('');
+    if (selectedGroupId === wsGroupId) {
+      void loadGroupSummary(wsGroupId);
+    }
+  };
+
+  const removeWorkspaceShare = async (groupId: string, workspaceId: string) => {
+    const r = await fetch(`/api/groups/${groupId}/workspaces/${workspaceId}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+    const data = (await r.json().catch(() => ({}))) as { error?: string };
+    if (!r.ok) {
+      toast.error(data.error || 'Could not remove workspace entry');
+      return;
+    }
+    toast.success('Workspace reference removed');
+    if (selectedGroupId === groupId) {
+      void loadGroupSummary(groupId);
+    }
   };
 
   const PaginationBar = ({
@@ -817,6 +1072,7 @@ export default function AdminPage() {
             <>
               <TabsTrigger value="users">Users &amp; roles</TabsTrigger>
               <TabsTrigger value="groups">Groups</TabsTrigger>
+              <TabsTrigger value="prompts">System prompts</TabsTrigger>
             </>
           )}
           <TabsTrigger value="audit">Audit log</TabsTrigger>
@@ -1004,7 +1260,7 @@ export default function AdminPage() {
             <form onSubmit={createGroup} className="flex flex-wrap gap-2 items-end border border-border rounded-md p-4">
               <div className="space-y-1">
                 <Label>Team name</Label>
-                <Input value={groupName} onChange={(e) => setGroupName(e.target.value)} className="w-64 h-9 text-xs" />
+                <Input value={groupName} onChange={(e) => setGroupName(e.target.value)} className="w-full sm:w-64 max-w-full h-9 text-xs" />
               </div>
               <div className="space-y-1 flex-1 min-w-[200px]">
                 <Label>Description (optional)</Label>
@@ -1020,49 +1276,60 @@ export default function AdminPage() {
               </Button>
             </form>
 
-            <div className="border border-border rounded-md divide-y divide-border">
-              {groups.map((g) => (
-                <div key={g.id} className="p-3 text-xs flex flex-wrap items-start justify-between gap-2">
-                  <div>
-                    <div className="font-medium">{g.name}</div>
-                    {g.description && <div className="text-muted-foreground mt-0.5">{g.description}</div>}
-                    <div className="text-[10px] text-muted-foreground mt-1 font-mono">{g.id}</div>
+            <div className="border border-border rounded-md overflow-hidden">
+              <div className="max-h-[360px] overflow-y-auto divide-y divide-border">
+                {groups.map((g) => (
+                  <div key={g.id} className="p-3 text-xs flex flex-wrap items-start justify-between gap-2 min-w-0">
+                    <div className="min-w-0 flex-1 pr-2">
+                      <div className="font-medium break-words">{g.name}</div>
+                      {g.description && <div className="text-muted-foreground mt-0.5 break-words">{g.description}</div>}
+                      <div className="text-[10px] text-muted-foreground mt-1 font-mono break-all">{g.id}</div>
+                    </div>
+                    <div className="flex flex-wrap gap-1 shrink-0 justify-end max-w-full">
+                      <Button
+                        type="button"
+                        variant={selectedGroupId === g.id ? 'default' : 'outline'}
+                        size="sm"
+                        className="h-8 whitespace-nowrap"
+                        onClick={() => setSelectedGroupId(g.id)}
+                      >
+                        View details
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 gap-1 whitespace-nowrap"
+                        onClick={() => {
+                          setEditGroup(g);
+                          setEditGroupName(g.name);
+                          setEditGroupDescription(g.description ?? '');
+                        }}
+                      >
+                        <Pencil className="h-3 w-3" />
+                        Edit
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-destructive"
+                        onClick={() => setDeleteGroup(g)}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </Button>
+                    </div>
                   </div>
-                  <div className="flex gap-1 shrink-0">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-8 gap-1"
-                      onClick={() => {
-                        setEditGroup(g);
-                        setEditGroupName(g.name);
-                        setEditGroupDescription(g.description ?? '');
-                      }}
-                    >
-                      <Pencil className="h-3 w-3" />
-                      Edit
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-8 text-destructive"
-                      onClick={() => setDeleteGroup(g)}
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </Button>
-                  </div>
-                </div>
-              ))}
-              {groups.length === 0 && <div className="p-4 text-muted-foreground">No groups match this search.</div>}
+                ))}
+                {groups.length === 0 && <div className="p-4 text-muted-foreground">No groups match this search.</div>}
+              </div>
             </div>
 
             <form onSubmit={addMember} className="space-y-2 border border-border rounded-md p-4">
               <div className="text-sm font-medium">Add member to group</div>
               <div className="flex flex-wrap gap-2">
                 <Select value={addMemberGroupId} onValueChange={setAddMemberGroupId}>
-                  <SelectTrigger className="w-56 h-9 text-xs">
+                  <SelectTrigger className="w-full sm:w-56 h-9 text-xs">
                     <SelectValue placeholder="Group" />
                   </SelectTrigger>
                   <SelectContent>
@@ -1074,7 +1341,7 @@ export default function AdminPage() {
                   </SelectContent>
                 </Select>
                 <Select value={addMemberUserId} onValueChange={setAddMemberUserId}>
-                  <SelectTrigger className="w-56 h-9 text-xs">
+                  <SelectTrigger className="w-full sm:w-56 h-9 text-xs">
                     <SelectValue placeholder="User" />
                   </SelectTrigger>
                   <SelectContent>
@@ -1085,11 +1352,128 @@ export default function AdminPage() {
                     ))}
                   </SelectContent>
                 </Select>
+                <Select value={addMemberRole} onValueChange={(v) => setAddMemberRole(v as 'member' | 'lead')}>
+                  <SelectTrigger className="w-full sm:w-40 h-9 text-xs">
+                    <SelectValue placeholder="Role" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="member">member</SelectItem>
+                    <SelectItem value="lead">lead</SelectItem>
+                  </SelectContent>
+                </Select>
                 <Button type="submit" size="sm">
                   Add
                 </Button>
               </div>
             </form>
+
+            <div className="space-y-4 border border-border rounded-md p-4 overflow-hidden">
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="text-sm font-medium">Team details</div>
+                <Select value={selectedGroupId} onValueChange={setSelectedGroupId}>
+                  <SelectTrigger className="w-full sm:w-72 h-9 text-xs">
+                    <SelectValue placeholder="Select a group" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {groupsForPicker.map((g) => (
+                      <SelectItem key={g.id} value={g.id}>
+                        {g.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {!selectedGroupSummary ? (
+                <div className="min-h-[220px] text-xs text-muted-foreground flex items-center">
+                  {groupSummaryLoading
+                    ? 'Loading team details...'
+                    : 'Select a group to view members and workspace references.'}
+                </div>
+              ) : (
+                <div className="grid gap-4 lg:grid-cols-2 min-w-0">
+                  <div className="space-y-2 rounded-md border border-border p-3 min-w-0 overflow-hidden">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Members ({selectedGroupSummary.members.length})
+                    </div>
+                    {selectedGroupSummary.members.length === 0 ? (
+                      <div className="text-xs text-muted-foreground">No members yet.</div>
+                    ) : (
+                      <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1">
+                        {selectedGroupSummary.members.map((member) => (
+                          <div
+                            key={member.userId}
+                            className="rounded-md border border-border/70 px-2.5 py-2 flex flex-wrap items-center justify-between gap-2"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="text-xs font-medium truncate">{member.displayName}</div>
+                              <div className="text-[11px] text-muted-foreground truncate">{member.email}</div>
+                            </div>
+                            <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
+                              <Select
+                                value={member.roleInGroup}
+                                onValueChange={(v) =>
+                                  void updateMemberRole(selectedGroupSummary.group.id, member.userId, v as 'member' | 'lead')
+                                }
+                              >
+                                <SelectTrigger className="h-8 w-[112px] text-xs">
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="member">member</SelectItem>
+                                  <SelectItem value="lead">lead</SelectItem>
+                                </SelectContent>
+                              </Select>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-8 text-destructive"
+                                onClick={() => void removeMember(selectedGroupSummary.group.id, member.userId)}
+                              >
+                                Remove
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="space-y-2 rounded-md border border-border p-3 min-w-0 overflow-hidden">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Shared paths ({selectedGroupSummary.workspaces.length})
+                    </div>
+                    {selectedGroupSummary.workspaces.length === 0 ? (
+                      <div className="text-xs text-muted-foreground">No workspace references yet.</div>
+                    ) : (
+                      <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1">
+                        {selectedGroupSummary.workspaces.map((workspace) => (
+                          <div
+                            key={workspace.id}
+                            className="rounded-md border border-border/70 px-2.5 py-2 flex flex-wrap items-start justify-between gap-2"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="text-xs font-medium truncate">{workspace.label}</div>
+                              <div className="text-[11px] text-muted-foreground break-all">{workspace.rootPath}</div>
+                            </div>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-8 text-destructive"
+                              onClick={() => void removeWorkspaceShare(selectedGroupSummary.group.id, workspace.id)}
+                            >
+                              Remove
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
 
             <form onSubmit={addWorkspaceShare} className="space-y-2 border border-border rounded-md p-4">
               <div className="text-sm font-medium">Group workspace paths (shared reference)</div>
@@ -1116,6 +1500,130 @@ export default function AdminPage() {
                 </Button>
               </div>
             </form>
+          </TabsContent>
+        )}
+
+        {user.role === 'admin' && (
+          <TabsContent value="prompts" className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              Edit the system instructions sent to the model for <strong className="text-foreground">Chat</strong> vs{' '}
+              <strong className="text-foreground">Agent</strong> mode. Each save creates a new version; restore rolls
+              forward by copying an older version as the latest. All signed-in users pick up the active prompt on their
+              next request.
+            </p>
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="space-y-1">
+                <Label className="text-xs">Prompt kind</Label>
+                <Select
+                  value={promptKind}
+                  onValueChange={(v) => {
+                    setPromptKind(v as 'chat' | 'agent');
+                    setPromptHistoryPage(1);
+                  }}
+                >
+                  <SelectTrigger className="h-9 w-[200px] text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="chat">Chat mode</SelectItem>
+                    <SelectItem value="agent">Agent mode</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                className="gap-1"
+                disabled={promptSaving || !promptDraft.trim()}
+                onClick={() => void saveSystemPrompt()}
+              >
+                Save as new active version
+              </Button>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs">Active prompt (editable)</Label>
+              <Textarea
+                value={promptDraft}
+                onChange={(e) => setPromptDraft(e.target.value)}
+                className="min-h-[260px] font-mono text-xs leading-relaxed"
+                spellCheck={false}
+              />
+              <p className="text-[11px] text-muted-foreground">
+                If nothing has been stored yet for this kind, the textarea shows the built-in default from the app until
+                you save.
+              </p>
+            </div>
+            <div className="rounded-md border border-border bg-card overflow-hidden">
+              <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs font-medium bg-muted/30">
+                <History className="h-3.5 w-3.5" />
+                Version history (newest first)
+              </div>
+              <div className="divide-y divide-border">
+                {promptHistory.length === 0 ? (
+                  <div className="px-3 py-8 text-xs text-muted-foreground text-center">No saved versions yet.</div>
+                ) : (
+                  promptHistory.map((row, idx) => (
+                    <div
+                      key={row.id}
+                      className="px-3 py-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between"
+                    >
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="text-[11px] text-muted-foreground">
+                          {new Date(row.createdAt).toLocaleString()}
+                          {idx === 0 ? (
+                            <span className="text-primary"> · latest (active)</span>
+                          ) : (
+                            ''
+                          )}
+                        </div>
+                        <div className="text-xs font-mono text-muted-foreground whitespace-pre-wrap break-words max-h-24 overflow-hidden">
+                          {row.content.length > 360 ? `${row.content.slice(0, 360)}…` : row.content}
+                        </div>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0 gap-1 h-8 text-xs"
+                        onClick={() => void restoreSystemPromptVersion(row.id)}
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        Restore
+                      </Button>
+                    </div>
+                  ))
+                )}
+              </div>
+              {promptTotalPages > 1 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground">
+                  <span>
+                    {promptHistoryTotal} versions · page {promptHistoryPage} of {promptTotalPages}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8"
+                      disabled={promptHistoryPage <= 1}
+                      onClick={() => setPromptHistoryPage((p) => Math.max(1, p - 1))}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8"
+                      disabled={promptHistoryPage >= promptTotalPages}
+                      onClick={() => setPromptHistoryPage((p) => Math.min(promptTotalPages, p + 1))}
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
           </TabsContent>
         )}
 

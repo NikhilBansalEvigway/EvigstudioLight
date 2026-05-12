@@ -15,6 +15,7 @@ import { groupRoutes } from './routes/groups.js';
 import { adminRoutes } from './routes/admin.js';
 import { auditEventRoutes } from './routes/auditEvents.js';
 import { llmProxyRoutes } from './routes/llmProxy.js';
+import { promptRoutes } from './routes/prompts.js';
 
 await verifyPostgresOrExit();
 await ensurePostgresSchema();
@@ -46,6 +47,7 @@ app.route('/api/auth', authRoutes);
 app.route('/api/chats', chatRoutes);
 app.route('/api/groups', groupRoutes);
 app.route('/api/admin', adminRoutes);
+app.route('/api', promptRoutes);
 app.route('/api/audit', auditEventRoutes);
 app.route('/api/llm', llmProxyRoutes);
 

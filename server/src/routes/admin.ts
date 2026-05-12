@@ -3,7 +3,7 @@ import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 import { and, count, desc, eq, gte, ilike, lte, or, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { auditLogs, users } from '../db/schema.js';
+import { auditLogs, users, prompts } from '../db/schema.js';
 import {
   auditRetentionDays,
   auditActorSnapshot,
@@ -772,6 +772,195 @@ adminRoutes.get('/audit/export', async (c) => {
     headers: {
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': 'attachment; filename="audit-log-export.csv"',
+    },
+  });
+});
+
+const promptPayloadSchema = z.object({
+  type: z.enum(['chat', 'agent']),
+  content: z.string().min(1).max(500_000),
+});
+
+adminRoutes.get('/prompts/history', async (c) => {
+  const adminUser = c.get('user');
+  if (!adminUser) return c.json({ error: 'Unauthorized' }, 401);
+  if (adminUser.role !== 'admin') {
+    await writeStructuredAuditLog({
+      action: 'admin.prompt_history',
+      resourceType: 'system_prompt',
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'denied', code: 403, reason: 'admin_only' },
+    });
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const typeParam = c.req.query('type');
+  if (typeParam !== 'chat' && typeParam !== 'agent') {
+    return c.json({ error: 'Query "type" must be chat or agent' }, 400);
+  }
+
+  const page = Math.max(1, Number(c.req.query('page') ?? '1'));
+  const pageSize = Math.min(100, Math.max(1, Number(c.req.query('pageSize') ?? '20')));
+  const offset = (page - 1) * pageSize;
+
+  const rows = await db
+    .select()
+    .from(prompts)
+    .where(eq(prompts.type, typeParam))
+    .orderBy(desc(prompts.createdAt))
+    .limit(pageSize)
+    .offset(offset);
+
+  const [{ total }] = await db
+    .select({ total: count() })
+    .from(prompts)
+    .where(eq(prompts.type, typeParam));
+
+  return c.json({
+    prompts: rows.map((r) => ({
+      id: r.id,
+      content: r.content,
+      createdAt: r.createdAt.toISOString(),
+    })),
+    total: Number(total),
+    page,
+    pageSize,
+  });
+});
+
+adminRoutes.post('/prompts', async (c) => {
+  const adminUser = c.get('user');
+  if (!adminUser) return c.json({ error: 'Unauthorized' }, 401);
+  if (adminUser.role !== 'admin') {
+    await writeStructuredAuditLog({
+      action: 'admin.prompt_update',
+      resourceType: 'system_prompt',
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'denied', code: 403, reason: 'admin_only' },
+    });
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const parsed = promptPayloadSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    await writeStructuredAuditLog({
+      action: 'admin.prompt_update',
+      resourceType: 'system_prompt',
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'error', code: 400, reason: 'invalid_payload' },
+    });
+    return c.json({ error: 'Invalid payload' }, 400);
+  }
+
+  const [row] = await db
+    .insert(prompts)
+    .values({
+      type: parsed.data.type,
+      content: parsed.data.content,
+    })
+    .returning();
+
+  await writeStructuredAuditLog({
+    action: 'admin.prompt_update',
+    resourceType: 'system_prompt',
+    resourceId: row.id,
+    actor: auditActorSnapshot(adminUser),
+    context: auditRequestContext(c),
+    target: { type: 'system_prompt', id: row.id, label: parsed.data.type },
+    result: { status: 'success', code: 200 },
+    details: { promptType: parsed.data.type, contentLength: parsed.data.content.length },
+  });
+
+  return c.json({
+    prompt: {
+      id: row.id,
+      type: parsed.data.type,
+      content: row.content,
+      createdAt: row.createdAt.toISOString(),
+    },
+  });
+});
+
+const restorePromptSchema = z.object({
+  type: z.enum(['chat', 'agent']),
+  sourcePromptId: z.string().uuid(),
+});
+
+adminRoutes.post('/prompts/restore', async (c) => {
+  const adminUser = c.get('user');
+  if (!adminUser) return c.json({ error: 'Unauthorized' }, 401);
+  if (adminUser.role !== 'admin') {
+    await writeStructuredAuditLog({
+      action: 'admin.prompt_restore',
+      resourceType: 'system_prompt',
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'denied', code: 403, reason: 'admin_only' },
+    });
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const parsed = restorePromptSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    await writeStructuredAuditLog({
+      action: 'admin.prompt_restore',
+      resourceType: 'system_prompt',
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'error', code: 400, reason: 'invalid_payload' },
+    });
+    return c.json({ error: 'Invalid payload' }, 400);
+  }
+
+  const [src] = await db
+    .select()
+    .from(prompts)
+    .where(eq(prompts.id, parsed.data.sourcePromptId))
+    .limit(1);
+  if (!src || src.type !== parsed.data.type) {
+    await writeStructuredAuditLog({
+      action: 'admin.prompt_restore',
+      resourceType: 'system_prompt',
+      resourceId: parsed.data.sourcePromptId,
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'error', code: 404, reason: 'not_found' },
+    });
+    return c.json({ error: 'Source prompt not found for this type' }, 404);
+  }
+
+  const [row] = await db
+    .insert(prompts)
+    .values({
+      type: src.type,
+      content: src.content,
+    })
+    .returning();
+
+  await writeStructuredAuditLog({
+    action: 'admin.prompt_restore',
+    resourceType: 'system_prompt',
+    resourceId: row.id,
+    actor: auditActorSnapshot(adminUser),
+    context: auditRequestContext(c),
+    target: { type: 'system_prompt', id: row.id, label: parsed.data.type },
+    result: { status: 'success', code: 200 },
+    details: {
+      promptType: parsed.data.type,
+      restoredFromId: src.id,
+      contentLength: src.content.length,
+    },
+  });
+
+  return c.json({
+    prompt: {
+      id: row.id,
+      type: parsed.data.type,
+      content: row.content,
+      createdAt: row.createdAt.toISOString(),
     },
   });
 });

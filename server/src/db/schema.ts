@@ -10,7 +10,21 @@ import {
   index,
 } from 'drizzle-orm/pg-core';
 
+export const promptTypeEnum = pgEnum('prompt_type', ['chat', 'agent']);
 export const userRoleEnum = pgEnum('user_role', ['admin', 'developer', 'tester', 'auditor']);
+
+export const prompts = pgTable(
+  'prompts',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    type: promptTypeEnum('type').notNull(),
+    content: text('content').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    typeCreatedIdx: index('prompts_type_created_idx').on(t.type, t.createdAt),
+  }),
+);
 
 export const users = pgTable('users', {
   id: uuid('id').defaultRandom().primaryKey(),

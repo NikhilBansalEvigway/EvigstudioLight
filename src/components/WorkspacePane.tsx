@@ -23,7 +23,10 @@ import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus
 import { toast } from 'sonner';
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useTheme } from 'next-themes';
-import Editor from '@monaco-editor/react';
+import Editor, { loader } from '@monaco-editor/react';
+import * as monaco from 'monaco-editor';
+
+loader.config({ monaco });
 
 function getMonacoLanguage(filePath: string): string {
   const ext = getFileExtension(filePath).toLowerCase();

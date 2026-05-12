@@ -14,6 +14,13 @@ export async function ensurePostgresSchema(): Promise<void> {
     EXCEPTION
       WHEN duplicate_object THEN NULL;
     END $$;
+
+    DO $$
+    BEGIN
+      CREATE TYPE prompt_type AS ENUM ('chat', 'agent');
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$;
   `);
 
   await pgClient.unsafe(`
@@ -25,6 +32,15 @@ export async function ensurePostgresSchema(): Promise<void> {
       role user_role NOT NULL DEFAULT 'developer',
       created_at timestamptz NOT NULL DEFAULT now()
     );
+
+    CREATE TABLE IF NOT EXISTS prompts (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      type prompt_type NOT NULL,
+      content text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS prompts_type_created_idx ON prompts (type, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS groups (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

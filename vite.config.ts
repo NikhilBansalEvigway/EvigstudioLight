@@ -52,18 +52,7 @@ export default defineConfig(({ mode }) => ({
       },
       workbox: {
         globPatterns: ["**/*.{js,css,html,ico,png,svg,woff,woff2}"],
-        // Strict air-gap: visit online once so jsdelivr Monaco assets populate this cache, or bundle Monaco later.
-        runtimeCaching: [
-          {
-            urlPattern: /^https:\/\/cdn\.jsdelivr\.net\/.*/i,
-            handler: "CacheFirst",
-            options: {
-              cacheName: "monaco-cdn-cache",
-              expiration: { maxEntries: 50, maxAgeSeconds: 60 * 60 * 24 * 30 },
-              cacheableResponse: { statuses: [0, 200] },
-            },
-          },
-        ],
+        maximumFileSizeToCacheInBytes: 10 * 1024 * 1024,
       },
     }),
   ].filter(Boolean),

@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-set -euo pipefail
+
+# Some environments ship a `bash` that does not support `set -o pipefail`.
+# Use it when available, but don't fail hard when it's not.
+set -e
+set -u
+if (set -o pipefail) 2>/dev/null; then
+  set -o pipefail
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$ROOT_DIR/server/.env"

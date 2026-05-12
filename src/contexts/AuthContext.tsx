@@ -93,6 +93,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [ready, serverAvailable, refresh]);
 
   useEffect(() => {
+    if (!ready || !serverAvailable || !user) {
+      useAppStore.setState({ serverSystemPrompts: null });
+      return;
+    }
+    void useAppStore.getState().refreshServerSystemPrompts();
+  }, [ready, serverAvailable, user]);
+
+  useEffect(() => {
     if (!ready) return;
     if (!serverAvailable || !user) {
       setChatPersistenceMode('idb');

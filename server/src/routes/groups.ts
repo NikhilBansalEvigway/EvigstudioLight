@@ -147,6 +147,10 @@ const memberSchema = z.object({
   roleInGroup: z.enum(['member', 'lead']).default('member'),
 });
 
+const memberRoleSchema = z.object({
+  roleInGroup: z.enum(['member', 'lead']),
+});
+
 groupRoutes.post('/:id/members', async (c) => {
   const user = c.get('user');
   if (!user) return c.json({ error: 'Unauthorized' }, 401);
@@ -204,6 +208,81 @@ groupRoutes.post('/:id/members', async (c) => {
         email: target.email,
         displayName: target.displayName,
       },
+      roleInGroup: parsed.data.roleInGroup,
+    },
+  });
+
+  return c.json({ ok: true });
+});
+
+groupRoutes.patch('/:id/members/:userId', async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  const groupId = c.req.param('id');
+  const targetUserId = c.req.param('userId');
+  const parsed = memberRoleSchema.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: 'Invalid payload' }, 400);
+
+  const [selfMem] = await db
+    .select()
+    .from(groupMembers)
+    .where(and(eq(groupMembers.groupId, groupId), eq(groupMembers.userId, user.id)))
+    .limit(1);
+  const isLead = selfMem?.roleInGroup === 'lead';
+  const canManageGroups = roleHasPermission(user.role, 'groups.manage');
+  const [g] = await db.select().from(groups).where(eq(groups.id, groupId)).limit(1);
+  if (!g) return c.json({ error: 'Group not found' }, 404);
+  if (!canManageGroups && !isLead) {
+    await writeStructuredAuditLog({
+      action: 'group.member_update',
+      resourceType: 'group',
+      resourceId: groupId,
+      actor: auditActorSnapshot(user),
+      context: auditRequestContext(c),
+      target: { type: 'group', id: groupId, label: g.name },
+      result: { status: 'denied', code: 403, reason: 'not_group_manager_or_lead' },
+      details: { targetUserId, roleInGroup: parsed.data.roleInGroup },
+    });
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const [targetMembership] = await db
+    .select()
+    .from(groupMembers)
+    .where(and(eq(groupMembers.groupId, groupId), eq(groupMembers.userId, targetUserId)))
+    .limit(1);
+  if (!targetMembership) return c.json({ error: 'Group member not found' }, 404);
+
+  if (targetMembership.roleInGroup === 'lead' && parsed.data.roleInGroup !== 'lead') {
+    const [{ total: leadCount }] = await db
+      .select({ total: count() })
+      .from(groupMembers)
+      .where(and(eq(groupMembers.groupId, groupId), eq(groupMembers.roleInGroup, 'lead')));
+    if (Number(leadCount) <= 1) {
+      return c.json({ error: 'Group must have at least one lead' }, 400);
+    }
+  }
+
+  await db
+    .update(groupMembers)
+    .set({ roleInGroup: parsed.data.roleInGroup })
+    .where(and(eq(groupMembers.groupId, groupId), eq(groupMembers.userId, targetUserId)));
+
+  const [target] = await db.select().from(users).where(eq(users.id, targetUserId)).limit(1);
+
+  await writeStructuredAuditLog({
+    action: 'group.member_update',
+    resourceType: 'group',
+    resourceId: groupId,
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: { type: 'group', id: groupId, label: g.name },
+    result: { status: 'success', code: 200 },
+    details: {
+      updatedUser: target
+        ? { id: target.id, email: target.email, displayName: target.displayName }
+        : { id: targetUserId },
       roleInGroup: parsed.data.roleInGroup,
     },
   });
@@ -354,6 +433,56 @@ groupRoutes.get('/:id/workspaces', async (c) => {
 
   const list = await db.select().from(groupWorkspaces).where(eq(groupWorkspaces.groupId, groupId));
   return c.json({ workspaces: list });
+});
+
+groupRoutes.delete('/:id/workspaces/:workspaceId', async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  const groupId = c.req.param('id');
+  const workspaceId = c.req.param('workspaceId');
+
+  const [mem] = await db
+    .select()
+    .from(groupMembers)
+    .where(and(eq(groupMembers.groupId, groupId), eq(groupMembers.userId, user.id)))
+    .limit(1);
+  const isLead = mem?.roleInGroup === 'lead';
+  const canShare =
+    user.role === 'admin' ||
+    roleHasPermission(user.role, 'workspace.shares_manage') ||
+    isLead;
+  if (user.role !== 'admin' && !mem) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+  if (!canShare) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const [g] = await db.select().from(groups).where(eq(groups.id, groupId)).limit(1);
+  if (!g) return c.json({ error: 'Group not found' }, 404);
+
+  const [ws] = await db
+    .select()
+    .from(groupWorkspaces)
+    .where(and(eq(groupWorkspaces.id, workspaceId), eq(groupWorkspaces.groupId, groupId)))
+    .limit(1);
+  if (!ws) return c.json({ error: 'Workspace entry not found' }, 404);
+
+  await db.delete(groupWorkspaces).where(and(eq(groupWorkspaces.id, workspaceId), eq(groupWorkspaces.groupId, groupId)));
+
+  await writeStructuredAuditLog({
+    action: 'group.workspace_remove',
+    resourceType: 'group_workspace',
+    resourceId: workspaceId,
+    actor: auditActorSnapshot(user),
+    context: auditRequestContext(c),
+    target: { type: 'group_workspace', id: workspaceId, label: ws.label, groupId, groupName: g.name },
+    result: { status: 'success', code: 200 },
+    details: { groupId, groupName: g.name, workspaceId, label: ws.label, rootPath: ws.rootPath },
+  });
+
+  return c.json({ ok: true });
 });
 
 const patchGroupSchema = z.object({
