@@ -31,6 +31,19 @@ class Settings(BaseSettings):
         default=30,
         alias="DATABASE_SQLITE_BUSY_TIMEOUT_SECONDS",
     )
+    # SQLite only: retry commits/flushes on transient SQLITE_BUSY/LOCKED.
+    database_sqlite_lock_retry_attempts: int = Field(
+        default=8,
+        alias="DATABASE_SQLITE_LOCK_RETRY_ATTEMPTS",
+    )
+    database_sqlite_lock_retry_base_delay_ms: int = Field(
+        default=40,
+        alias="DATABASE_SQLITE_LOCK_RETRY_BASE_DELAY_MS",
+    )
+    database_sqlite_lock_retry_max_delay_ms: int = Field(
+        default=2000,
+        alias="DATABASE_SQLITE_LOCK_RETRY_MAX_DELAY_MS",
+    )
 
     redis_url: str = Field(default="redis://127.0.0.1:6379", alias="REDIS_URL")
     redis_namespace: str = Field(default="llm_orchestrator", alias="REDIS_NAMESPACE")
@@ -82,6 +95,11 @@ class Settings(BaseSettings):
     worker_max_parallel_jobs: int = Field(
         default=4,
         alias="WORKER_MAX_PARALLEL_JOBS",
+    )
+    # SQLite only: cap parallel jobs to reduce write contention across workers.
+    worker_sqlite_max_parallel_jobs: int = Field(
+        default=1,
+        alias="WORKER_SQLITE_MAX_PARALLEL_JOBS",
     )
     worker_heartbeat_ttl_seconds: int = Field(
         default=30,

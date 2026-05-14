@@ -161,6 +161,7 @@ This allows safe defaults while enabling operational tuning without redeploying 
 - Streaming mode is compatibility-oriented and not full token-by-token passthrough.
 - Worker scheduling uses polling-based orchestration.
 - Admin UI is intentionally lightweight for operations use cases.
+- SQLite is supported for local/offline use, but it is still single-writer; for higher throughput or multiple workers, use Postgres.
 
 ## License
 

@@ -121,6 +121,11 @@ class WorkerService:
         self.quota_service = QuotaService()
         self.lm_client = LMStudioClient()
         self._max_parallel_jobs = max(1, self.settings.worker_max_parallel_jobs)
+        if self.settings.database_url.startswith("sqlite"):
+            self._max_parallel_jobs = min(
+                self._max_parallel_jobs,
+                max(1, int(self.settings.worker_sqlite_max_parallel_jobs)),
+            )
         self.worker_monitor = WorkerMonitorService()
         self.worker_id = self.worker_monitor.new_worker_id()
 
