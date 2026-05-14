@@ -91,6 +91,12 @@ export async function ensurePostgresSchema(): Promise<void> {
       created_at timestamptz NOT NULL DEFAULT now()
     );
 
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key text PRIMARY KEY,
+      value jsonb NOT NULL DEFAULT '{}'::jsonb,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS privacy text NOT NULL DEFAULT 'private';
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS thread_id uuid;
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS thread_title text;

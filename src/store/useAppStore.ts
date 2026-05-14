@@ -27,6 +27,7 @@ import {
   persistenceLoadChats,
   persistenceSaveChat,
 } from '@/lib/chatPersistence';
+import { DEFAULT_CONTEXT_RULES, normalizeContextRules, type ContextRules } from '@/lib/contextRules';
 
 export interface EditorTab {
   path: string;
@@ -122,6 +123,10 @@ interface AppState {
   /** Team server: latest stored system prompts (null per kind = use bundled defaults in UI). */
   serverSystemPrompts: { chat: string | null; agent: string | null } | null;
   refreshServerSystemPrompts: () => Promise<void>;
+
+  /** Team server: context filtering rules for what files can be attached to the agent. */
+  serverContextRules: ContextRules | null;
+  refreshServerContextRules: () => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -732,6 +737,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
     } catch {
       set({ serverSystemPrompts: null });
+    }
+  },
+
+  serverContextRules: null,
+  refreshServerContextRules: async () => {
+    try {
+      const r = await fetch('/api/context-rules', { credentials: 'include' });
+      if (!r.ok) {
+        set({ serverContextRules: null });
+        return;
+      }
+      const d = (await r.json()) as { rules?: unknown };
+      const rules = normalizeContextRules(d.rules ?? DEFAULT_CONTEXT_RULES);
+      set({ serverContextRules: rules });
+    } catch {
+      set({ serverContextRules: null });
     }
   },
 }));

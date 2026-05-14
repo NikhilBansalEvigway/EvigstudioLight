@@ -48,6 +48,7 @@ import {
 import { Textarea } from '@/components/ui/textarea';
 import { AGENT_SYSTEM_PROMPT, CHAT_SYSTEM_PROMPT } from '@/types';
 import { useAppStore } from '@/store/useAppStore';
+import { DEFAULT_CONTEXT_RULES, normalizeContextRules } from '@/lib/contextRules';
 
 type UserRow = Pick<AuthUser, 'id' | 'email' | 'displayName' | 'role'> & { createdAt?: string };
 
@@ -312,6 +313,7 @@ const PROMPT_HISTORY_PAGE_SIZE = 15;
 export default function AdminPage() {
   const { user, serverAvailable } = useAuth();
   const refreshServerSystemPrompts = useAppStore((s) => s.refreshServerSystemPrompts);
+  const refreshServerContextRules = useAppStore((s) => s.refreshServerContextRules);
 
   const [users, setUsers] = useState<UserRow[]>([]);
   const [userTotal, setUserTotal] = useState(0);
@@ -390,6 +392,12 @@ export default function AdminPage() {
   const [promptHistory, setPromptHistory] = useState<Array<{ id: string; content: string; createdAt: string }>>([]);
   const [promptHistoryTotal, setPromptHistoryTotal] = useState(0);
   const [promptHistoryPage, setPromptHistoryPage] = useState(1);
+
+  const [contextRulesLoading, setContextRulesLoading] = useState(false);
+  const [contextRulesSaving, setContextRulesSaving] = useState(false);
+  const [contextAllowDotEnv, setContextAllowDotEnv] = useState(DEFAULT_CONTEXT_RULES.allowDotEnv);
+  const [contextAllowedExtensions, setContextAllowedExtensions] = useState(DEFAULT_CONTEXT_RULES.allowedExtensions.join(', '));
+  const [contextAllowedBasenames, setContextAllowedBasenames] = useState(DEFAULT_CONTEXT_RULES.allowedBasenames.join(', '));
 
   useEffect(() => {
     const t = window.setTimeout(() => setUserQuery(userSearchInput.trim()), 350);
@@ -564,10 +572,40 @@ export default function AdminPage() {
     }
   }, [user, serverAvailable, promptKind, promptHistoryPage]);
 
+  const parseCsv = useCallback((value: string) => {
+    return value
+      .split(/[,\n]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }, []);
+
+  const loadContextRules = useCallback(async () => {
+    if (!user || user.role !== 'admin' || !serverAvailable) return;
+    setContextRulesLoading(true);
+    try {
+      const r = await fetch('/api/context-rules', { credentials: 'include' });
+      if (!r.ok) return;
+      const d = (await r.json()) as { rules?: unknown };
+      const rules = normalizeContextRules(d.rules ?? DEFAULT_CONTEXT_RULES);
+      setContextAllowDotEnv(rules.allowDotEnv);
+      setContextAllowedExtensions(rules.allowedExtensions.join(', '));
+      setContextAllowedBasenames(rules.allowedBasenames.join(', '));
+    } catch {
+      toast.error('Could not load context rules');
+    } finally {
+      setContextRulesLoading(false);
+    }
+  }, [user, serverAvailable]);
+
   useEffect(() => {
     if (!user || !serverAvailable || user.role !== 'admin') return;
     void loadPromptPanel();
   }, [user, serverAvailable, user.role, promptKind, promptHistoryPage, loadPromptPanel]);
+
+  useEffect(() => {
+    if (!user || !serverAvailable || user.role !== 'admin') return;
+    void loadContextRules();
+  }, [user, serverAvailable, user.role, loadContextRules]);
 
   useEffect(() => {
     if (!user || !serverAvailable || user.role !== 'admin') return;
@@ -671,6 +709,32 @@ export default function AdminPage() {
       await loadPromptPanel();
     } finally {
       setPromptSaving(false);
+    }
+  };
+
+  const saveContextRules = async () => {
+    setContextRulesSaving(true);
+    try {
+      const payload = {
+        allowDotEnv: contextAllowDotEnv,
+        allowedExtensions: parseCsv(contextAllowedExtensions),
+        allowedBasenames: parseCsv(contextAllowedBasenames),
+      };
+      const r = await fetch('/api/admin/context-rules', {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        toast.error('Could not save context rules');
+        return;
+      }
+      toast.success('Saved. New rules apply on the next LLM request.');
+      await refreshServerContextRules();
+      await loadContextRules();
+    } finally {
+      setContextRulesSaving(false);
     }
   };
 
@@ -1122,6 +1186,7 @@ export default function AdminPage() {
             <>
               <TabsTrigger value="users">Users &amp; roles</TabsTrigger>
               <TabsTrigger value="groups">Groups</TabsTrigger>
+              <TabsTrigger value="context">Context rules</TabsTrigger>
               <TabsTrigger value="prompts">System prompts</TabsTrigger>
             </>
           )}
@@ -1723,6 +1788,91 @@ export default function AdminPage() {
                   </div>
                 </div>
               )}
+            </div>
+          </TabsContent>
+        )}
+
+        {user.role === 'admin' && (
+          <TabsContent value="context" className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              Control which file types are eligible to be sent to the agent as context. Non-matching files (images,
+              logos, binaries) are skipped even if a user pins them.
+            </p>
+
+            <div className="rounded-md border border-border bg-card p-4 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">Context file filter</div>
+                  <div className="text-[11px] text-muted-foreground">
+                    Applies to project tree summaries and to files added via @ mentions or the context pin icon.
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 text-xs"
+                    disabled={contextRulesSaving}
+                    onClick={() => {
+                      setContextAllowDotEnv(DEFAULT_CONTEXT_RULES.allowDotEnv);
+                      setContextAllowedExtensions(DEFAULT_CONTEXT_RULES.allowedExtensions.join(', '));
+                      setContextAllowedBasenames(DEFAULT_CONTEXT_RULES.allowedBasenames.join(', '));
+                    }}
+                  >
+                    Reset defaults
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="h-8 text-xs"
+                    disabled={contextRulesSaving || contextRulesLoading}
+                    onClick={() => void saveContextRules()}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  checked={contextAllowDotEnv}
+                  onCheckedChange={(v) => setContextAllowDotEnv(v === true)}
+                  id="context-allow-dotenv"
+                />
+                <Label htmlFor="context-allow-dotenv" className="text-xs">
+                  Allow <span className="font-mono">.env</span> and <span className="font-mono">.env.*</span>
+                </Label>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <Label className="text-xs">Allowed extensions</Label>
+                  <Textarea
+                    value={contextAllowedExtensions}
+                    onChange={(e) => setContextAllowedExtensions(e.target.value)}
+                    className="min-h-[120px] font-mono text-xs leading-relaxed"
+                    spellCheck={false}
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Comma or newline separated. Examples: <span className="font-mono">.ts, .tsx, .py</span>
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="text-xs">Allowed filenames (no extension)</Label>
+                  <Textarea
+                    value={contextAllowedBasenames}
+                    onChange={(e) => setContextAllowedBasenames(e.target.value)}
+                    className="min-h-[120px] font-mono text-xs leading-relaxed"
+                    spellCheck={false}
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Comma or newline separated. Examples: <span className="font-mono">Dockerfile</span>,{' '}
+                    <span className="font-mono">Makefile</span>
+                  </p>
+                </div>
+              </div>
             </div>
           </TabsContent>
         )}

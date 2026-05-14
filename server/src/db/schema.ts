@@ -120,3 +120,9 @@ export const auditLogs = pgTable(
     resourceTypeIdx: index('audit_logs_resource_type_idx').on(t.resourceType),
   }),
 );
+
+export const appSettings = pgTable('app_settings', {
+  key: text('key').primaryKey(),
+  value: jsonb('value').notNull().default(sql`'{}'::jsonb`),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});

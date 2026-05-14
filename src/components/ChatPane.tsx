@@ -6,12 +6,12 @@ import {
   buildWorkspaceTree,
   deleteWorkspacePath,
   isWorkspacePathIgnored,
-  isSupportedFile,
   readWorkspaceFile,
   serializeFileTree,
   STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE,
   writeWorkspaceFile,
 } from '@/lib/fsWorkspace';
+import { DEFAULT_CONTEXT_RULES, isAllowedContextPath } from '@/lib/contextRules';
 import {
   parseToolCalls,
   hasAgentTools,
@@ -69,6 +69,7 @@ export function ChatPane() {
   const {
     chats, activeChatId, createChat, addMessage, updateLastAssistantMessage, updateChatFields, saveVersionSnapshot,
     settings, contextFiles, fileTree, isStreaming, setIsStreaming, workspaceRoots, contextUsedChars, contextBudgetChars,
+    serverContextRules,
   } = useAppStore();
 
   const [autoAppliedPathsByMessageId, setAutoAppliedPathsByMessageId] = useState<Record<string, string[]>>({});
@@ -439,10 +440,8 @@ export function ChatPane() {
     const totalChars = () => parts.reduce((sum, part) => sum + part.length, 0);
     const canAdd = (nextPart: string) => totalChars() + nextPart.length <= MAX_TOTAL_CONTEXT_CHARS;
 
-    const isContextFilePath = (p: string) => {
-      const name = p.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
-      return isSupportedFile(name);
-    };
+    const rules = serverContextRules ?? DEFAULT_CONTEXT_RULES;
+    const isContextFilePath = (p: string) => isAllowedContextPath(p, rules);
 
     const addFileContext = async (path: string, heading: string, maxChars: number, required = false) => {
       if (included.has(path)) return true;
@@ -541,7 +540,11 @@ export function ChatPane() {
 
     const hasExplicitContext = mentionedRefs.length > 0 || pinnedContextFiles.length > 0;
     if (!hasExplicitContext) {
-      const treeStr = fileTree.length ? serializeFileTree(fileTree) : '';
+      const treeStr = fileTree.length
+        ? serializeFileTree(fileTree, {
+            fileFilter: (n) => isContextFilePath(n.path),
+          })
+        : '';
       if (treeStr) {
         const tree = truncate(treeStr, MAX_TREE_CHARS);
         const block = `## Project structure (file paths)\n\`\`\`\n${tree.text}\n\`\`\``;
@@ -578,7 +581,7 @@ export function ChatPane() {
     const content = `Workspace context (use paths below as ground truth; do not invent paths that are not listed):\n${summary}\n\n${parts.join('\n\n')}`;
     useAppStore.getState().setContextUsage(content.length, MAX_TOTAL_CONTEXT_CHARS);
     return [{ role: 'user' as const, content }];
-  }, [workspaceRoots, fileTree, contextFiles]);
+  }, [workspaceRoots, fileTree, contextFiles, serverContextRules]);
 
   const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
@@ -795,6 +798,7 @@ export function ChatPane() {
   }) => {
     if (getChatPersistenceMode() === 'server') {
       await useAppStore.getState().refreshServerSystemPrompts();
+      await useAppStore.getState().refreshServerContextRules();
     }
     const isAgentMode = chatMode === 'agent';
     const sp = useAppStore.getState().serverSystemPrompts;

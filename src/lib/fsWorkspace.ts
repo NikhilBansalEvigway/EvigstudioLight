@@ -769,13 +769,17 @@ export function isSupportedFile(name: string): boolean {
 }
 
 /** Flat list of file paths (directories omitted) for LLM project overview. */
-export function serializeFileTree(nodes: FileNode[]): string {
+export function serializeFileTree(
+  nodes: FileNode[],
+  options?: {
+    fileFilter?: (node: FileNode) => boolean;
+  },
+): string {
   const paths: string[] = [];
   const walk = (list: FileNode[]) => {
     for (const n of list) {
       if (n.type === 'file') {
-        // Only include code-ish files (plus env/config dotfiles) to keep context small.
-        if (isSupportedFile(n.name)) {
+        if (!options?.fileFilter || options.fileFilter(n)) {
           paths.push(n.path);
         }
       } else if (n.type === 'directory' && n.children?.length) {

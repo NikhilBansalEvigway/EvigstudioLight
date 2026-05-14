@@ -3,7 +3,7 @@ import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 import { and, count, desc, eq, gte, ilike, lte, or, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { auditLogs, users, prompts } from '../db/schema.js';
+import { auditLogs, users, prompts, appSettings } from '../db/schema.js';
 import {
   auditRetentionDays,
   auditActorSnapshot,
@@ -15,6 +15,14 @@ import type { HonoEnv } from '../middleware/session.js';
 import { roleHasPermission, type RoleName } from '../rbac.js';
 
 export const adminRoutes = new Hono<HonoEnv>();
+
+const CONTEXT_RULES_KEY = 'context_rules';
+
+const contextRulesSchema = z.object({
+  allowedExtensions: z.array(z.string().min(1).max(24)).max(200).optional(),
+  allowedBasenames: z.array(z.string().min(1).max(200)).max(200).optional(),
+  allowDotEnv: z.boolean().optional(),
+});
 
 function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, '\\$&');
@@ -963,4 +971,75 @@ adminRoutes.post('/prompts/restore', async (c) => {
       createdAt: row.createdAt.toISOString(),
     },
   });
+});
+
+adminRoutes.get('/context-rules', async (c) => {
+  const adminUser = c.get('user');
+  if (!adminUser) return c.json({ error: 'Unauthorized' }, 401);
+  if (adminUser.role !== 'admin') return c.json({ error: 'Forbidden' }, 403);
+
+  const [row] = await db.select().from(appSettings).where(eq(appSettings.key, CONTEXT_RULES_KEY)).limit(1);
+  return c.json({
+    rules: (row?.value as any) ?? null,
+    updatedAt: row?.updatedAt?.toISOString?.() ?? null,
+  });
+});
+
+adminRoutes.put('/context-rules', async (c) => {
+  const adminUser = c.get('user');
+  if (!adminUser) return c.json({ error: 'Unauthorized' }, 401);
+  if (adminUser.role !== 'admin') {
+    await writeStructuredAuditLog({
+      action: 'admin.context_rules_update',
+      resourceType: 'context_rules',
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'denied', code: 403, reason: 'admin_only' },
+    });
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const parsed = contextRulesSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    await writeStructuredAuditLog({
+      action: 'admin.context_rules_update',
+      resourceType: 'context_rules',
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'error', code: 400, reason: 'invalid_payload' },
+    });
+    return c.json({ error: 'Invalid payload' }, 400);
+  }
+
+  const rules = {
+    ...(parsed.data.allowedExtensions ? { allowedExtensions: parsed.data.allowedExtensions } : {}),
+    ...(parsed.data.allowedBasenames ? { allowedBasenames: parsed.data.allowedBasenames } : {}),
+    ...(parsed.data.allowDotEnv !== undefined ? { allowDotEnv: parsed.data.allowDotEnv } : {}),
+  };
+
+  const [row] = await db
+    .insert(appSettings)
+    .values({
+      key: CONTEXT_RULES_KEY,
+      value: rules,
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: appSettings.key,
+      set: { value: rules, updatedAt: new Date() },
+    })
+    .returning();
+
+  await writeStructuredAuditLog({
+    action: 'admin.context_rules_update',
+    resourceType: 'context_rules',
+    resourceId: row.key,
+    actor: auditActorSnapshot(adminUser),
+    context: auditRequestContext(c),
+    target: { type: 'context_rules', id: row.key, label: row.key },
+    result: { status: 'success', code: 200 },
+    details: { keys: Object.keys(rules) },
+  });
+
+  return c.json({ rules: row.value, updatedAt: row.updatedAt.toISOString() });
 });
