@@ -31,7 +31,34 @@ const IGNORED_DIR_NAMES = new Set([
 
 export function isWorkspacePathIgnored(path: string): boolean {
   const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
-  return parts.some((part) => part.startsWith('.') || IGNORED_DIR_NAMES.has(part));
+  if (parts.length === 0) return false;
+
+  const isAllowedDotFile = (name: string) =>
+    name === '.env' ||
+    name.startsWith('.env.') ||
+    name === '.gitignore' ||
+    name === '.gitattributes' ||
+    name === '.editorconfig' ||
+    name === '.npmrc' ||
+    name === '.nvmrc' ||
+    name === '.dockerignore' ||
+    name === '.eslintignore' ||
+    name === '.prettierignore';
+
+  // Ignore hidden/ignored directories anywhere in the path.
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    const part = parts[i];
+    if (!part) continue;
+    if (part.startsWith('.') || IGNORED_DIR_NAMES.has(part)) return true;
+  }
+
+  const last = parts[parts.length - 1];
+  if (!last) return false;
+  if (IGNORED_DIR_NAMES.has(last)) return true;
+
+  // Allow a small set of dotfiles (we still ignore dot-directories above).
+  if (last.startsWith('.') && !isAllowedDotFile(last)) return true;
+  return false;
 }
 
 function shouldSkipDirectory(name: string): boolean {
@@ -717,8 +744,28 @@ export function getFileExtension(name: string): string {
 }
 
 export function isSupportedFile(name: string): boolean {
-  const ext = getFileExtension(name).toLowerCase();
-  return ['.m', '.vhd', '.vhdl', '.txt', '.md', '.json', '.v', '.sv', '.py', '.c', '.h', '.cpp', '.hpp', '.ts', '.js', '.css', '.html', '.xml', '.yaml', '.yml', '.toml', '.cfg', '.ini', '.sh', '.bat'].includes(ext);
+  const trimmed = name.trim();
+  if (!trimmed) return false;
+  // Common dotfiles used for configuration.
+  if (trimmed === '.env' || trimmed.startsWith('.env.')) return true;
+
+  // Common extension-less code/config entrypoints.
+  const lower = trimmed.toLowerCase();
+  if (lower === 'dockerfile' || lower === 'makefile' || lower === 'cmakelists.txt') return true;
+
+  const ext = getFileExtension(trimmed).toLowerCase();
+  return [
+    '.m', '.vhd', '.vhdl',
+    '.txt', '.md', '.json',
+    '.v', '.sv',
+    '.py',
+    '.c', '.h', '.cpp', '.hpp',
+    '.ts', '.tsx', '.js', '.jsx',
+    '.css', '.scss', '.html',
+    '.xml', '.yaml', '.yml', '.toml', '.cfg', '.ini',
+    '.sh', '.ps1', '.bat',
+    '.java', '.kt', '.go', '.rs', '.php', '.sql',
+  ].includes(ext);
 }
 
 /** Flat list of file paths (directories omitted) for LLM project overview. */
@@ -727,7 +774,10 @@ export function serializeFileTree(nodes: FileNode[]): string {
   const walk = (list: FileNode[]) => {
     for (const n of list) {
       if (n.type === 'file') {
-        paths.push(n.path);
+        // Only include code-ish files (plus env/config dotfiles) to keep context small.
+        if (isSupportedFile(n.name)) {
+          paths.push(n.path);
+        }
       } else if (n.type === 'directory' && n.children?.length) {
         walk(n.children);
       }

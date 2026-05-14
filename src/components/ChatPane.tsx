@@ -6,6 +6,7 @@ import {
   buildWorkspaceTree,
   deleteWorkspacePath,
   isWorkspacePathIgnored,
+  isSupportedFile,
   readWorkspaceFile,
   serializeFileTree,
   STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE,
@@ -438,12 +439,29 @@ export function ChatPane() {
     const totalChars = () => parts.reduce((sum, part) => sum + part.length, 0);
     const canAdd = (nextPart: string) => totalChars() + nextPart.length <= MAX_TOTAL_CONTEXT_CHARS;
 
+    const isContextFilePath = (p: string) => {
+      const name = p.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
+      return isSupportedFile(name);
+    };
+
     const addFileContext = async (path: string, heading: string, maxChars: number, required = false) => {
       if (included.has(path)) return true;
       if (isWorkspacePathIgnored(path)) {
         stats.omittedFiles += 1;
         return false;
       }
+
+      if (!isContextFilePath(path)) {
+        // Keep non-code assets (images, videos, etc.) out of the LLM context.
+        const block = `### ${heading}: ${path}\n(Skipped: non-code file)`;
+        if (canAdd(block)) {
+          parts.push(block);
+        } else {
+          stats.omittedFiles += 1;
+        }
+        return false;
+      }
+
       included.add(path);
       try {
         const content = await readWorkspaceFile(workspaceRoots, path);
@@ -480,13 +498,22 @@ export function ChatPane() {
       }
 
       stats.attachedFolders += 1;
-      const listing = summarizeDirectory(node);
+      // Summarize the folder but keep non-code files out of the listing.
+      const listing = summarizeDirectory(node)
+        .split('\n')
+        .filter((line) => {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('file ')) return true;
+          const p = trimmed.slice('file '.length).trim();
+          return isContextFilePath(p);
+        })
+        .join('\n');
       const block = `### Folder: ${path}\n\`\`\`\n${listing || '(empty)'}\n\`\`\``;
       if (canAdd(block)) {
         parts.push(block);
       }
 
-      const folderFiles = collectDirectoryFilePaths(node, MAX_FOLDER_FILE_CONTENTS);
+      const folderFiles = collectDirectoryFilePaths(node, MAX_FOLDER_FILE_CONTENTS).filter(isContextFilePath);
       for (const filePath of folderFiles) {
         await addFileContext(filePath, `File from @folder ${path}`, MAX_FILE_CHARS_AUTO);
       }
@@ -512,12 +539,15 @@ export function ChatPane() {
       await addFileContext(path, 'Pinned context file', MAX_FILE_CHARS_EXPLICIT);
     }
 
-    const treeStr = fileTree.length ? serializeFileTree(fileTree) : '';
-    if (treeStr) {
-      const tree = truncate(treeStr, MAX_TREE_CHARS);
-      const block = `## Project structure (file paths)\n\`\`\`\n${tree.text}\n\`\`\``;
-      if (canAdd(block)) {
-        parts.push(block);
+    const hasExplicitContext = mentionedRefs.length > 0 || pinnedContextFiles.length > 0;
+    if (!hasExplicitContext) {
+      const treeStr = fileTree.length ? serializeFileTree(fileTree) : '';
+      if (treeStr) {
+        const tree = truncate(treeStr, MAX_TREE_CHARS);
+        const block = `## Project structure (file paths)\n\`\`\`\n${tree.text}\n\`\`\``;
+        if (canAdd(block)) {
+          parts.push(block);
+        }
       }
     }
 
