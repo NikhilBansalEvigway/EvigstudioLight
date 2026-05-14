@@ -1,4 +1,5 @@
 import { Link } from 'react-router-dom';
+import { useState, type FormEvent } from 'react';
 import { useAppStore } from '@/store/useAppStore';
 import { useAuth } from '@/contexts/AuthContext';
 import { useTheme } from 'next-themes';
@@ -16,10 +17,22 @@ import {
   LogOut,
   Users,
   LogIn,
+  KeyRound,
 } from 'lucide-react';
 import { Logo } from '@/components/Logo';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { toast } from 'sonner';
 
 export function StatusBar() {
   const {
@@ -43,6 +56,44 @@ export function StatusBar() {
   const { theme, setTheme } = useTheme();
   const hasBackground = Boolean(settings.backgroundImageDataUrl);
   const canOpenSettings = user?.role === 'admin';
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
+
+  const resetPasswordFields = () => {
+    setCurrentPassword('');
+    setNewPassword('');
+    setConfirmNewPassword('');
+  };
+
+  const submitOwnPassword = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!currentPassword || newPassword.length < 8) {
+      toast.error('Enter current password and a new password (min 8 chars)');
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      toast.error('New passwords do not match');
+      return;
+    }
+
+    const r = await fetch('/api/auth/change-password', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword, newPassword }),
+    });
+    const data = (await r.json().catch(() => ({}))) as { error?: string };
+    if (!r.ok) {
+      toast.error(data.error || 'Could not change password');
+      return;
+    }
+
+    toast.success('Password updated');
+    setPasswordDialogOpen(false);
+    resetPasswordFields();
+  };
 
   const formatChars = (n: number) => {
     const abs = Math.abs(n);
@@ -192,6 +243,18 @@ export function StatusBar() {
             size="icon"
             className="h-8 w-8"
             type="button"
+            title="Change password"
+            onClick={() => setPasswordDialogOpen(true)}
+          >
+            <KeyRound className="w-4 h-4" />
+          </Button>
+        )}
+        {serverAvailable && user && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            type="button"
             title="Sign out"
             onClick={() => void logout()}
           >
@@ -221,6 +284,63 @@ export function StatusBar() {
           </TooltipContent>
         </Tooltip>
       </div>
+
+      <Dialog
+        open={passwordDialogOpen}
+        onOpenChange={(open) => {
+          setPasswordDialogOpen(open);
+          if (!open) {
+            resetPasswordFields();
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Change password</DialogTitle>
+            <DialogDescription>Use your current password to set a new one.</DialogDescription>
+          </DialogHeader>
+          <form onSubmit={submitOwnPassword} className="space-y-3">
+            <div className="space-y-1">
+              <Label htmlFor="status-current-password">Current password</Label>
+              <Input
+                id="status-current-password"
+                type="password"
+                autoComplete="current-password"
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="status-new-password">New password</Label>
+              <Input
+                id="status-new-password"
+                type="password"
+                minLength={8}
+                autoComplete="new-password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="status-confirm-password">Confirm new password</Label>
+              <Input
+                id="status-confirm-password"
+                type="password"
+                minLength={8}
+                autoComplete="new-password"
+                value={confirmNewPassword}
+                onChange={(e) => setConfirmNewPassword(e.target.value)}
+              />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setPasswordDialogOpen(false)}>
+                Cancel
+              </Button>
+              <Button type="submit">Update password</Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </header>
   );
 }

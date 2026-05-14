@@ -26,13 +26,14 @@ const ROLE_PERMISSIONS: Record<RoleName, Set<Permission | '*'>> = {
   admin: ALL,
   developer: new Set([
     'chats.read_own',
+    'chats.read_all',
     'chats.write_own',
     'chats.delete_own',
     'groups.read',
     'groups.manage',
     'workspace.shares_manage',
   ]),
-  tester: new Set(['chats.read_own', 'chats.write_own', 'groups.read']),
+  tester: new Set(['chats.read_own', 'chats.read_all', 'chats.write_own', 'groups.read']),
   auditor: new Set(['chats.read_all', 'groups.read', 'audit.read']),
 };
 

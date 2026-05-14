@@ -349,7 +349,7 @@ export default function AdminPage() {
   const [groupDescription, setGroupDescription] = useState('');
   const [newGroupMemberIds, setNewGroupMemberIds] = useState<string[]>([]);
   const [addMemberGroupId, setAddMemberGroupId] = useState('');
-  const [addMemberUserId, setAddMemberUserId] = useState('');
+  const [addMemberUserIds, setAddMemberUserIds] = useState<string[]>([]);
   const [addMemberRole, setAddMemberRole] = useState<'member' | 'lead'>('member');
   const [wsGroupId, setWsGroupId] = useState('');
   const [wsLabel, setWsLabel] = useState('');
@@ -615,6 +615,7 @@ export default function AdminPage() {
 
   useEffect(() => {
     setNewGroupMemberIds((prev) => prev.filter((userId) => usersForPicker.some((userRow) => userRow.id === userId)));
+    setAddMemberUserIds((prev) => prev.filter((userId) => usersForPicker.some((userRow) => userRow.id === userId)));
   }, [usersForPicker]);
 
   useEffect(() => {
@@ -690,6 +691,7 @@ export default function AdminPage() {
   const auditTotalPages = Math.max(1, Math.ceil(auditTotal / auditPageSize));
   const promptTotalPages = Math.max(1, Math.ceil(promptHistoryTotal / PROMPT_HISTORY_PAGE_SIZE));
   const allNewGroupMembersSelected = usersForPicker.length > 0 && newGroupMemberIds.length === usersForPicker.length;
+  const allAddMemberUsersSelected = usersForPicker.length > 0 && addMemberUserIds.length === usersForPicker.length;
 
   const saveSystemPrompt = async () => {
     setPromptSaving(true);
@@ -1022,19 +1024,42 @@ export default function AdminPage() {
 
   const addMember = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!addMemberGroupId || !addMemberUserId) return;
-    const r = await fetch(`/api/groups/${addMemberGroupId}/members`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: addMemberUserId, roleInGroup: addMemberRole }),
-    });
-    if (!r.ok) {
-      toast.error('Could not add member');
+    if (!addMemberGroupId || addMemberUserIds.length === 0) return;
+
+    const selectedUserIds = [...new Set(addMemberUserIds)];
+    const results = await Promise.allSettled(
+      selectedUserIds.map((userId) =>
+        fetch(`/api/groups/${addMemberGroupId}/members`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, roleInGroup: addMemberRole }),
+        }),
+      ),
+    );
+
+    let addedCount = 0;
+    let failedCount = 0;
+
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value.ok) {
+        addedCount += 1;
+      } else {
+        failedCount += 1;
+      }
+    }
+
+    if (addedCount === 0) {
+      toast.error('Could not add selected members');
       return;
     }
-    toast.success('Member added');
-    setAddMemberUserId('');
+
+    toast.success(`Added ${addedCount} member${addedCount === 1 ? '' : 's'}`);
+    if (failedCount > 0) {
+      toast.error(`Could not add ${failedCount} member${failedCount === 1 ? '' : 's'}`);
+    }
+    setAddMemberUserIds([]);
+
     if (selectedGroupId === addMemberGroupId) {
       void loadGroupSummary(addMemberGroupId);
     }
@@ -1505,18 +1530,6 @@ export default function AdminPage() {
                     ))}
                   </SelectContent>
                 </Select>
-                <Select value={addMemberUserId} onValueChange={setAddMemberUserId}>
-                  <SelectTrigger className="w-full sm:w-56 h-9 text-xs">
-                    <SelectValue placeholder="User" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {usersForPicker.map((u) => (
-                      <SelectItem key={u.id} value={u.id}>
-                        {u.displayName} ({u.email})
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
                 <Select value={addMemberRole} onValueChange={(v) => setAddMemberRole(v as 'member' | 'lead')}>
                   <SelectTrigger className="w-full sm:w-40 h-9 text-xs">
                     <SelectValue placeholder="Role" />
@@ -1526,8 +1539,61 @@ export default function AdminPage() {
                     <SelectItem value="lead">lead</SelectItem>
                   </SelectContent>
                 </Select>
-                <Button type="submit" size="sm">
-                  Add
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <Label className="text-xs">Select users</Label>
+                  <div className="flex items-center gap-3 text-xs">
+                    <label className="inline-flex items-center gap-2 cursor-pointer">
+                      <Checkbox
+                        checked={allAddMemberUsersSelected}
+                        onCheckedChange={(checked) =>
+                          setAddMemberUserIds(checked === true ? usersForPicker.map((u) => u.id) : [])
+                        }
+                      />
+                      <span>Select all</span>
+                    </label>
+                    <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => setAddMemberUserIds([])}>
+                      Clear
+                    </Button>
+                    <span className="text-muted-foreground">{addMemberUserIds.length} selected</span>
+                  </div>
+                </div>
+
+                {usersForPicker.length === 0 ? (
+                  <div className="rounded-md border border-border/70 px-3 py-2 text-xs text-muted-foreground">
+                    No users available to assign.
+                  </div>
+                ) : (
+                  <div className="max-h-[180px] overflow-y-auto rounded-md border border-border/70 p-2 space-y-1">
+                    {usersForPicker.map((u) => {
+                      const checked = addMemberUserIds.includes(u.id);
+                      return (
+                        <label key={u.id} className="flex items-center gap-2 rounded px-2 py-1 text-xs hover:bg-muted/50 cursor-pointer">
+                          <Checkbox
+                            checked={checked}
+                            onCheckedChange={(nextChecked) => {
+                              setAddMemberUserIds((prev) => {
+                                if (nextChecked === true) {
+                                  return prev.includes(u.id) ? prev : [...prev, u.id];
+                                }
+                                return prev.filter((id) => id !== u.id);
+                              });
+                            }}
+                          />
+                          <span className="min-w-0 truncate">{u.displayName}</span>
+                          <span className="min-w-0 truncate text-muted-foreground">({u.email})</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex justify-end">
+                <Button type="submit" size="sm" disabled={!addMemberGroupId || addMemberUserIds.length === 0}>
+                  Add selected
                 </Button>
               </div>
             </form>
