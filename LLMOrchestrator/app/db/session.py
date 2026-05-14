@@ -160,11 +160,27 @@ class ResilientAsyncSession(AsyncSession):
                 if not _looks_like_sqlite_lock_error(exc):
                     raise
 
-                # For SQLITE_BUSY/LOCKED, the write typically did not happen.
-                # Rolling back here can discard in-memory pending changes; prefer
-                # waiting and retrying the same unit of work.
-                # If the transaction is marked inactive by SQLAlchemy, the next
-                # retry will raise and surface the root error.
+                # In order to retry safely, we must rollback the failed transaction.
+                # If we're inside an explicit `async with session.begin():` context,
+                # rolling back would close the context and break subsequent ops.
+                # Detect this via the sync session's transactional context manager.
+                in_ctx = False
+                try:
+                    in_ctx = bool(getattr(self.sync_session, "_trans_context_manager", None))
+                except Exception:
+                    in_ctx = False
+                if in_ctx:
+                    raise
+
+                try:
+                    await AsyncSession.rollback(self)
+                except Exception:
+                    pass
+
+                # Do not rollback here.
+                # If we're inside an explicit transaction context (session.begin()),
+                # rolling back will close the transaction and break the context.
+                # Higher-level helpers should retry the whole transaction instead.
 
                 if i >= attempts - 1:
                     raise
@@ -187,6 +203,54 @@ class ResilientAsyncSession(AsyncSession):
             lambda: AsyncSession.flush(self, objects),
             operation="flush",
         )
+
+
+async def run_sqlite_transaction_with_retry(
+    fn,
+    *,
+    attempts: int | None = None,
+):
+    """Run a unit of work in its own transaction with SQLite lock retries.
+
+    This is the safe place to do retries. Retrying inside a live `session.begin()`
+    context is not safe because SQLAlchemy requires a rollback before reuse.
+    """
+
+    settings = get_settings()
+    session_factory = get_session_factory()
+    url = settings.database_url
+    if not _is_sqlite_url(url):
+        async with session_factory() as session:
+            async with session.begin():
+                return await fn(session)
+
+    max_attempts = attempts or int(
+        getattr(settings, "database_sqlite_lock_retry_attempts", 8) or 0
+    )
+    base_ms = int(getattr(settings, "database_sqlite_lock_retry_base_delay_ms", 40) or 0)
+    max_ms = int(getattr(settings, "database_sqlite_lock_retry_max_delay_ms", 2000) or 0)
+    max_attempts = max(1, max_attempts)
+
+    last_exc: Exception | None = None
+    for i in range(max_attempts):
+        try:
+            async with _sqlite_interprocess_write_lock(url):
+                async with session_factory() as session:
+                    async with session.begin():
+                        return await fn(session)
+        except OperationalError as exc:
+            last_exc = exc
+            if not _looks_like_sqlite_lock_error(exc):
+                raise
+            if i >= max_attempts - 1:
+                raise
+            delay = min(max_ms, base_ms * (2**i)) if base_ms and max_ms else 0
+            delay = int(delay * (0.75 + random.random() * 0.5)) if delay else 0
+            if delay:
+                await asyncio.sleep(delay / 1000)
+        
+    if last_exc is not None:
+        raise last_exc
 
 
 def _engine_kwargs(settings) -> dict:

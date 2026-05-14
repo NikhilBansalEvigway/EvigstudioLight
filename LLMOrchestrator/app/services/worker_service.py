@@ -132,12 +132,16 @@ class WorkerService:
     async def run_forever(self) -> None:
         running_tasks: set[asyncio.Task] = set()
         while True:
-            await self.worker_monitor.publish_heartbeat(
-                worker_id=self.worker_id,
-                active_tasks=len(running_tasks),
-                max_parallel_jobs=self._max_parallel_jobs,
-                status="running",
-            )
+            try:
+                await self.worker_monitor.publish_heartbeat(
+                    worker_id=self.worker_id,
+                    active_tasks=len(running_tasks),
+                    max_parallel_jobs=self._max_parallel_jobs,
+                    status="running",
+                )
+            except Exception:
+                # Heartbeats are best-effort; don't take down the worker loop.
+                logger.exception("worker_heartbeat_failed")
             # Reap completed tasks so failures do not get swallowed.
             completed = {task for task in running_tasks if task.done()}
             for task in completed:
@@ -160,7 +164,12 @@ class WorkerService:
                         logger.exception("worker_task_failed")
                 continue
 
-            job = await self._dequeue_next_job()
+            try:
+                job = await self._dequeue_next_job()
+            except Exception:
+                logger.exception("worker_dequeue_failed")
+                await asyncio.sleep(0.25)
+                continue
             if job is None:
                 if running_tasks:
                     done, _ = await asyncio.wait(
