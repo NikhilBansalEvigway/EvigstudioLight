@@ -1,0 +1,25 @@
+[project]
+name = "llm-orchestrator"
+version = "0.1.0"
+description = "Gateway and orchestration layer for EvigStudio LLM traffic"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116.0",
+  "uvicorn[standard]>=0.35.0",
+  "pydantic-settings>=2.10.0",
+  "pydantic>=2.11.7",
+  "sqlalchemy>=2.0.43",
+  "aiosqlite>=0.21.0",
+  "alembic>=1.16.0",
+  "httpx>=0.28.1",
+  "redis>=6.4.0",
+  "PyJWT>=2.10.1",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]

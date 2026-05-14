@@ -12,6 +12,17 @@ dist
 dist-ssr
 *.local
 
+# Env files (keep examples tracked)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local/host runtime artifacts
+server/.env.offline
+server/.env
+evigstudio-db-*.sql
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
