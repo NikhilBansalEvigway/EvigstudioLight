@@ -92,23 +92,43 @@ export function ChatMessage({
   }, [isEditing, rawText]);
 
   const handleCopyMessage = useCallback(() => {
-    const text = displayText.trim() || rawText.trim();
+    const text = displayText || rawText;
     if (!text) return;
-    void navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    const fallbackCopy = () => {
+      const textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.setAttribute('readonly', '');
+      textArea.style.position = 'fixed';
+      textArea.style.opacity = '0';
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+    };
+
+    const copyPromise = navigator.clipboard?.writeText
+      ? navigator.clipboard.writeText(text).catch(() => {
+          fallbackCopy();
+        })
+      : Promise.resolve().then(() => {
+          fallbackCopy();
+        });
+
+    void copyPromise.finally(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
   }, [displayText, rawText]);
 
   const handleSubmitEdit = useCallback(async () => {
-    const trimmed = draftText.trim();
-    if (!onSubmitEdit || !trimmed || trimmed === rawText.trim()) {
+    if (!onSubmitEdit || !draftText.trim() || draftText === rawText) {
       setIsEditing(false);
       return;
     }
 
     setIsSavingEdit(true);
     try {
-      await onSubmitEdit(message.id, trimmed);
+      await onSubmitEdit(message.id, draftText);
       setIsEditing(false);
     } finally {
       setIsSavingEdit(false);
@@ -182,7 +202,7 @@ export function ChatMessage({
               <button
                 type="button"
                 onClick={() => void handleSubmitEdit()}
-                disabled={isSavingEdit || !draftText.trim() || draftText.trim() === rawText.trim()}
+                disabled={isSavingEdit || !draftText.trim() || draftText === rawText}
                 className="inline-flex items-center gap-1 rounded-md bg-primary px-2.5 py-1 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isSavingEdit ? <Loader2 className="h-3 w-3 animate-spin" /> : <Pencil className="h-3 w-3" />}
@@ -192,33 +212,39 @@ export function ChatMessage({
             <p className="text-[11px] text-muted-foreground">This replaces this turn and regenerates the conversation from here.</p>
           </div>
         ) : displayText.trim().length > 0 && (
-          <div
-            className="prose prose-sm max-w-none leading-relaxed dark:prose-invert
-            [&_p]:my-1.5 [&_ul]:my-1 [&_ol]:my-1
-            [&_a]:text-primary [&_a]:no-underline hover:[&_a]:underline
-            [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_h1]:text-foreground [&_h2]:text-foreground [&_h3]:text-foreground
-            [&_blockquote]:border-l-primary [&_blockquote]:text-muted-foreground
-            [&_table]:text-xs [&_th]:text-foreground
-            text-sm sm:text-[15px]
-          "
-          >
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              rehypePlugins={[rehypeHighlight]}
-              components={{
-                pre: ({ children }) => <ExpandablePre>{children}</ExpandablePre>,
-                code: ({ children, className }) => {
-                  const isInline = !className;
-                  if (isInline) {
-                    return <code className="rounded bg-secondary px-1 py-0.5 text-[0.85em]">{children}</code>;
-                  }
-                  return <code className={className}>{children}</code>;
-                },
-              }}
-            >
+          message.role === 'user' ? (
+            <pre className="whitespace-pre-wrap break-words text-sm sm:text-[15px] leading-relaxed font-mono">
               {displayText}
-            </ReactMarkdown>
-          </div>
+            </pre>
+          ) : (
+            <div
+              className="prose prose-sm max-w-none leading-relaxed dark:prose-invert
+              [&_p]:my-1.5 [&_ul]:my-1 [&_ol]:my-1
+              [&_a]:text-primary [&_a]:no-underline hover:[&_a]:underline
+              [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_h1]:text-foreground [&_h2]:text-foreground [&_h3]:text-foreground
+              [&_blockquote]:border-l-primary [&_blockquote]:text-muted-foreground
+              [&_table]:text-xs [&_th]:text-foreground
+              text-sm sm:text-[15px]
+            "
+            >
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                rehypePlugins={[rehypeHighlight]}
+                components={{
+                  pre: ({ children }) => <ExpandablePre>{children}</ExpandablePre>,
+                  code: ({ children, className }) => {
+                    const isInline = !className;
+                    if (isInline) {
+                      return <code className="rounded bg-secondary px-1 py-0.5 text-[0.85em]">{children}</code>;
+                    }
+                    return <code className={className}>{children}</code>;
+                  },
+                }}
+              >
+                {displayText}
+              </ReactMarkdown>
+            </div>
+          )
         )}
 
         {message.role === 'assistant' && displayText.trim().length > 0 && (

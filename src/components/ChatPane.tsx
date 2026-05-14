@@ -39,6 +39,8 @@ import { ChatToolbar } from '@/components/ChatToolbar';
 import { getLastUserContextRefPaths, getMessageContextRefPaths } from '@/lib/chatContext';
 import { collectDirectoryFilePaths, findMentionNode, summarizeDirectory, type MentionEntry } from '@/lib/fileMentions';
 import { isWorkspaceEditRequest } from '@/lib/workspaceIntent';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
 import {
   buildActiveDocumentAudit,
   buildWorkspaceRootSummaries,
@@ -46,7 +48,7 @@ import {
   workspaceFolderLabels,
 } from '@/lib/auditClient';
 import { useSpeechDictation } from '@/hooks/useSpeechDictation';
-import { Send, ImagePlus, Loader2, StopCircle, FileCode, X, Mic, Bot, MessageSquare, Lock, FolderOpen } from 'lucide-react';
+import { Send, ImagePlus, Loader2, StopCircle, FileCode, X, Mic, Bot, MessageSquare, Lock, FolderOpen, ChevronDown } from 'lucide-react';
 import { toast } from 'sonner';
 
 const KEY_PROJECT_FILES = [
@@ -58,16 +60,30 @@ const KEY_PROJECT_FILES = [
   '.env.example',
 ];
 
+const CONTEXT_WARNING_RATIO = 0.86;
+const AUTO_SUMMARY_HEADER = 'Conversation summary (auto-generated):';
+const AUTO_SUMMARY_FOOTER = 'Continue chatting with this summary as context.';
+
 export function ChatPane() {
   const {
     chats, activeChatId, createChat, addMessage, updateLastAssistantMessage, updateChatFields, saveVersionSnapshot,
-    settings, contextFiles, fileTree, isStreaming, setIsStreaming, workspaceRoots,
+    settings, contextFiles, fileTree, isStreaming, setIsStreaming, workspaceRoots, contextUsedChars, contextBudgetChars,
   } = useAppStore();
 
   const [autoAppliedPathsByMessageId, setAutoAppliedPathsByMessageId] = useState<Record<string, string[]>>({});
   const [agentActionsByMessageId, setAgentActionsByMessageId] = useState<Record<string, AgentAction[]>>({});
   const patchedPathsRef = useRef<Set<string>>(new Set());
   const [agentGatherStep, setAgentGatherStep] = useState<number | null>(null);
+  const [showContextActionsDialog, setShowContextActionsDialog] = useState(false);
+  const [isCondensingChat, setIsCondensingChat] = useState(false);
+  const [contextPressure, setContextPressure] = useState<{
+    usedChars: number;
+    budgetChars: number;
+    historyChars: number;
+    workspaceChars: number;
+    pendingChars: number;
+    ratio: number;
+  } | null>(null);
 
   useEffect(() => {
     patchedPathsRef.current = new Set();
@@ -126,6 +142,19 @@ export function ChatPane() {
   }, [fileTree, mentionedFiles]);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUp = useRef(false);
+  const [showScrollToLatest, setShowScrollToLatest] = useState(false);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    try {
+      container.scrollTo({ top: container.scrollHeight, behavior });
+    } catch {
+      container.scrollTop = container.scrollHeight;
+    }
+    userScrolledUp.current = false;
+    setShowScrollToLatest(false);
+  }, []);
 
   useEffect(() => {
     if (fileTree.length === 0 || mentionedFiles.length === 0) return;
@@ -135,19 +164,39 @@ export function ChatPane() {
   useEffect(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
+    const BOTTOM_THRESHOLD_PX = 96;
     const onScroll = () => {
       const distFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-      userScrolledUp.current = distFromBottom > 120;
+      const scrolledUp = distFromBottom > BOTTOM_THRESHOLD_PX;
+      userScrolledUp.current = scrolledUp;
+      if (scrolledUp && isStreaming) {
+        setShowScrollToLatest(true);
+      }
+      if (!scrolledUp) {
+        setShowScrollToLatest(false);
+      }
     };
     container.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
     return () => container.removeEventListener('scroll', onScroll);
-  }, []);
+  }, [isStreaming]);
 
   useEffect(() => {
+    if (!activeChat) return;
     if (!userScrolledUp.current) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      scrollToBottom('auto');
+      return;
     }
-  }, [activeChat?.messages]);
+    setShowScrollToLatest(true);
+  }, [activeChat?.messages, activeChat, scrollToBottom]);
+
+  useEffect(() => {
+    if (!activeChatId) {
+      setShowScrollToLatest(false);
+      return;
+    }
+    requestAnimationFrame(() => scrollToBottom('auto'));
+  }, [activeChatId, scrollToBottom]);
 
   const addPatchedPaths = useCallback((paths: string[]) => {
     for (const p of paths) {
@@ -170,6 +219,200 @@ export function ChatPane() {
     const text = firstUserMessage ? getMessageText(firstUserMessage).trim() : '';
     return text ? text.slice(0, 40) : fallbackTitle;
   }, []);
+
+  const formatCharCount = useCallback((value: number) => {
+    const abs = Math.abs(value);
+    if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+    if (abs >= 1_000) return `${Math.round(value / 1_000)}k`;
+    return `${Math.round(value)}`;
+  }, []);
+
+  const estimateContextPressure = useCallback((messages: Message[], pendingText: string, pendingImageCount: number) => {
+    const historyChars = messages.reduce((sum, message) => sum + getMessageText(message).length + 48, 0);
+    const pendingChars = Math.max(0, pendingText.length) + Math.max(0, pendingImageCount) * 8_000 + 512;
+    const workspaceChars = Math.max(0, contextUsedChars || 0);
+    const tokenBudgetChars = Math.max(24_000, Math.min(320_000, Math.round((settings.maxTokens || 8192) * 4)));
+    const budgetChars = Math.max(60_000, Math.max(tokenBudgetChars, contextBudgetChars || 120_000));
+    const usedChars = historyChars + workspaceChars + pendingChars;
+    const ratio = budgetChars > 0 ? usedChars / budgetChars : 0;
+    return {
+      historyChars,
+      workspaceChars,
+      pendingChars,
+      usedChars,
+      budgetChars,
+      ratio,
+      shouldPrompt: ratio >= CONTEXT_WARNING_RATIO,
+    };
+  }, [contextBudgetChars, contextUsedChars, settings.maxTokens]);
+
+  const buildCondenseTranscript = useCallback((messages: Message[], maxChars = 90_000) => {
+    const chunks: string[] = [];
+    let used = 0;
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'user' && message.role !== 'assistant') continue;
+
+      const baseText = getMessageText(message).trim();
+      const fallback = hasImages(message) ? '[Image attachment]' : '(empty)';
+      const messageText = baseText || fallback;
+      const linePrefix = message.role === 'user' ? 'User' : 'Assistant';
+      const line = `${linePrefix}: ${messageText}`;
+
+      if (used + line.length <= maxChars) {
+        chunks.push(line);
+        used += line.length;
+        continue;
+      }
+
+      const remaining = maxChars - used;
+      if (remaining > 24) {
+        chunks.push(`${line.slice(0, remaining)}…`);
+      }
+      break;
+    }
+
+    return chunks.reverse().join('\n\n').trim();
+  }, []);
+
+  const normalizeSummaryEntity = useCallback((value: string) => {
+    return value
+      .toLowerCase()
+      .replace(/[`"']/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }, []);
+
+  const uniqueSummaryEntities = useCallback((values: string[]) => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const raw of values) {
+      const value = raw.trim();
+      if (!value) continue;
+      const key = normalizeSummaryEntity(value);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(value);
+    }
+    return out;
+  }, [normalizeSummaryEntity]);
+
+  const extractAutoSummaryBody = useCallback((content: string): string | null => {
+    const markerIndex = content.indexOf(AUTO_SUMMARY_HEADER);
+    if (markerIndex < 0) return null;
+    let body = content.slice(markerIndex + AUTO_SUMMARY_HEADER.length).trim();
+    if (!body) return null;
+    if (body.endsWith(AUTO_SUMMARY_FOOTER)) {
+      body = body.slice(0, -AUTO_SUMMARY_FOOTER.length).trim();
+    }
+    return body || null;
+  }, []);
+
+  const findLatestAutoSummaryBody = useCallback((messages: Message[]): string | null => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'assistant' || typeof message.content !== 'string') continue;
+      const body = extractAutoSummaryBody(message.content);
+      if (body) return body;
+    }
+    return null;
+  }, [extractAutoSummaryBody]);
+
+  const extractSummaryEntities = useCallback((text: string) => {
+    const inlineCode = Array.from(text.matchAll(/`([^`]+)`/g)).map((match) => (match[1] ?? '').trim());
+
+    const fileLikeFromCode = inlineCode.filter((token) => {
+      if (!token || token.startsWith('http://') || token.startsWith('https://')) return false;
+      return token.includes('/') || /\.[A-Za-z0-9]+$/.test(token);
+    });
+
+    const fileLikeFromText = Array.from(
+      text.matchAll(
+        /(?:^|[\s(])([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+(?:\.[A-Za-z0-9]+)?|[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml|py|java|go|rs|c|cpp|h|hpp|sql|css|scss|html|sh|ps1|bat|toml|env))/g,
+      ),
+    ).map((match) => (match[1] ?? '').trim());
+
+    const apiEndpoints = Array.from(
+      text.matchAll(/(?:\b(?:GET|POST|PUT|PATCH|DELETE)\s+)?(\/[A-Za-z0-9._~\-/:?#[\]@!$&'()*+,;=%]{2,})/g),
+    ).map((match) => (match[0] ?? '').trim());
+
+    const apiSymbols = Array.from(text.matchAll(/\b[a-z][A-Za-z0-9_]*(?:\.[a-zA-Z0-9_]+)*\s*\(/g)).map((match) => {
+      const token = (match[0] ?? '').trim();
+      return token.endsWith('(') ? token.slice(0, -1).trim() : token;
+    });
+
+    const constraintPattern = /\b(must|should|do not|don't|cannot|can't|only|required|constraint|limit|maximum|min(?:imum)?|offline|browser|firefox|chrome|edge)\b/i;
+    const causePattern = /\b(root cause|caused by|because|due to|issue|bug|failure|regression|glitch)\b/i;
+
+    const sentenceCandidates = text
+      .split(/\n+|[.!?]\s+/)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+
+    return {
+      files: uniqueSummaryEntities([...fileLikeFromCode, ...fileLikeFromText]),
+      apis: uniqueSummaryEntities([...apiEndpoints, ...apiSymbols]),
+      constraints: uniqueSummaryEntities(sentenceCandidates.filter((entry) => constraintPattern.test(entry))),
+      bugCauses: uniqueSummaryEntities(sentenceCandidates.filter((entry) => causePattern.test(entry))),
+    };
+  }, [uniqueSummaryEntities]);
+
+  const mergeSummaryWithEntityRetention = useCallback((oldSummary: string | null, newSummary: string) => {
+    if (!oldSummary || !oldSummary.trim()) {
+      return { mergedSummary: newSummary, retainedCount: 0 };
+    }
+
+    const oldEntities = extractSummaryEntities(oldSummary);
+    const newEntities = extractSummaryEntities(newSummary);
+    const normalizedNewSummary = normalizeSummaryEntity(newSummary);
+
+    const findMissing = (older: string[], newer: string[]) => {
+      const newerSet = new Set(newer.map((value) => normalizeSummaryEntity(value)).filter(Boolean));
+      return older.filter((entry) => {
+        const normalized = normalizeSummaryEntity(entry);
+        if (!normalized) return false;
+        if (newerSet.has(normalized)) return false;
+        return !normalizedNewSummary.includes(normalized);
+      });
+    };
+
+    const missing = {
+      files: findMissing(oldEntities.files, newEntities.files),
+      apis: findMissing(oldEntities.apis, newEntities.apis),
+      constraints: findMissing(oldEntities.constraints, newEntities.constraints),
+      bugCauses: findMissing(oldEntities.bugCauses, newEntities.bugCauses),
+    };
+
+    const retainedCount =
+      missing.files.length +
+      missing.apis.length +
+      missing.constraints.length +
+      missing.bugCauses.length;
+
+    if (retainedCount === 0) {
+      return { mergedSummary: newSummary, retainedCount: 0 };
+    }
+
+    const section = (title: string, values: string[]) => {
+      if (values.length === 0) return null;
+      const bullets = values.slice(0, 8).map((value) => `- ${value}`).join('\n');
+      return `${title}:\n${bullets}`;
+    };
+
+    const retainedSections = [
+      section('Files', missing.files),
+      section('APIs', missing.apis),
+      section('Constraints', missing.constraints),
+      section('Bug causes', missing.bugCauses),
+    ].filter((entry): entry is string => Boolean(entry));
+
+    const retainedBlock = `Retained from previous summary (diff check):\n${retainedSections.join('\n\n')}`;
+    return {
+      mergedSummary: `${newSummary}\n\n${retainedBlock}`,
+      retainedCount,
+    };
+  }, [extractSummaryEntities, normalizeSummaryEntity]);
 
   const buildContextMessages = useCallback(async (messageMentionedFiles: string[] = []): Promise<{ role: 'user'; content: string }[]> => {
     if (workspaceRoots.length === 0) {
@@ -336,7 +579,7 @@ export function ChatPane() {
       const before = input.slice(0, mentionStartIdx);
       const cursorPos = textareaRef.current?.selectionStart ?? input.length;
       const after = input.slice(cursorPos);
-      const nextValue = `${before}${after}`.replace(/[ \t]{2,}/g, ' ');
+      const nextValue = `${before}${after}`;
       setInput(nextValue);
     }
 
@@ -697,14 +940,13 @@ export function ChatPane() {
     const originalMessage = chat.messages[messageIndex];
     if (originalMessage.role !== 'user' || typeof originalMessage.content !== 'string') return;
 
-    const trimmed = nextText.trim();
-    if (!trimmed || trimmed === originalMessage.content.trim()) return;
+    if (!nextText.trim() || nextText === originalMessage.content) return;
 
     saveVersionSnapshot(chat.id, `Before editing message ${messageIndex + 1}`);
 
     const updatedMessage: Message = {
       ...originalMessage,
-      content: trimmed,
+      content: nextText,
       timestamp: Date.now(),
     };
     const nextMessages = [...chat.messages.slice(0, messageIndex), updatedMessage];
@@ -760,16 +1002,20 @@ export function ChatPane() {
     });
   }, [deriveChatTitle, isStreaming, runAssistantTurn, saveVersionSnapshot, trimMessageUiState, updateChatFields]);
 
-  const handleSend = useCallback(async () => {
+  const sendCurrentInput = useCallback(async () => {
     if ((!input.trim() && images.length === 0) || isStreaming) return;
-    if (activeChat && !canWriteChat(activeChat)) {
+    const state = useAppStore.getState();
+    const currentActiveChat = state.activeChatId
+      ? state.chats.find((chat) => chat.id === state.activeChatId) ?? null
+      : null;
+    if (currentActiveChat && !canWriteChat(currentActiveChat)) {
       toast.error('This conversation is locked. Start a new chat to continue.');
       return;
     }
 
-    const currentMode = useAppStore.getState().chats.find((c) => c.id === activeChatId)?.mode ?? 'agent';
+    const currentMode = currentActiveChat?.mode ?? 'agent';
 
-    let chatId = activeChatId;
+    let chatId = state.activeChatId;
     if (!chatId) {
       try {
         chatId = await createChat();
@@ -785,13 +1031,14 @@ export function ChatPane() {
     }
 
     const hasVision = images.length > 0;
+    const rawInput = input;
     const mentionedFilePaths = mentionedFiles;
     const hasWorkspaceContext = mentionedFilePaths.length > 0 || contextFiles.length > 0;
     const shouldUseAgentForEdit =
       currentMode === 'chat' &&
       workspaceRoots.length > 0 &&
       hasWorkspaceContext &&
-      isWorkspaceEditRequest(input);
+      isWorkspaceEditRequest(rawInput);
     const effectiveMode: ChatMode = shouldUseAgentForEdit ? 'agent' : currentMode;
 
     if (shouldUseAgentForEdit) {
@@ -810,13 +1057,13 @@ export function ChatPane() {
     let userContent: string | ContentPart[];
     if (hasVision) {
       const parts: ContentPart[] = [];
-      if (input.trim()) parts.push({ type: 'text', text: input.trim() });
+      if (rawInput.trim()) parts.push({ type: 'text', text: rawInput });
       for (const img of images) {
         parts.push({ type: 'image_url', image_url: { url: img } });
       }
       userContent = parts;
     } else {
-      userContent = input.trim();
+      userContent = rawInput;
     }
 
     const userMsg: Message = {
@@ -884,6 +1131,167 @@ export function ChatPane() {
     runAssistantTurn,
   ]);
 
+  const summarizeActiveChat = useCallback(async (): Promise<boolean> => {
+    const state = useAppStore.getState();
+    const chatId = state.activeChatId;
+    if (!chatId) return false;
+
+    const chat = state.chats.find((entry) => entry.id === chatId);
+    if (!chat || !canWriteChat(chat)) return false;
+    const previousSummary = findLatestAutoSummaryBody(chat.messages);
+
+    const transcript = buildCondenseTranscript(chat.messages);
+    if (!transcript) {
+      toast.error('Not possible to summarize right now. Please use Clear chat or New chat.');
+      return false;
+    }
+
+    setIsCondensingChat(true);
+    try {
+      const summary = (await chatCompletion({
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a conversation condenser. Create a compact continuity summary of the provided chat. Include goals, decisions, constraints, pending tasks, and important file paths or entities. Keep it concise and actionable.',
+          },
+          {
+            role: 'user',
+            content:
+              `Summarize the conversation below for future context carry-over. Output plain text with short headings and bullets.\n\nConversation:\n${transcript}`,
+          },
+        ],
+        settings: {
+          ...settings,
+          stream: false,
+          maxTokens: Math.min(2048, Math.max(512, Math.floor(settings.maxTokens / 2))),
+        },
+        useVision: false,
+      })).trim();
+
+      if (!summary) {
+        toast.error('Not possible to summarize right now. Please use Clear chat or New chat.');
+        return false;
+      }
+
+      const { mergedSummary, retainedCount } = mergeSummaryWithEntityRetention(previousSummary, summary);
+
+      saveVersionSnapshot(chat.id, 'Before auto-summary condense');
+
+      const summaryMessage: Message = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: `${AUTO_SUMMARY_HEADER}\n\n${mergedSummary}\n\n${AUTO_SUMMARY_FOOTER}`,
+        timestamp: Date.now(),
+      };
+
+      trimMessageUiState([summaryMessage]);
+      updateChatFields(chat.id, {
+        messages: [summaryMessage],
+      });
+      userScrolledUp.current = false;
+      setShowScrollToLatest(false);
+      toast.success(
+        retainedCount > 0
+          ? `Conversation summarized. Retained ${retainedCount} key item(s) from previous summary.`
+          : 'Conversation summarized. You can continue chatting.',
+      );
+      return true;
+    } catch (err) {
+      console.error('[EvigStudio] summarize conversation failed', err);
+      toast.error('Not possible to summarize right now. Please use Clear chat or New chat.');
+      return false;
+    } finally {
+      setIsCondensingChat(false);
+    }
+  }, [
+    buildCondenseTranscript,
+    findLatestAutoSummaryBody,
+    mergeSummaryWithEntityRetention,
+    saveVersionSnapshot,
+    settings,
+    trimMessageUiState,
+    updateChatFields,
+  ]);
+
+  const clearActiveChat = useCallback((): boolean => {
+    const state = useAppStore.getState();
+    const chatId = state.activeChatId;
+    if (!chatId) return false;
+
+    const chat = state.chats.find((entry) => entry.id === chatId);
+    if (!chat || !canWriteChat(chat)) return false;
+
+    saveVersionSnapshot(chat.id, 'Before clearing conversation');
+    trimMessageUiState([]);
+    updateChatFields(chat.id, {
+      messages: [],
+      title: 'New Chat',
+    });
+    userScrolledUp.current = false;
+    setShowScrollToLatest(false);
+    toast.success('Chat cleared. Start a fresh conversation.');
+    return true;
+  }, [saveVersionSnapshot, trimMessageUiState, updateChatFields]);
+
+  const handleContextActionSummarize = useCallback(async () => {
+    const ok = await summarizeActiveChat();
+    if (!ok) return;
+    setShowContextActionsDialog(false);
+    await sendCurrentInput();
+  }, [sendCurrentInput, summarizeActiveChat]);
+
+  const handleContextActionClear = useCallback(async () => {
+    const ok = clearActiveChat();
+    if (!ok) return;
+    setShowContextActionsDialog(false);
+    await sendCurrentInput();
+  }, [clearActiveChat, sendCurrentInput]);
+
+  const handleContextActionNewChat = useCallback(async () => {
+    try {
+      await createChat();
+      setShowContextActionsDialog(false);
+      await sendCurrentInput();
+    } catch (e) {
+      console.error('[EvigStudio] createChat for context action', e);
+      const msg = e instanceof Error && e.message ? e.message : 'Could not create a new chat.';
+      toast.error(msg);
+    }
+  }, [createChat, sendCurrentInput]);
+
+  const handleSend = useCallback(async () => {
+    if ((!input.trim() && images.length === 0) || isStreaming) return;
+
+    const state = useAppStore.getState();
+    const currentActiveChat = state.activeChatId
+      ? state.chats.find((chat) => chat.id === state.activeChatId) ?? null
+      : null;
+
+    if (currentActiveChat && !canWriteChat(currentActiveChat)) {
+      toast.error('This conversation is locked. Start a new chat to continue.');
+      return;
+    }
+
+    if (currentActiveChat) {
+      const pressure = estimateContextPressure(currentActiveChat.messages, input, images.length);
+      if (pressure.shouldPrompt) {
+        setContextPressure({
+          usedChars: pressure.usedChars,
+          budgetChars: pressure.budgetChars,
+          historyChars: pressure.historyChars,
+          workspaceChars: pressure.workspaceChars,
+          pendingChars: pressure.pendingChars,
+          ratio: pressure.ratio,
+        });
+        setShowContextActionsDialog(true);
+        return;
+      }
+    }
+
+    await sendCurrentInput();
+  }, [estimateContextPressure, images.length, input, isStreaming, sendCurrentInput]);
+
   const handleStop = () => abortRef.current?.abort();
 
   const handleImageAttach = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -949,51 +1357,141 @@ export function ChatPane() {
         </div>
       )}
 
-      {/* Messages */}
-      <div ref={scrollContainerRef} className="flex-1 space-y-4 overflow-y-auto px-3 py-3 sm:px-5">
-        {!activeChat || activeChat.messages.length === 0 ? (
-          <div className="flex items-center justify-center h-full">
-            <div className="text-center space-y-3">
-              <div className="text-4xl">{isAgent ? '🤖' : '💬'}</div>
-              <h2 className="text-lg font-semibold text-foreground">
-                {isAgent ? 'Agent Mode' : 'Chat Mode'}
-              </h2>
-              <p className="text-xs text-muted-foreground max-w-sm">
-                {isAgent
-                  ? 'Full coding agent : reads, edits, creates, and deletes files in your workspace. Open a folder to get started.'
-                  : 'Plain conversation with your local AI. Ask questions, brainstorm, or discuss code.'}
-              </p>
+      <Dialog
+        open={showContextActionsDialog}
+        onOpenChange={(open) => {
+          setShowContextActionsDialog(open);
+          if (!open) {
+            setContextPressure(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-base">Context is almost full</DialogTitle>
+            <DialogDescription>
+              This chat is nearing the context window. Choose how you want to continue.
+            </DialogDescription>
+          </DialogHeader>
+
+          {contextPressure && (
+            <div className="rounded-md border border-border/70 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+              <div className="flex items-center justify-between">
+                <span>Total usage</span>
+                <span className="font-medium text-foreground">
+                  {formatCharCount(contextPressure.usedChars)} / {formatCharCount(contextPressure.budgetChars)}
+                </span>
+              </div>
+              <div className="mt-1 flex items-center justify-between">
+                <span>History</span>
+                <span>{formatCharCount(contextPressure.historyChars)}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span>Workspace context</span>
+                <span>{formatCharCount(contextPressure.workspaceChars)}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span>Current input</span>
+                <span>{formatCharCount(contextPressure.pendingChars)}</span>
+              </div>
+              <div className="mt-1 text-[11px]">
+                Usage: {Math.round(contextPressure.ratio * 100)}%
+              </div>
             </div>
+          )}
+
+          <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setShowContextActionsDialog(false);
+                setContextPressure(null);
+              }}
+              disabled={isCondensingChat}
+            >
+              Cancel
+            </Button>
+            <Button type="button" variant="secondary" onClick={() => void handleContextActionClear()} disabled={isCondensingChat}>
+              Clear chat
+            </Button>
+            <Button type="button" variant="secondary" onClick={() => void handleContextActionNewChat()} disabled={isCondensingChat}>
+              New chat
+            </Button>
+            <Button type="button" onClick={() => void handleContextActionSummarize()} disabled={isCondensingChat}>
+              {isCondensingChat ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Summarizing…
+                </>
+              ) : (
+                'Summarize'
+              )}
+            </Button>
           </div>
-        ) : (
-          activeChat.messages.map(msg => (
-            <ChatMessage
-              key={msg.id}
-              message={msg}
-              chatMode={chatMode}
-              onApplyPatch={handleApplyPatch}
-              onGetOriginal={handleGetOriginal}
-              autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
-              agentActions={agentActionsByMessageId[msg.id]}
-              onOpenFile={handleOpenEditorFile}
-              onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
-              onRegenerate={isLocked ? undefined : handleRegenerateMessage}
-              busy={isStreaming}
-            />
-          ))
-        )}
-        {isStreaming && (
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Loader2 className="w-3 h-3 animate-spin" />
-            <span>
-              {agentGatherStep != null && agentGatherStep > 1 && isAgent
-                ? `Gathering context… (step ${agentGatherStep - 1}/${Math.min(10, Math.max(1, settings.agentMaxIterations ?? 5)) - 1})`
-                : 'Generating…'}
-            </span>
-            <span className="animate-blink">▋</span>
+        </DialogContent>
+      </Dialog>
+
+      {/* Messages */}
+      <div className="relative flex-1 min-h-0">
+        <div ref={scrollContainerRef} className="h-full space-y-4 overflow-y-auto px-3 py-3 sm:px-5">
+          {!activeChat || activeChat.messages.length === 0 ? (
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center space-y-3">
+                <div className="text-4xl">{isAgent ? '🤖' : '💬'}</div>
+                <h2 className="text-lg font-semibold text-foreground">
+                  {isAgent ? 'Agent Mode' : 'Chat Mode'}
+                </h2>
+                <p className="text-xs text-muted-foreground max-w-sm">
+                  {isAgent
+                    ? 'Full coding agent : reads, edits, creates, and deletes files in your workspace. Open a folder to get started.'
+                    : 'Plain conversation with your local AI. Ask questions, brainstorm, or discuss code.'}
+                </p>
+              </div>
+            </div>
+          ) : (
+            activeChat.messages.map(msg => (
+              <ChatMessage
+                key={msg.id}
+                message={msg}
+                chatMode={chatMode}
+                onApplyPatch={handleApplyPatch}
+                onGetOriginal={handleGetOriginal}
+                autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
+                agentActions={agentActionsByMessageId[msg.id]}
+                onOpenFile={handleOpenEditorFile}
+                onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
+                onRegenerate={isLocked ? undefined : handleRegenerateMessage}
+                busy={isStreaming}
+              />
+            ))
+          )}
+          {isStreaming && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="w-3 h-3 animate-spin" />
+              <span>
+                {agentGatherStep != null && agentGatherStep > 1 && isAgent
+                  ? `Gathering context… (step ${agentGatherStep - 1}/${Math.min(10, Math.max(1, settings.agentMaxIterations ?? 5)) - 1})`
+                  : 'Generating…'}
+              </span>
+              <span className="animate-blink">▋</span>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {showScrollToLatest && (
+          <div className="pointer-events-none absolute bottom-3 left-0 right-0 z-10 flex justify-center px-3 sm:px-5">
+            <button
+              type="button"
+              onClick={() => scrollToBottom('smooth')}
+              className="pointer-events-auto inline-flex items-center gap-1 rounded-full border border-primary/35 bg-background/95 px-3 py-1.5 text-xs text-primary shadow-sm backdrop-blur hover:bg-background"
+            >
+              <ChevronDown className="h-3.5 w-3.5" />
+              New content below
+            </button>
           </div>
         )}
-        <div ref={messagesEndRef} />
       </div>
 
       {/* Image previews */}
@@ -1103,7 +1601,7 @@ export function ChatPane() {
               disabled={isLocked}
               placeholder={isAgent ? 'Describe what to build, fix, or change… (@ file)' : 'Ask anything…'}
               rows={2}
-              className="min-h-[48px] w-full resize-none rounded-lg border border-border/80 bg-input px-3 py-3 text-base leading-snug outline-none ring-2 ring-transparent transition-shadow placeholder:text-muted-foreground focus:border-primary/40 focus:ring-primary/30 sm:min-h-[44px] sm:py-2.5 sm:text-sm"
+              className="min-h-[56px] w-full resize-none rounded-lg border border-border/80 bg-input px-3 py-3 text-base leading-snug outline-none ring-2 ring-transparent transition-shadow placeholder:text-muted-foreground focus:border-primary/40 focus:ring-primary/30 sm:min-h-[48px] sm:py-2.5 sm:text-sm"
             />
           </div>
           {isStreaming ? (

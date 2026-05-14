@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, Navigate } from 'react-router-dom';
 import { useAuth, type AuthUser } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -197,6 +198,17 @@ function prettifyReason(value: string | null | undefined): string {
   return value.replace(/_/g, ' ');
 }
 
+function formatAuditTimestampIST(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat('en-IN', {
+    dateStyle: 'medium',
+    timeStyle: 'medium',
+    timeZone: 'Asia/Kolkata',
+    hour12: true,
+  }).format(date);
+}
+
 function auditActorLabel(log: AuditRow, metadata: AuditMetadata): string {
   const actor = metadata.actor;
   if (actor?.displayName) return actor.email ? `${actor.displayName} (${actor.email})` : actor.displayName;
@@ -333,6 +345,7 @@ export default function AdminPage() {
 
   const [groupName, setGroupName] = useState('');
   const [groupDescription, setGroupDescription] = useState('');
+  const [newGroupMemberIds, setNewGroupMemberIds] = useState<string[]>([]);
   const [addMemberGroupId, setAddMemberGroupId] = useState('');
   const [addMemberUserId, setAddMemberUserId] = useState('');
   const [addMemberRole, setAddMemberRole] = useState<'member' | 'lead'>('member');
@@ -563,6 +576,10 @@ export default function AdminPage() {
   }, [user, serverAvailable, loadUsersPicker, loadGroupsPicker]);
 
   useEffect(() => {
+    setNewGroupMemberIds((prev) => prev.filter((userId) => usersForPicker.some((userRow) => userRow.id === userId)));
+  }, [usersForPicker]);
+
+  useEffect(() => {
     if (!user || !serverAvailable || user.role !== 'admin') return;
     void loadUsers();
     void loadGroups();
@@ -634,6 +651,7 @@ export default function AdminPage() {
   const groupTotalPages = Math.max(1, Math.ceil(groupTotal / groupPageSize));
   const auditTotalPages = Math.max(1, Math.ceil(auditTotal / auditPageSize));
   const promptTotalPages = Math.max(1, Math.ceil(promptHistoryTotal / PROMPT_HISTORY_PAGE_SIZE));
+  const allNewGroupMembersSelected = usersForPicker.length > 0 && newGroupMemberIds.length === usersForPicker.length;
 
   const saveSystemPrompt = async () => {
     setPromptSaving(true);
@@ -848,14 +866,46 @@ export default function AdminPage() {
       toast.error('Could not create group');
       return;
     }
+    const newGroupId = data.group?.id;
+    const selectedMemberIds = [...new Set(newGroupMemberIds)];
+    let addedMemberCount = 0;
+    let failedMemberCount = 0;
+
+    if (newGroupId && selectedMemberIds.length > 0) {
+      const addMemberResults = await Promise.allSettled(
+        selectedMemberIds.map((userId) =>
+          fetch(`/api/groups/${newGroupId}/members`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId, roleInGroup: 'member' }),
+          }),
+        ),
+      );
+
+      for (const result of addMemberResults) {
+        if (result.status === 'fulfilled' && result.value.ok) {
+          addedMemberCount += 1;
+        } else {
+          failedMemberCount += 1;
+        }
+      }
+    }
+
     toast.success('Group created');
+    if (addedMemberCount > 0) {
+      toast.success(`Added ${addedMemberCount} member${addedMemberCount === 1 ? '' : 's'} to the new team`);
+    }
+    if (failedMemberCount > 0) {
+      toast.error(`Could not add ${failedMemberCount} member${failedMemberCount === 1 ? '' : 's'} automatically`);
+    }
     setGroupName('');
     setGroupDescription('');
-    const newGroupId = data.group?.id;
     if (newGroupId) {
       setSelectedGroupId(newGroupId);
       setAddMemberGroupId(newGroupId);
       setWsGroupId(newGroupId);
+      void loadGroupSummary(newGroupId);
     }
     void loadGroups();
     void loadGroupsPicker();
@@ -1257,23 +1307,73 @@ export default function AdminPage() {
               }}
             />
 
-            <form onSubmit={createGroup} className="flex flex-wrap gap-2 items-end border border-border rounded-md p-4">
-              <div className="space-y-1">
-                <Label>Team name</Label>
-                <Input value={groupName} onChange={(e) => setGroupName(e.target.value)} className="w-full sm:w-64 max-w-full h-9 text-xs" />
+            <form onSubmit={createGroup} className="space-y-3 border border-border rounded-md p-4">
+              <div className="flex flex-wrap gap-2 items-end">
+                <div className="space-y-1">
+                  <Label>Team name</Label>
+                  <Input value={groupName} onChange={(e) => setGroupName(e.target.value)} className="w-full sm:w-64 max-w-full h-9 text-xs" />
+                </div>
+                <div className="space-y-1 flex-1 min-w-[200px]">
+                  <Label>Description (optional)</Label>
+                  <Input
+                    value={groupDescription}
+                    onChange={(e) => setGroupDescription(e.target.value)}
+                    className="h-9 text-xs"
+                    placeholder="Short description"
+                  />
+                </div>
+                <Button type="submit" size="sm">
+                  Create group
+                </Button>
               </div>
-              <div className="space-y-1 flex-1 min-w-[200px]">
-                <Label>Description (optional)</Label>
-                <Input
-                  value={groupDescription}
-                  onChange={(e) => setGroupDescription(e.target.value)}
-                  className="h-9 text-xs"
-                  placeholder="Short description"
-                />
+
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <Label className="text-xs">Initial members (optional)</Label>
+                  <div className="flex items-center gap-3 text-xs">
+                    <label className="inline-flex items-center gap-2 cursor-pointer">
+                      <Checkbox
+                        checked={allNewGroupMembersSelected}
+                        onCheckedChange={(checked) => setNewGroupMemberIds(checked === true ? usersForPicker.map((u) => u.id) : [])}
+                      />
+                      <span>Select all</span>
+                    </label>
+                    <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => setNewGroupMemberIds([])}>
+                      Clear
+                    </Button>
+                    <span className="text-muted-foreground">{newGroupMemberIds.length} selected</span>
+                  </div>
+                </div>
+
+                {usersForPicker.length === 0 ? (
+                  <div className="rounded-md border border-border/70 px-3 py-2 text-xs text-muted-foreground">
+                    No users available to assign.
+                  </div>
+                ) : (
+                  <div className="max-h-[180px] overflow-y-auto rounded-md border border-border/70 p-2 space-y-1">
+                    {usersForPicker.map((u) => {
+                      const checked = newGroupMemberIds.includes(u.id);
+                      return (
+                        <label key={u.id} className="flex items-center gap-2 rounded px-2 py-1 text-xs hover:bg-muted/50 cursor-pointer">
+                          <Checkbox
+                            checked={checked}
+                            onCheckedChange={(nextChecked) => {
+                              setNewGroupMemberIds((prev) => {
+                                if (nextChecked === true) {
+                                  return prev.includes(u.id) ? prev : [...prev, u.id];
+                                }
+                                return prev.filter((id) => id !== u.id);
+                              });
+                            }}
+                          />
+                          <span className="min-w-0 truncate">{u.displayName}</span>
+                          <span className="min-w-0 truncate text-muted-foreground">({u.email})</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
-              <Button type="submit" size="sm">
-                Create group
-              </Button>
             </form>
 
             <div className="border border-border rounded-md overflow-hidden">
@@ -1795,7 +1895,7 @@ export default function AdminPage() {
                           <span className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${getResultBadgeClass(status)}`}>
                             {status ?? 'n/a'}
                           </span>
-                          <span className="font-mono text-muted-foreground">{log.createdAt}</span>
+                          <span className="font-mono text-muted-foreground">{formatAuditTimestampIST(log.createdAt)} IST</span>
                           <span className="font-semibold text-primary">{log.action}</span>
                         </div>
                         <div className="text-foreground break-all">

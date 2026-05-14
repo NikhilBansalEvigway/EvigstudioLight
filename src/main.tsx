@@ -1,15 +1,24 @@
 import { createRoot } from "react-dom/client";
+import { registerSW } from "virtual:pwa-register";
 import App from "./App.tsx";
 import "./index.css";
 
-// Unregister any stale service workers to ensure fresh code loads
-if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.getRegistrations().then(registrations => {
-        for (const registration of registrations) {
-            registration.unregister();
-            console.log('[EvigStudio] Unregistered stale service worker');
-        }
-    });
+if (import.meta.env.PROD && "serviceWorker" in navigator) {
+  registerSW({
+    immediate: true,
+    onOfflineReady() {
+      console.info("[EvigStudio] Offline cache ready");
+    },
+    onRegisterError(error) {
+      console.error("[EvigStudio] Service worker registration failed", error);
+    },
+  });
+} else if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.getRegistrations().then((registrations) => {
+    for (const registration of registrations) {
+      registration.unregister();
+    }
+  });
 }
 
 createRoot(document.getElementById("root")!).render(<App />);
