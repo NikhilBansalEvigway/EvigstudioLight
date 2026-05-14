@@ -1,0 +1,81 @@
+# Offline override: run EvigStudio Light fully offline.
+# UI -> API (/api/llm) -> LLM Orchestrator queue -> LM Studio
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.offline.yml up -d --build
+
+services:
+  api:
+    image: evigstudiolight-api:latest
+    # Use a dedicated env file for offline/orchestrator configuration.
+    env_file: ./server/.env.offline
+    depends_on:
+      llm-orch:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  llm-orch:
+    image: evigstudiolight-llm-orch:latest
+    build:
+      context: ./LLMOrchestrator
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3013:3013"
+    env_file:
+      - ./LLMOrchestrator/.env.offline
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PYTHONPATH=/app
+      - DATABASE_URL=sqlite+aiosqlite:////data/llm_orchestrator.db
+    volumes:
+      - llm-db-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - llm-orch
+
+  llm-orch-worker:
+    image: evigstudiolight-llm-orch-worker:latest
+    build:
+      context: ./LLMOrchestrator
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./LLMOrchestrator/.env.offline
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PYTHONPATH=/app
+      - DATABASE_URL=sqlite+aiosqlite:////data/llm_orchestrator.db
+    volumes:
+      - llm-db-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: python app/worker.py
+    depends_on:
+      redis:
+        condition: service_healthy
+      llm-orch:
+        condition: service_started
+
+  frontend:
+    image: evigstudiolight-frontend:latest
+
+volumes:
+  # Reuse existing orchestrator volume (keeps queue history/config).
+  llm-db-data:
+    external: true
+    name: evig-studio_llm-db-data

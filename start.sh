@@ -50,6 +50,14 @@ set_env_value() {
   fi
 }
 
+get_env_value() {
+  local key="$1"
+  if [[ -f "$ENV_FILE" ]]; then
+    # Keep it simple: read KEY=... from .env (no quoting rules supported).
+    sed -n "s/^${key}=//p" "$ENV_FILE" | head -n 1 || true
+  fi
+}
+
 set_compose_cmd() {
   if docker compose version >/dev/null 2>&1; then
     COMPOSE=(docker compose)
@@ -86,12 +94,24 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 SYSTEM_IP="$(detect_ip)"
-APP_URL="https://${SYSTEM_IP}"
+APP_URL="http://${SYSTEM_IP}"
 
 set_env_value "APP_HOST" "$SYSTEM_IP"
 set_env_value "APP_URL" "$APP_URL"
 set_env_value "PUBLIC_APP_URL" "$APP_URL"
-set_env_value "LM_STUDIO_URL" "http://${SYSTEM_IP}:1234"
+
+# LLM upstream configuration:
+# 1) If LM_STUDIO_URL is set in the shell when running this script, persist it.
+# 2) Else if it's already set in server/.env, keep it as-is.
+# 3) Else default to host.docker.internal (LM Studio on the host).
+if [[ -n "${LM_STUDIO_URL:-}" ]]; then
+  set_env_value "LM_STUDIO_URL" "$LM_STUDIO_URL"
+else
+  existing_lmstudio="$(get_env_value "LM_STUDIO_URL")"
+  if [[ -z "$existing_lmstudio" ]]; then
+    set_env_value "LM_STUDIO_URL" "http://host.docker.internal:1234"
+  fi
+fi
 
 COMPOSE=()
 COMPOSE_DISPLAY=''
