@@ -212,7 +212,7 @@ export function Sidebar() {
   }, [editingId]);
 
   return (
-    <div className={`flex flex-col h-full ${hasBackground ? 'bg-sidebar/78 backdrop-blur-md' : 'bg-sidebar'}`}>
+    <div className={`flex h-full min-h-0 min-w-0 flex-col overflow-hidden ${hasBackground ? 'bg-sidebar/78 backdrop-blur-md' : 'bg-sidebar'}`}>
       <div className="pane-header justify-between">
         <span>Chats</span>
         <button
@@ -267,7 +267,7 @@ export function Sidebar() {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-1.5 py-1 space-y-0.5">
+      <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-1.5 py-1 space-y-0.5">
         {filtered.length === 0 && (
           <div className="text-xs text-muted-foreground text-center py-8">
             {chats.length === 0 ? 'No chats yet' : 'No matches'}

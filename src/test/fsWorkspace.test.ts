@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE,
+  buildDownloadFilenameForUploadSave,
   buildWorkspaceTree,
   createWorkspaceFile,
+  EVIGSTUDIO_TRASH_DIR_NAME,
   getFileSystemAccessStatus,
+  getRestoreDestinationWorkspacePath,
   getUniqueWorkspaceLabel,
   resolveWorkspacePath,
   workspaceFileExists,
@@ -13,6 +16,7 @@ import {
 import type { FileNode, WorkspaceRoot } from '@/types';
 
 const originalPicker = (window as Window & { showDirectoryPicker?: unknown }).showDirectoryPicker;
+const originalSavePicker = (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker;
 const originalSecureContext = window.isSecureContext;
 
 function setPicker(value?: unknown) {
@@ -22,6 +26,17 @@ function setPicker(value?: unknown) {
   }
 
   Object.defineProperty(window, 'showDirectoryPicker', {
+    configurable: true,
+    value,
+  });
+}
+
+function setSavePicker(value?: unknown) {
+  if (value === undefined) {
+    delete (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    return;
+  }
+  Object.defineProperty(window, 'showSaveFilePicker', {
     configurable: true,
     value,
   });
@@ -137,40 +152,75 @@ function createFileHandle(node: MemoryFileNode): FileSystemFileHandle {
 afterEach(() => {
   setSecureContext(originalSecureContext);
   setPicker(originalPicker);
+  setSavePicker(originalSavePicker);
 });
 
 describe('getFileSystemAccessStatus', () => {
-  it('reports support when the directory picker exists', () => {
+  it('reports native picker when showDirectoryPicker exists on a secure page', () => {
     setSecureContext(true);
     setPicker(() => Promise.resolve(null));
+    setSavePicker(async () => ({}) as FileSystemFileHandle);
 
     expect(getFileSystemAccessStatus()).toEqual({
-      supported: true,
-      reason: 'supported',
+      workspaceUiAvailable: true,
+      nativeDirectoryPicker: true,
+      saveFilePickerAvailable: true,
+      reason: 'native-fs',
       message: null,
     });
   });
 
-  it('reports insecure-context over LAN/http when the picker is unavailable', () => {
+  it('reports insecure-context when the page is not HTTPS / localhost', () => {
     setSecureContext(false);
     setPicker(undefined);
+    setSavePicker(undefined);
 
     expect(getFileSystemAccessStatus()).toEqual({
-      supported: false,
+      workspaceUiAvailable: false,
+      nativeDirectoryPicker: false,
+      saveFilePickerAvailable: false,
       reason: 'insecure-context',
-      message: 'Workspace access over the network requires HTTPS in Chrome or Edge. Open EvigStudio via HTTPS or use localhost.',
+      message:
+        'Opening a workspace requires a secure page. Use HTTPS or open EvigStudio at localhost.',
     });
   });
 
-  it('reports unsupported browsers when secure context is available but picker is missing', () => {
+  it('allows folder upload UI when secure but showDirectoryPicker is missing (Firefox/Safari)', () => {
     setSecureContext(true);
     setPicker(undefined);
+    setSavePicker(undefined);
 
     expect(getFileSystemAccessStatus()).toEqual({
-      supported: false,
-      reason: 'unsupported-browser',
-      message: 'File System Access requires Chrome or Edge. Firefox/Safari not supported.',
+      workspaceUiAvailable: true,
+      nativeDirectoryPicker: false,
+      saveFilePickerAvailable: false,
+      reason: 'upload-folder',
+      message: null,
     });
+  });
+
+  it('reports save picker when showSaveFilePicker exists without directory picker', () => {
+    setSecureContext(true);
+    setPicker(undefined);
+    setSavePicker(async () => ({}) as FileSystemFileHandle);
+
+    expect(getFileSystemAccessStatus()).toEqual({
+      workspaceUiAvailable: true,
+      nativeDirectoryPicker: false,
+      saveFilePickerAvailable: true,
+      reason: 'upload-folder',
+      message: null,
+    });
+  });
+});
+
+describe('buildDownloadFilenameForUploadSave', () => {
+  it('builds a safe download name from root label and path', () => {
+    expect(buildDownloadFilenameForUploadSave('juice-shop', 'routes/index.ts')).toMatch(/^juice-shop__routes__index\.ts$/);
+  });
+
+  it('adds .txt when the path has no extension', () => {
+    expect(buildDownloadFilenameForUploadSave('app', 'README')).toMatch(/README\.txt$/);
   });
 });
 
@@ -209,10 +259,10 @@ describe('workspace path helpers', () => {
     );
   });
 
-  it('matches workspace roots by ordered ids before applying async tree results', () => {
+  it('matches workspace roots by id set (order-independent) before applying async tree results', () => {
     expect(workspaceRootsMatch(roots, roots)).toBe(true);
     expect(workspaceRootsMatch(roots.slice(1), roots)).toBe(false);
-    expect(workspaceRootsMatch([roots[1], roots[0]], roots)).toBe(false);
+    expect(workspaceRootsMatch([roots[1], roots[0]], roots)).toBe(true);
   });
 
   it('emits partial workspace trees while rebuilding selected roots', async () => {
@@ -315,5 +365,31 @@ describe('workspace path helpers', () => {
     };
 
     await expect(createWorkspaceFile([root], 'ghost.txt')).rejects.toThrow(STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE);
+  });
+});
+
+describe('getRestoreDestinationWorkspacePath', () => {
+  const roots: WorkspaceRoot[] = [{ id: 'r1', label: 'proj', handle: {} as FileSystemDirectoryHandle }];
+
+  it('maps a trashed path back to the original workspace path', () => {
+    const batch = '2026-01-01T00-00-00-000Z-abcdef12';
+    const trashed = `proj/${EVIGSTUDIO_TRASH_DIR_NAME}/${batch}/src/foo.ts`;
+    expect(getRestoreDestinationWorkspacePath(roots, trashed)).toBe('proj/src/foo.ts');
+  });
+
+  it('returns null for trash root, batch-only, or non-trash paths', () => {
+    expect(getRestoreDestinationWorkspacePath(roots, `proj/${EVIGSTUDIO_TRASH_DIR_NAME}`)).toBeNull();
+    expect(getRestoreDestinationWorkspacePath(roots, `proj/${EVIGSTUDIO_TRASH_DIR_NAME}/batch`)).toBeNull();
+    expect(getRestoreDestinationWorkspacePath(roots, 'proj/src/foo.ts')).toBeNull();
+  });
+
+  it('returns null for invalid paths', () => {
+    expect(getRestoreDestinationWorkspacePath(roots, 'nope/foo')).toBeNull();
+  });
+
+  it('works with single-root unprefixed workspace paths', () => {
+    const one = [{ id: 'r1', label: 'solo', handle: {} as FileSystemDirectoryHandle }];
+    const trashed = `${EVIGSTUDIO_TRASH_DIR_NAME}/batch-1/a/b.txt`;
+    expect(getRestoreDestinationWorkspacePath(one, trashed)).toBe('solo/a/b.txt');
   });
 });

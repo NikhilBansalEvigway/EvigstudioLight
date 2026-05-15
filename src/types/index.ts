@@ -59,6 +59,8 @@ export interface Chat {
   tags?: string[];
   /** Point-in-time copies of the conversation for local history. */
   versionHistory?: ChatVersionSnapshot[];
+  /** Team server: last persisted workspace snapshot (recovery). */
+  workspaceSession?: WorkspaceSessionServerSnapshot | null;
 }
 
 export function normalizeChat(
@@ -84,6 +86,7 @@ export function normalizeChat(
     threadTitle: raw.threadTitle ?? null,
     tags: Array.isArray(raw.tags) ? raw.tags : [],
     versionHistory: Array.isArray(raw.versionHistory) ? raw.versionHistory : [],
+    ...(raw.workspaceSession !== undefined ? { workspaceSession: raw.workspaceSession } : {}),
   };
 }
 
@@ -110,7 +113,24 @@ export interface FileNode {
 export interface WorkspaceRoot {
   id: string;
   label: string;
-  handle: FileSystemDirectoryHandle;
+  /** Native File System Access directory handle when available. Null when the folder was loaded via upload or drag-and-drop. */
+  handle: FileSystemDirectoryHandle | null;
+  /** Folder upload / drag-and-drop (Firefox, Safari): relative path → original file snapshot. */
+  uploadedFiles?: Map<string, File>;
+  /** Edited or newly created files for upload-backed workspaces (relative path → UTF-8 text). */
+  contentOverlay?: Map<string, string>;
+  /** Empty directories created under upload-backed workspaces. */
+  virtualEmptyDirs?: Set<string>;
+  /**
+   * Folder-upload only: optional linked on-disk file per relative path (via Save / showSaveFilePicker).
+   * Lets Firefox and similar browsers write edits to a real file without showDirectoryPicker.
+   */
+  diskFileHandles?: Map<string, FileSystemFileHandle>;
+  /**
+   * Folder-upload only: optional directory handle for the real project folder on disk (e.g. your checkout).
+   * When set, Save writes each relative path under this folder (no per-file Save As).
+   */
+  diskDirectoryHandle?: FileSystemDirectoryHandle | null;
 }
 
 export interface PersistedWorkspaceRoot {
@@ -118,12 +138,46 @@ export interface PersistedWorkspaceRoot {
   label: string;
   /** Stored in IndexedDB when supported; may be null if persistence is unavailable. */
   handle: FileSystemDirectoryHandle | null;
+  /** Folder-upload workspace — persisted via IndexedDB structured clone (path → File snapshot). */
+  uploadedFilesEntries?: Array<[string, File]>;
+  contentOverlayEntries?: Array<[string, string]>;
+  virtualEmptyDirs?: string[];
+  /** Upload-backed: persisted file handles when IndexedDB supports cloning them. */
+  diskFileHandleEntries?: Array<[string, FileSystemFileHandle]>;
+  /** Upload-backed: persisted directory handle for mirroring saves to a real folder. */
+  diskDirectoryHandle?: FileSystemDirectoryHandle | null;
 }
 
 export interface WorkspaceSession {
   chatId: string;
   updatedAt: number;
   workspaceRoots: PersistedWorkspaceRoot[];
+  openEditorTabs: Array<{
+    path: string;
+    content: string;
+    savedContent: string;
+  }>;
+  activeFilePath: string | null;
+  contextFiles: string[];
+}
+
+/**
+ * Serializable workspace state stored on the team server (Postgres).
+ * Omits browser handles and File blobs; used for recovery after errors or fresh browsers.
+ */
+export interface WorkspaceRootServerSummary {
+  id: string;
+  label: string;
+  source: 'native' | 'upload';
+  /** Upload-backed workspace: relative paths only (no file bytes on server). */
+  uploadedPaths?: string[];
+  contentOverlayKeys?: string[];
+  virtualEmptyDirs?: string[];
+}
+
+export interface WorkspaceSessionServerSnapshot {
+  updatedAt: number;
+  workspaceRoots: WorkspaceRootServerSummary[];
   openEditorTabs: Array<{
     path: string;
     content: string;

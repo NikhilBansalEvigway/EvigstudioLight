@@ -1,3 +1,8 @@
+# Build and run (needs Docker + this repo). Database and API env are inlined so server/.env is optional.
+# Offline / LAN: use docker-compose.offline.yml — same images and build definitions; either `docker load`
+# from a tar or `docker compose -f docker-compose.offline.yml build` from this checkout, then `up -d`.
+# Export bundle: scripts/docker-export-offline-bundle.ps1
+
 services:
 
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
@@ -20,22 +25,35 @@ services:
 
   # ── Node / Hono API ─────────────────────────────────────────────────────────
   api:
+    image: evigstudiolight-api:latest
     build:
       context: ./server
       dockerfile: Dockerfile
     restart: unless-stopped
-    env_file: ./server/.env
     environment:
       DATABASE_URL: postgresql://evigstudio:evigstudio@db:5432/evigstudio
       NODE_ENV: production
+      PORT: "3001"
+      # Must be >= 16 characters (see server/src/auth/jwt.ts). Override for anything beyond local demo.
+      JWT_SECRET: evigstudio-offline-demo-change-for-any-real-use-min-16
+      # LLM proxy: LM Studio on the host (Docker Desktop: host.docker.internal).
+      LLM_PROVIDER: lmstudio
+      LM_STUDIO_URL: http://host.docker.internal:1234
+      LLM_ORCHESTRATOR_URL: http://host.docker.internal:4000
+      LLM_REQUIRE_AUTH: "false"
+      # Firefox / Safari: mirror each Save to a host folder (bind-mount your repo). See server/.env.example.
+      # LOCAL_WORKSPACE_MIRROR_ROOT: /workspace/mirror
+      # LOCAL_WORKSPACE_MIRROR_TOKEN: "change-me"
     depends_on:
       db:
         condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+ 
   # ── Nginx + React frontend (HTTPS) ──────────────────────────────────────────
   frontend:
+    image: evigstudiolight-frontend:latest
     build:
       context: .
       dockerfile: src/Dockerfile
@@ -45,6 +63,7 @@ services:
       - "443:443"
     depends_on:
       - api
+
 
 networks:
   default:

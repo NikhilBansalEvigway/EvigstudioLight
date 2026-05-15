@@ -1,4 +1,4 @@
-import { useDeferredValue, useState, useCallback } from 'react';
+import { useDeferredValue, useMemo, useState, useCallback } from 'react';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -23,6 +23,7 @@ import {
   BookOpen,
   Braces,
   ChevronDown,
+  Link2,
   ChevronRight,
   File,
   FileCode2,
@@ -32,7 +33,9 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  FolderSync,
   Pencil,
+  RotateCcw,
   Search,
   Sparkles,
   Terminal,
@@ -46,11 +49,14 @@ import {
   createWorkspaceFile,
   deleteWorkspacePath,
   trashWorkspacePath,
+  EVIGSTUDIO_TRASH_DIR_NAME,
   getFileExtension,
+  isNativeDiskStubRoot,
   readWorkspaceFile,
   removeWorkspaceRootFromTree,
   renameWorkspacePath,
   workspaceRootsMatch,
+  getRestoreDestinationWorkspacePath,
 } from '@/lib/fsWorkspace';
 import {
   buildActiveDocumentAudit,
@@ -60,7 +66,8 @@ import {
   workspaceFolderLabels,
 } from '@/lib/auditClient';
 import { useAppStore } from '@/store/useAppStore';
-import type { FileNode } from '@/types';
+import { isUploadBackedWorkspaceRoot } from '@/lib/uploadedWorkspace';
+import type { FileNode, WorkspaceRoot } from '@/types';
 import { toast } from 'sonner';
 
 type TreeStats = {
@@ -119,12 +126,24 @@ function resolveRenamePath(currentPath: string, nextValue: string): string {
   return parts.join('/');
 }
 
+/** Label shown in the tree for the soft-delete folder (real name is `.evigstudio-trash`). */
+function fileTreeNodeDisplayName(node: Pick<FileNode, 'name' | 'type'>): string {
+  if (node.type === 'directory' && node.name === EVIGSTUDIO_TRASH_DIR_NAME) {
+    return 'Trash';
+  }
+  return node.name;
+}
+
 function filterTree(nodes: FileNode[], query: string): FileNode[] {
   const q = query.trim().toLowerCase();
   if (!q) return nodes;
 
   const filterNode = (node: FileNode): FileNode | null => {
-    const selfMatches = node.name.toLowerCase().includes(q) || node.path.toLowerCase().includes(q);
+    const label = fileTreeNodeDisplayName(node);
+    const selfMatches =
+      label.toLowerCase().includes(q) ||
+      node.name.toLowerCase().includes(q) ||
+      node.path.toLowerCase().includes(q);
 
     if (node.type === 'file') {
       return selfMatches ? node : null;
@@ -201,7 +220,23 @@ function getFileVisual(name: string): { Icon: LucideIcon; iconClassName: string;
   };
 }
 
-export function FileTree() {
+type FileTreeProps = {
+  /** When set, empty-state area accepts drag-and-drop of a folder (same as Open Folder / webkitdirectory). */
+  onFolderDropped?: (files: File[]) => void | Promise<void>;
+  /** File System Access only — reconnect a native root whose handle was lost after reload. */
+  onReconnectNativeRoot?: (rootId: string) => void | Promise<void>;
+  /** Upload-backed root: pick the real project directory so Save mirrors files there. */
+  onLinkUploadRootDisk?: (rootId: string) => void | Promise<void>;
+  /** False when the browser cannot run showDirectoryPicker (Link disk unavailable; Open folder still uses the file picker). */
+  linkDiskPickerAvailable?: boolean;
+};
+
+export function FileTree({
+  onFolderDropped,
+  onReconnectNativeRoot,
+  onLinkUploadRootDisk,
+  linkDiskPickerAvailable = false,
+}: FileTreeProps) {
     const {
       activeChatId,
       activeFilePath,
@@ -229,6 +264,19 @@ export function FileTree() {
 
   const deferredQuery = useDeferredValue(searchQuery);
   const filteredTree = filterTree(fileTree, deferredQuery);
+  const nativeStubRootIds = useMemo(
+    () => new Set(workspaceRoots.filter((r) => isNativeDiskStubRoot(r)).map((r) => r.id)),
+    [workspaceRoots],
+  );
+  const uploadRootIdsNeedingDiskLink = useMemo(
+    () =>
+      new Set(
+        workspaceRoots
+          .filter((r) => isUploadBackedWorkspaceRoot(r) && !r.diskDirectoryHandle)
+          .map((r) => r.id),
+      ),
+    [workspaceRoots],
+  );
   const totalStats = countTreeStats(fileTree);
   const filteredStats = countTreeStats(filteredTree);
   const searching = deferredQuery.trim().length > 0;
@@ -240,6 +288,10 @@ export function FileTree() {
   const affectedOpenTabs = deleteTarget ? openEditorTabs.filter((tab) => deleteMatchesPath(tab.path)) : [];
   const affectedDirtyTabs = affectedOpenTabs.filter((tab) => tab.content !== tab.savedContent);
   const affectedContextFiles = deleteTarget ? contextFiles.filter((path) => deleteMatchesPath(path)) : [];
+  const deleteTargetRestoreDest =
+    deleteTarget && !deleteTarget.isWorkspaceRoot
+      ? getRestoreDestinationWorkspacePath(workspaceRoots, deleteTarget.path)
+      : null;
 
   const handleFileClick = useCallback(
     async (node: FileNode) => {
@@ -460,6 +512,35 @@ export function FileTree() {
     setRenameName(node.name);
   }, []);
 
+  const handleRestoreFromTrash = useCallback(
+    async (node: FileNode) => {
+      if (workspaceRoots.length === 0) return;
+      const dest = getRestoreDestinationWorkspacePath(workspaceRoots, node.path);
+      if (!dest) {
+        toast.error('Open an item inside Trash (not the Trash folder itself) to restore it.');
+        return;
+      }
+      try {
+        await renameWorkspacePath(workspaceRoots, node.path, dest);
+        renameWorkspacePathReferences(node.path, dest);
+        if (node.type === 'file' && activeFilePath === node.path) {
+          const content = await readWorkspaceFile(workspaceRoots, dest);
+          setActiveFile(dest, content);
+        }
+        await refreshTree();
+        const short = dest.includes('/') ? dest.slice(dest.indexOf('/') + 1) : dest;
+        toast.success(`Restored to ${short}`);
+        const sid = useAppStore.getState().activeChatId;
+        if (sid) void useAppStore.getState().persistWorkspaceSession(sid, true);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('Restore from Trash failed:', err);
+        toast.error(`Restore failed: ${msg}`);
+      }
+    },
+    [workspaceRoots, renameWorkspacePathReferences, setActiveFile, refreshTree, activeFilePath],
+  );
+
   if (fileTree.length === 0) {
     if (workspaceRoots.length > 0) {
       return (
@@ -488,13 +569,39 @@ export function FileTree() {
 
     return (
       <div className="flex h-full items-center justify-center p-4 text-center">
-        <div className="w-full max-w-[240px] rounded-2xl border border-dashed border-border/70 bg-gradient-to-b from-card via-card to-muted/30 px-5 py-7 shadow-[inset_0_1px_0_hsl(var(--background)/0.9)]">
+        <div
+          className={`w-full max-w-[280px] rounded-2xl border border-dashed px-5 py-7 shadow-[inset_0_1px_0_hsl(var(--background)/0.9)] transition-colors ${
+            onFolderDropped
+              ? 'border-primary/35 bg-gradient-to-b from-primary/5 via-card to-muted/30'
+              : 'border-border/70 bg-gradient-to-b from-card via-card to-muted/30'
+          }`}
+          onDragOver={
+            onFolderDropped
+              ? (e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }
+              : undefined
+          }
+          onDrop={
+            onFolderDropped
+              ? (e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const fl = e.dataTransfer.files;
+                  if (!fl?.length) return;
+                  void onFolderDropped([...fl]);
+                }
+              : undefined
+          }
+        >
           <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl border border-primary/15 bg-primary/8 text-primary shadow-sm">
             <Folder className="h-6 w-6 opacity-90" />
           </div>
           <p className="text-sm font-semibold text-foreground">No workspace open</p>
           <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-               Open one or more folders to search files, browse the tree, and jump into the editor.
+            <strong className="text-foreground">Open Folder</strong>
+            {onFolderDropped ? ' or drag a folder here.' : ' to load files.'}
           </p>
         </div>
       </div>
@@ -581,6 +688,7 @@ export function FileTree() {
                 key={node.path}
                 node={node}
                 depth={0}
+                workspaceRoots={workspaceRoots}
                 searchQuery={deferredQuery}
                 forceExpanded={searching}
                 activeFilePath={activeFilePath}
@@ -590,6 +698,12 @@ export function FileTree() {
                 onDelete={setDeleteTarget}
                 onRename={openRename}
                 onCreate={openCreate}
+                onRestoreFromTrash={handleRestoreFromTrash}
+                nativeStubRootIds={nativeStubRootIds}
+                onReconnectNativeRoot={onReconnectNativeRoot}
+                uploadRootIdsNeedingDiskLink={uploadRootIdsNeedingDiskLink}
+                onLinkUploadRootDisk={onLinkUploadRootDisk}
+                linkDiskPickerAvailable={linkDiskPickerAvailable}
               />
             ))
           )}
@@ -602,12 +716,18 @@ export function FileTree() {
             <AlertDialogTitle>
               {deleteTarget?.isWorkspaceRoot
                 ? 'Remove folder from workspace'
-                : `Delete ${deleteTarget?.type === 'directory' ? 'folder' : 'file'}`}
+                : deleteTargetRestoreDest
+                  ? `Remove from Trash: ${deleteTarget?.type === 'directory' ? 'folder' : 'file'}`
+                  : `Delete ${deleteTarget?.type === 'directory' ? 'folder' : 'file'}`}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {deleteTarget?.isWorkspaceRoot ? (
                 <span>
                   Remove <strong>{deleteTarget?.name}</strong> from this workspace? Files stay on disk.
+                </span>
+              ) : deleteTargetRestoreDest ? (
+                <span>
+                  This item is in Trash. Restore it to <strong>{deleteTargetRestoreDest.includes('/') ? deleteTargetRestoreDest.slice(deleteTargetRestoreDest.indexOf('/') + 1) : deleteTargetRestoreDest}</strong>, or delete it permanently.
                 </span>
               ) : (
                 <span>
@@ -642,6 +762,24 @@ export function FileTree() {
               <AlertDialogAction onClick={() => handleDelete('trash')}>
                 Remove
               </AlertDialogAction>
+            ) : deleteTargetRestoreDest ? (
+              <>
+                <AlertDialogAction
+                  onClick={() => {
+                    const t = deleteTarget;
+                    setDeleteTarget(null);
+                    if (t) void handleRestoreFromTrash(t);
+                  }}
+                >
+                  Restore
+                </AlertDialogAction>
+                <AlertDialogAction
+                  onClick={() => handleDelete('delete')}
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                >
+                  Delete permanently
+                </AlertDialogAction>
+              </>
             ) : (
               <>
                 <AlertDialogAction
@@ -714,6 +852,7 @@ export function FileTree() {
 function TreeNode({
   node,
   depth,
+  workspaceRoots,
   searchQuery,
   forceExpanded,
   activeFilePath,
@@ -723,9 +862,16 @@ function TreeNode({
   onDelete,
   onRename,
   onCreate,
+  onRestoreFromTrash,
+  nativeStubRootIds,
+  onReconnectNativeRoot,
+  uploadRootIdsNeedingDiskLink,
+  onLinkUploadRootDisk,
+  linkDiskPickerAvailable,
 }: {
   node: FileNode;
   depth: number;
+  workspaceRoots: WorkspaceRoot[];
   searchQuery: string;
   forceExpanded: boolean;
   activeFilePath: string | null;
@@ -735,7 +881,14 @@ function TreeNode({
   onDelete: (n: FileNode) => void;
   onRename: (n: FileNode) => void;
   onCreate: (type: 'file' | 'folder', parentPath: string) => void;
+  onRestoreFromTrash: (n: FileNode) => void | Promise<void>;
+  nativeStubRootIds: Set<string>;
+  onReconnectNativeRoot?: (rootId: string) => void | Promise<void>;
+  uploadRootIdsNeedingDiskLink: Set<string>;
+  onLinkUploadRootDisk?: (rootId: string) => void | Promise<void>;
+  linkDiskPickerAvailable: boolean;
 }) {
+  const trashRestoreDest = getRestoreDestinationWorkspacePath(workspaceRoots, node.path);
   const [expanded, setExpanded] = useState(depth < 1);
   const isContext = contextFiles.includes(node.path);
   const isActive = activeFilePath === node.path;
@@ -759,13 +912,53 @@ function TreeNode({
             <span className={`rounded-lg p-1 ${isExpanded ? 'bg-primary/12 text-primary' : 'bg-secondary/60 text-muted-foreground'}`}>
               {isExpanded ? <FolderOpen className="h-3.5 w-3.5" /> : <Folder className="h-3.5 w-3.5" />}
             </span>
-            <span className="min-w-0 truncate font-medium text-foreground">{highlightLabel(node.name, searchQuery)}</span>
+            <span className="min-w-0 truncate font-medium text-foreground">
+              {highlightLabel(fileTreeNodeDisplayName(node), searchQuery)}
+            </span>
+            {node.name === EVIGSTUDIO_TRASH_DIR_NAME && node.type === 'directory' && (
+              <span className="shrink-0 text-[9px] font-normal text-muted-foreground">(recoverable)</span>
+            )}
             {isWorkspaceRoot && (
               <span className="rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-primary">
                 Workspace
               </span>
             )}
           </button>
+          {isWorkspaceRoot &&
+            node.workspaceRootId &&
+            nativeStubRootIds.has(node.workspaceRootId) &&
+            onReconnectNativeRoot && (
+              <button
+                type="button"
+                onClick={() => void onReconnectNativeRoot(node.workspaceRootId!)}
+                className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-warning/35 bg-warning/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-warning transition-colors hover:bg-warning/15"
+                title="Choose this folder on disk again — then Save writes files there"
+              >
+                <Link2 className="h-3 w-3" />
+                Connect
+              </button>
+            )}
+          {isWorkspaceRoot &&
+            node.workspaceRootId &&
+            uploadRootIdsNeedingDiskLink.has(node.workspaceRootId) &&
+            (linkDiskPickerAvailable && onLinkUploadRootDisk ? (
+              <button
+                type="button"
+                onClick={() => void onLinkUploadRootDisk(node.workspaceRootId!)}
+                className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-accent/35 bg-accent/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-accent transition-colors hover:bg-accent/15"
+                title="Pick your real project folder on disk (e.g. juice-shop). Save then writes files there in real time."
+              >
+                <FolderSync className="h-3 w-3" />
+                Link disk
+              </button>
+            ) : (
+              <span
+                className="inline-flex shrink-0 cursor-help items-center gap-1 rounded-md border border-border/60 bg-muted/20 px-1.5 py-0.5 text-[9px] font-medium tracking-wide text-muted-foreground"
+                title="This browser has no writable folder picker for a whole project. Edits stay in the page; Save may use Save-as or a download. For disk sync use server mirror (LOCAL_WORKSPACE_MIRROR_ROOT), or Save ZIP. In Chrome or Edge, Link disk appears here."
+              >
+                No disk link
+              </span>
+            ))}
           <div className="flex items-center gap-0.5 pr-1 opacity-0 transition-all group-hover:opacity-100">
             <button
               type="button"
@@ -793,6 +986,16 @@ function TreeNode({
                 <Pencil className="h-3 w-3" />
               </button>
             )}
+            {trashRestoreDest && (
+              <button
+                type="button"
+                onClick={() => void onRestoreFromTrash(node)}
+                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-primary"
+                title="Restore to original location"
+              >
+                <RotateCcw className="h-3 w-3" />
+              </button>
+            )}
             <button
               type="button"
               onClick={() => onDelete(node)}
@@ -809,6 +1012,7 @@ function TreeNode({
               key={child.path}
               node={child}
               depth={depth + 1}
+              workspaceRoots={workspaceRoots}
               searchQuery={searchQuery}
               forceExpanded={forceExpanded}
               activeFilePath={activeFilePath}
@@ -818,6 +1022,12 @@ function TreeNode({
               onDelete={onDelete}
               onRename={onRename}
               onCreate={onCreate}
+              onRestoreFromTrash={onRestoreFromTrash}
+              nativeStubRootIds={nativeStubRootIds}
+              onReconnectNativeRoot={onReconnectNativeRoot}
+              uploadRootIdsNeedingDiskLink={uploadRootIdsNeedingDiskLink}
+              onLinkUploadRootDisk={onLinkUploadRootDisk}
+              linkDiskPickerAvailable={linkDiskPickerAvailable}
             />
           ))}
       </div>
@@ -877,6 +1087,19 @@ function TreeNode({
           >
             <Pencil className="h-3 w-3" />
           </button>
+          {trashRestoreDest && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                void onRestoreFromTrash(node);
+              }}
+              className="rounded-md p-1 text-muted-foreground opacity-0 transition-all group-hover:opacity-100 hover:bg-secondary hover:text-primary"
+              title="Restore to original location"
+            >
+              <RotateCcw className="h-3 w-3" />
+            </button>
+          )}
           <button
             type="button"
             onClick={(e) => {

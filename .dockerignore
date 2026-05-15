@@ -1,0 +1,12 @@
+node_modules
+dist
+electron-dist
+.git
+.cursor
+.vscode
+coverage
+**/*.md
+*.sql
+evigstudio-images*.tar
+.env
+.env.*

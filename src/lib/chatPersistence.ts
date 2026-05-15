@@ -1,5 +1,12 @@
 import { toast } from 'sonner';
-import type { Chat, ChatAccess, ChatPrivacy, ChatVersionSnapshot } from '@/types';
+import { randomId } from '@/lib/randomId';
+import type {
+  Chat,
+  ChatAccess,
+  ChatPrivacy,
+  ChatVersionSnapshot,
+  WorkspaceSessionServerSnapshot,
+} from '@/types';
 import { normalizeChat } from '@/types';
 import { loadChats, saveChat, deleteChat as deleteChatIdb } from '@/lib/storage';
 
@@ -32,6 +39,7 @@ function mapServerRow(row: {
   threadTitle?: string | null;
   tags?: string[];
   versionHistory?: ChatVersionSnapshot[];
+  workspaceSession?: WorkspaceSessionServerSnapshot | null;
 }): Chat {
   return normalizeChat({
     id: row.id,
@@ -49,7 +57,43 @@ function mapServerRow(row: {
     threadTitle: row.threadTitle ?? null,
     tags: row.tags,
     versionHistory: row.versionHistory,
+    ...(row.workspaceSession !== undefined ? { workspaceSession: row.workspaceSession } : {}),
   });
+}
+
+/** Persist workspace snapshot to Postgres (no-op in browser-only `idb` mode). */
+export async function persistenceSaveWorkspaceSession(
+  chatId: string,
+  snapshot: WorkspaceSessionServerSnapshot,
+): Promise<void> {
+  if (mode === 'idb') return;
+  const r = await fetch(`/api/chats/${chatId}/workspace-session`, {
+    method: 'PATCH',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(snapshot),
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(t || 'Failed to save workspace session');
+  }
+}
+
+/** Load workspace snapshot from Postgres for recovery when IndexedDB is empty. */
+export async function persistenceLoadWorkspaceSessionFromServer(
+  chatId: string,
+): Promise<WorkspaceSessionServerSnapshot | null> {
+  if (mode === 'idb') return null;
+  try {
+    const r = await fetch(`/api/chats/${chatId}/workspace-session`, {
+      credentials: 'include',
+    });
+    if (!r.ok) return null;
+    const data = (await r.json()) as { workspaceSession: WorkspaceSessionServerSnapshot | null };
+    return data.workspaceSession ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export async function persistenceLoadChats(): Promise<Chat[]> {
@@ -120,7 +164,7 @@ export async function persistenceDeleteChat(id: string): Promise<void> {
 }
 
 async function createChatInIdb(): Promise<Chat> {
-  const id = crypto.randomUUID();
+  const id = randomId();
   const chat: Chat = normalizeChat({
     id,
     title: 'New Chat',

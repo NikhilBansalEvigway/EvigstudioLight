@@ -7,6 +7,7 @@ import type {
   ChatVersionSnapshot,
   FileNode,
   Message,
+  PersistedWorkspaceRoot,
   WorkspaceRoot,
 } from '@/types';
 import {
@@ -16,17 +17,32 @@ import {
   normalizeChat,
   normalizeMaxTokens,
 } from '@/types';
-import { loadSettings, saveSettings } from '@/lib/storage';
-import { loadWorkspaceSession, saveWorkspaceSession, deleteWorkspaceSession } from '@/lib/storage';
+import {
+  deleteWorkspaceSession,
+  loadSettings,
+  loadWorkspaceSession,
+  saveSettings,
+  saveWorkspaceSession,
+} from '@/lib/storage';
+import { isUploadBackedWorkspaceRoot } from '@/lib/uploadedWorkspace';
 import { buildWorkspaceTree } from '@/lib/fsWorkspace';
+import { mapEntriesAsync, yieldToMain } from '@/lib/yieldToMain';
 import {
   getChatPersistenceMode,
   persistenceCreateChat,
   persistenceDeleteChat,
   persistenceLoadChat,
   persistenceLoadChats,
+  persistenceLoadWorkspaceSessionFromServer,
   persistenceSaveChat,
+  persistenceSaveWorkspaceSession,
 } from '@/lib/chatPersistence';
+import {
+  buildWorkspaceSessionServerSnapshot,
+  workspaceSessionFromServerSnapshot,
+} from '@/lib/workspaceSessionServer';
+import { readLastActiveChatId, writeLastActiveChatId } from '@/lib/lastActiveChat';
+import { randomId } from '@/lib/randomId';
 
 export interface EditorTab {
   path: string;
@@ -68,6 +84,13 @@ interface AppState {
   setWorkspaceRoots: (roots: WorkspaceRoot[]) => void;
   addWorkspaceRoot: (root: WorkspaceRoot) => void;
   removeWorkspaceRoot: (rootId: string) => void;
+  /** Re-attach a directory handle after reload (File System Access). */
+  reconnectWorkspaceRootHandle: (rootId: string, handle: FileSystemDirectoryHandle) => void;
+  /**
+   * Upload-backed root only: point at the real project directory on disk so Save mirrors paths
+   * (e.g. `login.html` under the folder you pick for `juice-shop`).
+   */
+  linkUploadRootDiskDirectory: (rootId: string, dirHandle: FileSystemDirectoryHandle) => void;
   clearWorkspace: () => void;
   workspaceHandle: FileSystemDirectoryHandle | null;
   setWorkspaceHandle: (h: FileSystemDirectoryHandle | null) => void;
@@ -80,7 +103,7 @@ interface AppState {
 
   // Workspace session (per chat, local)
   hydrateWorkspaceSession: (chatId: string) => Promise<void>;
-  persistWorkspaceSession: (chatId: string) => Promise<void>;
+  persistWorkspaceSession: (chatId: string, urgent?: boolean) => Promise<void>;
 
   // Editor
   openEditorTabs: EditorTab[];
@@ -88,6 +111,10 @@ interface AppState {
   activeFileContent: string;
   /** Bumps whenever editor/workspace session changes (used for autosave). */
   workspaceSessionRevision: number;
+  /** True while loading per-chat workspace state from IndexedDB — suppresses persist to avoid wiping session. */
+  workspaceSessionHydrating: boolean;
+  /** Persist linked upload disk file handles (showSaveFilePicker) to IndexedDB. */
+  bumpWorkspaceSessionRevision: () => void;
   setActiveFile: (path: string | null, content: string) => void;
   setActiveEditorFile: (path: string) => void;
   setActiveFileContent: (content: string) => void;
@@ -100,8 +127,8 @@ interface AppState {
   // UI
   showSettings: boolean;
   setShowSettings: (v: boolean) => void;
-  rightPaneTab: 'files' | 'editor' | 'context' | 'prompt';
-  setRightPaneTab: (t: 'files' | 'editor' | 'context' | 'prompt') => void;
+  rightPaneTab: 'files' | 'editor' | 'changes' | 'context' | 'prompt';
+  setRightPaneTab: (t: 'files' | 'editor' | 'changes' | 'context' | 'prompt') => void;
   showSidebar: boolean;
   setShowSidebar: (v: boolean) => void;
   showRightPane: boolean;
@@ -151,21 +178,29 @@ export const useAppStore = create<AppState>((set, get) => ({
       chats.sort((a, b) => b.updatedAt - a.updatedAt);
       set({ chats });
       if (chats.length > 0) {
-        set({ activeChatId: chats[0].id });
-        void get().hydrateWorkspaceSession(chats[0].id);
+        const preferred = readLastActiveChatId();
+        const pick =
+          (preferred && chats.some((c) => c.id === preferred) ? preferred : null) ?? chats[0].id;
+        writeLastActiveChatId(pick);
+        set({ activeChatId: pick, workspaceSessionHydrating: true });
+        await get().hydrateWorkspaceSession(pick);
       }
       if (getChatPersistenceMode() === 'server' && chats.length > 0) {
-        void get().refreshChat(chats[0].id);
+        const id = get().activeChatId;
+        if (id) void get().refreshChat(id);
       }
     } catch (e) {
       console.error('[EvigStudio] initChats failed', e);
+      writeLastActiveChatId(null);
       set({ chats: [], activeChatId: null });
     }
   },
-  resetChats: () =>
+  resetChats: () => {
+    writeLastActiveChatId(null);
     set({
       chats: [],
       activeChatId: null,
+      workspaceSessionHydrating: false,
       workspaceRoots: [],
       workspaceHandle: null,
       fileTree: [],
@@ -173,7 +208,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       openEditorTabs: [],
       activeFilePath: null,
       activeFileContent: '',
-    }),
+    });
+  },
   createChat: async () => {
     const prevActive = get().activeChatId;
     const modeBefore = getChatPersistenceMode();
@@ -187,22 +223,25 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (prevActive && prevActive !== chat.id) {
           void get().persistWorkspaceSession(prevActive);
         }
-        set((s) => ({ chats: [chat, ...s.chats], activeChatId: chat.id }));
-        void get().hydrateWorkspaceSession(chat.id);
+        set((s) => ({ chats: [chat, ...s.chats], activeChatId: chat.id, workspaceSessionHydrating: true }));
+        writeLastActiveChatId(chat.id);
+        await get().hydrateWorkspaceSession(chat.id);
         return chat.id;
       }
       if (prevActive && prevActive !== chat.id) {
         void get().persistWorkspaceSession(prevActive);
       }
-      set({ activeChatId: chat.id });
-      void get().hydrateWorkspaceSession(chat.id);
+      set({ activeChatId: chat.id, workspaceSessionHydrating: true });
+      writeLastActiveChatId(chat.id);
+      await get().hydrateWorkspaceSession(chat.id);
       return chat.id;
     }
     if (prevActive && prevActive !== chat.id) {
       void get().persistWorkspaceSession(prevActive);
     }
-    set((s) => ({ chats: [chat, ...s.chats], activeChatId: chat.id }));
-    void get().hydrateWorkspaceSession(chat.id);
+    set((s) => ({ chats: [chat, ...s.chats], activeChatId: chat.id, workspaceSessionHydrating: true }));
+    writeLastActiveChatId(chat.id);
+    await get().hydrateWorkspaceSession(chat.id);
     return chat.id;
   },
   refreshChat: async (id) => {
@@ -226,7 +265,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (prev && prev !== id) {
       void get().persistWorkspaceSession(prev);
     }
-    set({ activeChatId: id });
+    writeLastActiveChatId(id);
+    set({ activeChatId: id, workspaceSessionHydrating: true });
     void get().hydrateWorkspaceSession(id);
     if (getChatPersistenceMode() === 'server') {
       void get().refreshChat(id);
@@ -248,9 +288,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       set((s) => ({
         chats: s.chats.filter((c) => c.id !== id),
         activeChatId: nextActive,
+        ...(nextActive ? { workspaceSessionHydrating: true as const } : {}),
       }));
 
       if (prevActive === id) {
+        writeLastActiveChatId(nextActive);
         if (nextActive) {
           void get().hydrateWorkspaceSession(nextActive);
         } else {
@@ -357,7 +399,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (c.id !== chatId) return c;
         if (!canWriteChat(c)) return c;
         const snap: ChatVersionSnapshot = {
-          id: crypto.randomUUID(),
+          id: randomId(),
           savedAt: Date.now(),
           label,
           title: c.title,
@@ -397,16 +439,18 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   workspaceRoots: [],
   setWorkspaceRoots: (roots) =>
-    set({
+    set((s) => ({
       workspaceRoots: roots,
       workspaceHandle: roots[0]?.handle ?? null,
-    }),
+      workspaceSessionRevision: s.workspaceSessionRevision + 1,
+    })),
   addWorkspaceRoot: (root) =>
     set((s) => {
       const workspaceRoots = [...s.workspaceRoots, root];
       return {
         workspaceRoots,
         workspaceHandle: workspaceRoots[0]?.handle ?? null,
+        workspaceSessionRevision: s.workspaceSessionRevision + 1,
       };
     }),
   removeWorkspaceRoot: (rootId) =>
@@ -415,10 +459,34 @@ export const useAppStore = create<AppState>((set, get) => ({
       return {
         workspaceRoots,
         workspaceHandle: workspaceRoots[0]?.handle ?? null,
+        workspaceSessionRevision: s.workspaceSessionRevision + 1,
+      };
+    }),
+  reconnectWorkspaceRootHandle: (rootId, handle) =>
+    set((s) => {
+      const workspaceRoots = s.workspaceRoots.map((root) =>
+        root.id === rootId ? { ...root, handle } : root,
+      );
+      return {
+        workspaceRoots,
+        workspaceHandle: workspaceRoots[0]?.handle ?? null,
+        workspaceSessionRevision: s.workspaceSessionRevision + 1,
+      };
+    }),
+  linkUploadRootDiskDirectory: (rootId, dirHandle) =>
+    set((s) => {
+      const workspaceRoots = s.workspaceRoots.map((root) =>
+        root.id === rootId && isUploadBackedWorkspaceRoot(root)
+          ? { ...root, diskDirectoryHandle: dirHandle }
+          : root,
+      );
+      return {
+        workspaceRoots,
+        workspaceSessionRevision: s.workspaceSessionRevision + 1,
       };
     }),
   clearWorkspace: () =>
-    set({
+    set((s) => ({
       workspaceRoots: [],
       workspaceHandle: null,
       fileTree: [],
@@ -426,7 +494,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       openEditorTabs: [],
       activeFilePath: null,
       activeFileContent: '',
-    }),
+      workspaceSessionRevision: s.workspaceSessionRevision + 1,
+    })),
   workspaceHandle: null,
   setWorkspaceHandle: (h) =>
     set({
@@ -434,7 +503,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       workspaceRoots: h
         ? [
             {
-              id: crypto.randomUUID(),
+              id: randomId(),
               label: h.name,
               handle: h,
             },
@@ -474,6 +543,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeFilePath: null,
   activeFileContent: '',
   workspaceSessionRevision: 0,
+  workspaceSessionHydrating: false,
+  bumpWorkspaceSessionRevision: () => set((s) => ({ workspaceSessionRevision: s.workspaceSessionRevision + 1 })),
   setActiveFile: (path, content) =>
     set((s) => {
       if (!path) {
@@ -594,8 +665,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     }),
 
   hydrateWorkspaceSession: async (chatId) => {
+    const generation = ++workspaceHydrateGeneration;
     try {
-      const session = await loadWorkspaceSession(chatId);
+      let sessionHydratedFromServer = false;
+      let session = await loadWorkspaceSession(chatId);
+      if (!session && getChatPersistenceMode() === 'server') {
+        const fromApi = await persistenceLoadWorkspaceSessionFromServer(chatId);
+        if (fromApi) {
+          session = workspaceSessionFromServerSnapshot(fromApi, chatId);
+          sessionHydratedFromServer = true;
+        }
+      }
       if (!session) {
         // No session for this chat: start clean.
         set({
@@ -610,10 +690,52 @@ export const useAppStore = create<AppState>((set, get) => ({
         return;
       }
 
-      // Restore UI state first (even if FS permissions are missing, tabs stay visible).
-      const hydratedRoots = (session.workspaceRoots ?? [])
-        .filter((root) => !!root.handle)
-        .map((root) => ({ id: root.id, label: root.label, handle: root.handle! }));
+      // Yield before rebuilding huge Maps from IndexedDB (avoids Firefox “not responding” on large folders).
+      await yieldToMain(1);
+
+      const UPLOAD_MAP_CHUNK = 400;
+      const DISK_HANDLE_CHUNK = 120;
+      const OVERLAY_CHUNK = 600;
+
+      const hydratedRoots: WorkspaceRoot[] = [];
+      for (const raw of session.workspaceRoots ?? []) {
+        if (raw.handle) {
+          hydratedRoots.push({ id: raw.id, label: raw.label, handle: raw.handle });
+          continue;
+        }
+        const entries = raw.uploadedFilesEntries;
+        if (entries && entries.length > 0) {
+          const uploadedFiles =
+            entries.length > UPLOAD_MAP_CHUNK
+              ? await mapEntriesAsync(entries, UPLOAD_MAP_CHUNK)
+              : new Map(entries);
+          const dh = raw.diskFileHandleEntries;
+          let diskFileHandles: Map<string, FileSystemFileHandle> | undefined;
+          if (dh?.length) {
+            diskFileHandles =
+              dh.length > DISK_HANDLE_CHUNK ? await mapEntriesAsync(dh, DISK_HANDLE_CHUNK) : new Map(dh);
+          }
+          const overlayPairs = raw.contentOverlayEntries ?? [];
+          const contentOverlay =
+            overlayPairs.length > OVERLAY_CHUNK
+              ? await mapEntriesAsync(overlayPairs as Array<[string, string]>, OVERLAY_CHUNK)
+              : new Map(overlayPairs);
+
+          hydratedRoots.push({
+            id: raw.id,
+            label: raw.label,
+            handle: null,
+            uploadedFiles,
+            contentOverlay,
+            virtualEmptyDirs: new Set(raw.virtualEmptyDirs ?? []),
+            diskFileHandles,
+            diskDirectoryHandle: raw.diskDirectoryHandle ?? undefined,
+          });
+          continue;
+        }
+        hydratedRoots.push({ id: raw.id, label: raw.label, handle: null });
+      }
+
       set({
         workspaceRoots: hydratedRoots,
         workspaceHandle: hydratedRoots[0]?.handle ?? null,
@@ -626,6 +748,8 @@ export const useAppStore = create<AppState>((set, get) => ({
             : (session.openEditorTabs ?? [])[0]?.content) ??
           '',
       });
+
+      await yieldToMain(2);
 
       // Try to rebuild file tree; if permission is revoked, keep tree empty.
       const roots = hydratedRoots;
@@ -640,15 +764,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       } else {
         set({ fileTree: [] });
       }
+
+      if (sessionHydratedFromServer && session) {
+        void saveWorkspaceSession(session).catch(() => undefined);
+      }
     } catch (e) {
       console.warn('[EvigStudio] hydrateWorkspaceSession failed', e);
+    } finally {
+      if (generation === workspaceHydrateGeneration) {
+        set({ workspaceSessionHydrating: false });
+      }
     }
   },
 
-  persistWorkspaceSession: async (chatId) => {
+  persistWorkspaceSession: async (chatId, urgent = false) => {
     const s = get();
     if (!chatId) return;
     if (s.activeChatId && s.activeChatId !== chatId) return;
+
+    const maybeYield = async () => {
+      if (!urgent) await yieldToMain(1);
+    };
 
     // Cap payload size to avoid runaway IndexedDB growth.
     const MAX_TABS = 25;
@@ -659,35 +795,93 @@ export const useAppStore = create<AppState>((set, get) => ({
       savedContent: tab.savedContent.length > MAX_TAB_CHARS ? `${tab.savedContent.slice(0, MAX_TAB_CHARS)}\n\n… [truncated]` : tab.savedContent,
     }));
 
-    const rootsForStorage = s.workspaceRoots.map((root) => ({
-      id: root.id,
-      label: root.label,
-      handle: root.handle,
-    }));
+    const rootsForStorage: PersistedWorkspaceRoot[] = s.workspaceRoots.map((root) => {
+      const base: PersistedWorkspaceRoot = {
+        id: root.id,
+        label: root.label,
+        handle: root.handle,
+      };
+      if (isUploadBackedWorkspaceRoot(root)) {
+        return {
+          ...base,
+          uploadedFilesEntries: Array.from(root.uploadedFiles?.entries() ?? []),
+          contentOverlayEntries: Array.from(root.contentOverlay?.entries() ?? []),
+          virtualEmptyDirs: root.virtualEmptyDirs?.size ? [...root.virtualEmptyDirs] : undefined,
+          diskFileHandleEntries: root.diskFileHandles?.size
+            ? Array.from(root.diskFileHandles.entries())
+            : undefined,
+          diskDirectoryHandle: root.diskDirectoryHandle ?? undefined,
+        };
+      }
+      return base;
+    });
+
+    const payloadBase = {
+      chatId,
+      updatedAt: Date.now(),
+      openEditorTabs: tabs,
+      activeFilePath: s.activeFilePath,
+      contextFiles: s.contextFiles,
+    };
+
+    const syncServerSnapshot = async () => {
+      if (getChatPersistenceMode() !== 'server') return;
+      try {
+        await persistenceSaveWorkspaceSession(
+          chatId,
+          buildWorkspaceSessionServerSnapshot({
+            workspaceRoots: s.workspaceRoots,
+            openEditorTabs: s.openEditorTabs,
+            activeFilePath: s.activeFilePath,
+            contextFiles: s.contextFiles,
+          }),
+        );
+      } catch (err) {
+        console.warn('[EvigStudio] server workspace session sync failed', err);
+      }
+    };
 
     try {
+      await maybeYield();
       await saveWorkspaceSession({
-        chatId,
-        updatedAt: Date.now(),
+        ...payloadBase,
         workspaceRoots: rootsForStorage,
-        openEditorTabs: tabs,
-        activeFilePath: s.activeFilePath,
-        contextFiles: s.contextFiles,
       });
+      await syncServerSnapshot();
     } catch (e) {
-      // FileSystemDirectoryHandle may not be serializable in some environments.
-      console.warn('[EvigStudio] persistWorkspaceSession failed; retrying without handles', e);
+      console.warn('[EvigStudio] persistWorkspaceSession failed; retrying without upload disk extras', e);
       try {
+        await maybeYield();
         await saveWorkspaceSession({
-          chatId,
-          updatedAt: Date.now(),
-          workspaceRoots: rootsForStorage.map((root) => ({ ...root, handle: null })),
-          openEditorTabs: tabs,
-          activeFilePath: s.activeFilePath,
-          contextFiles: s.contextFiles,
+          ...payloadBase,
+          workspaceRoots: rootsForStorage.map((root) =>
+            root.uploadedFilesEntries !== undefined
+              ? { ...root, handle: null, diskDirectoryHandle: undefined }
+              : { ...root, diskDirectoryHandle: undefined },
+          ),
         });
+        await syncServerSnapshot();
       } catch (e2) {
-        console.warn('[EvigStudio] persistWorkspaceSession failed (no-handles)', e2);
+        console.warn('[EvigStudio] persistWorkspaceSession failed; retrying without per-file disk handles', e2);
+        try {
+          await maybeYield();
+          await saveWorkspaceSession({
+            ...payloadBase,
+            workspaceRoots: rootsForStorage.map((root) =>
+              root.uploadedFilesEntries !== undefined
+                ? {
+                    ...root,
+                    handle: null,
+                    diskFileHandleEntries: undefined,
+                    diskDirectoryHandle: undefined,
+                  }
+                : { ...root, diskDirectoryHandle: undefined },
+            ),
+          });
+          await syncServerSnapshot();
+        } catch (e3) {
+          console.warn('[EvigStudio] persistWorkspaceSession failed after gradual strip', e3);
+        }
       }
     }
   },
@@ -739,9 +933,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 // Debounced autosave of per-chat workspace session.
 let workspaceSessionTimer: number | null = null;
 let lastWorkspaceSessionKey = '';
+/** Only the latest `hydrateWorkspaceSession` run may clear `workspaceSessionHydrating` (overlapping async hydrates). */
+let workspaceHydrateGeneration = 0;
 useAppStore.subscribe((state) => {
   const chatId = state.activeChatId;
   if (!chatId) return;
+  if (state.workspaceSessionHydrating) return;
   const rootsSig = state.workspaceRoots.map((r) => `${r.id}:${r.label}`).join('|');
   const tabsSig = state.openEditorTabs.map((t) => `${t.path}:${t.content !== t.savedContent ? 1 : 0}`).join('|');
   const ctxSig = state.contextFiles.join('|');
@@ -753,14 +950,15 @@ useAppStore.subscribe((state) => {
   if (workspaceSessionTimer) window.clearTimeout(workspaceSessionTimer);
   workspaceSessionTimer = window.setTimeout(() => {
     void useAppStore.getState().persistWorkspaceSession(chatId);
-  }, 350);
+  }, 150);
 });
 
 if (typeof window !== 'undefined') {
   const flush = () => {
     const st = useAppStore.getState();
+    if (st.workspaceSessionHydrating) return;
     if (st.activeChatId) {
-      void st.persistWorkspaceSession(st.activeChatId);
+      void st.persistWorkspaceSession(st.activeChatId, true);
     }
   };
   window.addEventListener('pagehide', flush);

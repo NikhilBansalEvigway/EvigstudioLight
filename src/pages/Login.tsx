@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { useAppStore } from '@/store/useAppStore';
 import { Button } from '@/components/ui/button';
@@ -151,7 +151,17 @@ export default function Login() {
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="password">Password</Label>
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="password">Password</Label>
+              {mode === 'login' && (
+                <Link
+                  to="/forgot-password"
+                  className="text-xs font-semibold text-primary hover:underline shrink-0"
+                >
+                  Forgot password?
+                </Link>
+              )}
+            </div>
             <Input
               id="password"
               type="password"
@@ -187,6 +197,14 @@ export default function Login() {
             {loading ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}
           </Button>
         </form>
+
+        {mode === 'login' && (
+          <p className="text-center text-xs text-muted-foreground">
+            <Link to="/forgot-password" className="font-medium text-primary hover:underline">
+              Forgot password — set a new one here
+            </Link>
+          </p>
+        )}
 
         <button
           type="button"

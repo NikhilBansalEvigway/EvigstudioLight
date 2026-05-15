@@ -28,6 +28,7 @@ import {
 import { Download, History, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { format } from 'date-fns';
+import { randomId } from '@/lib/randomId';
 
 type GroupRow = { id: string; name: string };
 
@@ -75,7 +76,7 @@ export function ChatToolbar({ chat }: { chat: Chat }) {
       updateChatFields(chat.id, { threadId: null, threadTitle: null });
       return;
     }
-    const tid = chat.threadId ?? crypto.randomUUID();
+    const tid = chat.threadId ?? randomId();
     updateChatFields(chat.id, { threadId: tid, threadTitle: t });
   }, [chat.id, chat.threadId, threadTitle, updateChatFields]);
 

@@ -46,6 +46,7 @@ import {
   workspaceFolderLabels,
 } from '@/lib/auditClient';
 import { useSpeechDictation } from '@/hooks/useSpeechDictation';
+import { randomId } from '@/lib/randomId';
 import { Send, ImagePlus, Loader2, StopCircle, FileCode, X, Mic, Bot, MessageSquare, Lock, FolderOpen } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -378,7 +379,8 @@ export function ChatPane() {
       /* new or missing file */
     }
     const result = applyPatch(original, patch);
-    await writeWorkspaceFile(roots, filePath, result);
+    const linkedDisk = await writeWorkspaceFile(roots, filePath, result);
+    if (linkedDisk) useAppStore.getState().bumpWorkspaceSessionRevision();
     useAppStore.getState().syncEditorFileContent(filePath, result);
   }, []);
 
@@ -536,7 +538,7 @@ export function ChatPane() {
     const contextMsgs = shouldIncludeWorkspaceContext ? await buildContextMessages(turnContextPaths) : [];
 
     const assistantMsg: Message = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       role: 'assistant',
       content: '',
       timestamp: Date.now(),
@@ -820,7 +822,7 @@ export function ChatPane() {
     }
 
     const userMsg: Message = {
-      id: crypto.randomUUID(),
+      id: randomId(),
       role: 'user',
       content: userContent,
       timestamp: Date.now(),

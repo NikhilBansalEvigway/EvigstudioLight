@@ -255,7 +255,7 @@ export function SettingsDialog() {
               {isSpeechRecognitionSupported() ? (
                 <span className="text-accent">Supported in this browser.</span>
               ) : (
-                <span className="text-warning">Not available — try Chrome or Edge.</span>
+                <span className="text-warning">Not available in this browser.</span>
               )}
             </p>
           </Section>

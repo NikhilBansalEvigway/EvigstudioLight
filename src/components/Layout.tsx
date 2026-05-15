@@ -1,11 +1,23 @@
-import { useEffect, useSyncExternalStore } from 'react';
+import { useEffect, useSyncExternalStore, lazy, Suspense } from 'react';
 import { PanelGroup, Panel, PanelResizeHandle } from 'react-resizable-panels';
 import { useAppStore } from '@/store/useAppStore';
 import { StatusBar } from '@/components/StatusBar';
 import { Sidebar } from '@/components/Sidebar';
 import { ChatPane } from '@/components/ChatPane';
-import { WorkspacePane } from '@/components/WorkspacePane';
 import { SettingsDialog } from '@/components/SettingsDialog';
+
+const WorkspacePane = lazy(() =>
+  import('@/components/WorkspacePane').then((m) => ({ default: m.WorkspacePane })),
+);
+
+function WorkspacePaneFallback() {
+  return (
+    <div className="flex h-full min-h-0 flex-col items-center justify-center gap-2 px-4 text-center text-xs text-muted-foreground">
+      <div className="h-6 w-6 animate-pulse rounded-full border-2 border-primary/30 border-t-primary" aria-hidden />
+      <p>Loading workspace panel…</p>
+    </div>
+  );
+}
 
 const LG_MQ = '(min-width: 1024px)';
 
@@ -77,7 +89,7 @@ export function Layout() {
             {showSidebar ? (
               <>
                 <Panel defaultSize={22} minSize={14} maxSize={42} className="min-h-0 min-w-0">
-                  <div className={`flex h-full min-h-0 flex-col overflow-hidden ${sidebarSurfaceClass}`}>
+                  <div className={`flex h-full min-h-0 min-w-0 flex-col overflow-hidden ${sidebarSurfaceClass}`}>
                     <Sidebar />
                   </div>
                 </Panel>
@@ -117,8 +129,10 @@ export function Layout() {
                   />
                 </PanelResizeHandle>
                 <Panel defaultSize={showSidebar ? 28 : 38} minSize={16} maxSize={52} className="min-h-0 min-w-0">
-                  <div className={`flex h-full min-h-0 flex-col overflow-hidden ${workspaceSurfaceClass}`}>
-                    <WorkspacePane />
+                  <div className={`flex h-full min-h-0 min-w-0 flex-col overflow-hidden ${workspaceSurfaceClass}`}>
+                    <Suspense fallback={<WorkspacePaneFallback />}>
+                      <WorkspacePane />
+                    </Suspense>
                   </div>
                 </Panel>
               </>
@@ -127,7 +141,7 @@ export function Layout() {
         ) : (
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             {showSidebar && (
-              <div className={`flex max-h-[min(38vh,320px)] w-full shrink-0 flex-col overflow-hidden border-b border-border ${sidebarSurfaceClass}`}>
+              <div className={`flex max-h-[min(38vh,320px)] min-h-0 w-full shrink-0 flex-col overflow-hidden border-b border-border ${sidebarSurfaceClass}`}>
                 <Sidebar />
               </div>
             )}
@@ -135,8 +149,10 @@ export function Layout() {
               <ChatPane />
             </div>
             {showRightPane && (
-              <div className={`flex max-h-[min(40vh,360px)] w-full shrink-0 flex-col overflow-hidden border-t border-border ${workspaceSurfaceClass}`}>
-                <WorkspacePane />
+              <div className={`flex max-h-[min(40vh,360px)] min-h-0 w-full shrink-0 flex-col overflow-hidden border-t border-border ${workspaceSurfaceClass}`}>
+                <Suspense fallback={<WorkspacePaneFallback />}>
+                  <WorkspacePane />
+                </Suspense>
               </div>
             )}
           </div>

@@ -1,7 +1,42 @@
 import type { FileNode, WorkspaceRoot } from '@/types';
+import { toast } from 'sonner';
+import { strToU8, zipSync } from 'fflate';
+import { tryWriteWorkspaceMirrorFile } from '@/lib/workspaceMirrorClient';
+import { randomId } from '@/lib/randomId';
+import {
+  buildUploadedWorkspaceChildTree,
+  collectUploadedWorkspacePaths,
+  createUploadedDirectory,
+  createUploadedEmptyFile,
+  deleteUploadedSubtree,
+  isNativeDiskStubRoot,
+  isUploadBackedWorkspaceRoot,
+  isUploadedLeafFile,
+  listUploadedDirectoryContents,
+  readUploadedWorkspaceFile,
+  renameUploadedWithinRoot,
+  uploadedWorkspaceFileExists,
+  writeUploadedWorkspaceFile,
+} from '@/lib/uploadedWorkspace';
+
+export {
+  createUploadedWorkspaceRootFromFiles,
+  createUploadedWorkspaceRootsFromFiles,
+  isNativeDiskStubRoot,
+} from '@/lib/uploadedWorkspace';
+
+export const NATIVE_DISK_RECONNECT_HINT =
+  'This Open Folder root is not linked to disk anymore (common after reload or opening this chat on another device). In the Files tab, click Connect next to the workspace root and pick the same folder again — then Save will write files there.';
 
 export const STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE =
   'Workspace write could not be confirmed. This chat may be holding stale workspace state. Open a new chat, reopen the same workspace, and continue there.';
+
+/** Shown when an upload-backed workspace has no linked disk folder and disk write cannot proceed. */
+export const UPLOAD_WORKSPACE_DISK_LINK_HINT =
+  'This project is an in-browser copy (not yet linked to a folder on disk). In Chrome or Edge, click Link disk next to the workspace folder in the file tree, pick your project folder, then save again.';
+
+/** Soft-delete folder at workspace root (visible in the tree as “Trash”). */
+export const EVIGSTUDIO_TRASH_DIR_NAME = '.evigstudio-trash';
 
 const IGNORED_DIR_NAMES = new Set([
   'node_modules',
@@ -35,6 +70,7 @@ export function isWorkspacePathIgnored(path: string): boolean {
 }
 
 function shouldSkipDirectory(name: string): boolean {
+  if (name === EVIGSTUDIO_TRASH_DIR_NAME) return false;
   return name.startsWith('.') || IGNORED_DIR_NAMES.has(name);
 }
 
@@ -50,6 +86,43 @@ function sanitizePath(path: string): string[] {
     .replace(/\/+$/, '')      // remove trailing /
     .split('/')
     .filter(part => part.length > 0 && part !== '.' && part !== '..');
+}
+
+let warnedDownloadFallbackSave = false;
+
+function showDownloadFallbackHintOnce(): void {
+  if (warnedDownloadFallbackSave) return;
+  warnedDownloadFallbackSave = true;
+  toast.message(
+    'This browser cannot write into a project folder directly. Each Save also downloads the file (check Downloads), unless a server disk mirror (LOCAL_WORKSPACE_MIRROR_ROOT) is enabled. In Chrome or Edge, Open folder attaches the project on disk; otherwise use Link disk when shown.',
+  );
+}
+
+/** Safe filename for `<a download>` when File System Access pickers are unavailable (e.g. Firefox). */
+export function buildDownloadFilenameForUploadSave(rootLabel: string, relativePath: string): string {
+  const rootSegs = sanitizePath(rootLabel.replace(/\\/g, '/'));
+  const safeRoot = (rootSegs.join('-') || 'workspace').replace(/[/\\<>:"|?*\x00-\x1f]/g, '-').slice(0, 72);
+  const parts = sanitizePath(relativePath);
+  const joined = parts.length ? parts.join('__') : 'file';
+  const safeRel = joined.replace(/[/\\<>:"|?*\x00-\x1f]/g, '-').slice(0, 180) || 'file';
+  const ext = /\.[a-zA-Z0-9]{1,12}$/.test(safeRel) ? '' : '.txt';
+  return `${safeRoot}__${safeRel}${ext}`;
+}
+
+/** Writes UTF-8 text to disk via a browser download (Firefox / Safari fallback for upload workspaces). */
+export function saveUploadBackedCopyViaBrowserDownload(rootLabel: string, relativePath: string, content: string): void {
+  if (typeof document === 'undefined') return;
+  const name = buildDownloadFilenameForUploadSave(rootLabel, relativePath);
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 async function getDirectoryHandleForParts(
@@ -85,6 +158,22 @@ async function fileExists(dirHandle: FileSystemDirectoryHandle, name: string): P
   } catch {
     return false;
   }
+}
+
+/** Whether `relativePath` exists as a file under `dirHandle` (not a directory). */
+async function fileExistsOnDisk(dirHandle: FileSystemDirectoryHandle, relativePath: string): Promise<boolean> {
+  await ensurePermission(dirHandle, 'read');
+  const parts = sanitizePath(relativePath);
+  if (parts.length === 0) return false;
+  let current = dirHandle;
+  for (let i = 0; i < parts.length - 1; i++) {
+    try {
+      current = await current.getDirectoryHandle(parts[i]);
+    } catch {
+      return false;
+    }
+  }
+  return fileExists(current, parts[parts.length - 1]);
 }
 
 async function ensurePermission(
@@ -170,7 +259,10 @@ async function copyEntryBetweenDirectories(
 function sortFileNodesInPlace(nodes: FileNode[]): FileNode[] {
   return nodes.sort((a, b) => {
     if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
-    return a.name.localeCompare(b.name);
+    const aTrash = a.type === 'directory' && a.name === EVIGSTUDIO_TRASH_DIR_NAME;
+    const bTrash = b.type === 'directory' && b.name === EVIGSTUDIO_TRASH_DIR_NAME;
+    if (aTrash !== bTrash) return aTrash ? 1 : -1;
+    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
   });
 }
 
@@ -187,7 +279,7 @@ function createWorkspaceRootNode(root: WorkspaceRoot, children: FileNode[] = [])
     path: root.label,
     type: 'directory' as const,
     children,
-    handle: root.handle,
+    ...(root.handle ? { handle: root.handle } : {}),
     workspaceRootId: root.id,
     workspaceLabel: root.label,
     relativePath: '',
@@ -297,53 +389,137 @@ async function buildAnnotatedFileTree(
   }
 }
 
-export function isFileSystemAccessSupported(): boolean {
-  return getFileSystemAccessStatus().supported;
-}
-
-export type FileSystemAccessSupportReason = 'supported' | 'insecure-context' | 'unsupported-browser';
+export type FileSystemAccessSupportReason =
+  | 'native-fs'
+  | 'upload-folder'
+  | 'insecure-context'
+  | 'ssr';
 
 export interface FileSystemAccessStatus {
-  supported: boolean;
+  /** HTTPS / localhost — workspace UI (folder button + drag/drop) allowed */
+  workspaceUiAvailable: boolean;
+  /** Chromium-style writable directory picker (`showDirectoryPicker`) */
+  nativeDirectoryPicker: boolean;
+  /** `showSaveFilePicker` — per-file “Save as” link for upload workspaces (often Chromium only). */
+  saveFilePickerAvailable: boolean;
   reason: FileSystemAccessSupportReason;
+  /** Set only when workspace UI is blocked (`insecure-context`) */
   message: string | null;
+}
+
+/** @deprecated use workspaceUiAvailable */
+export function isFileSystemAccessSupported(): boolean {
+  return getFileSystemAccessStatus().workspaceUiAvailable;
+}
+
+/** Alias for `getFileSystemAccessStatus` — compatibility naming */
+export function checkCompatibility(): FileSystemAccessStatus {
+  return getFileSystemAccessStatus();
 }
 
 export function getFileSystemAccessStatus(): FileSystemAccessStatus {
   if (typeof window === 'undefined') {
     return {
-      supported: false,
-      reason: 'unsupported-browser',
-      message: 'File System Access requires Chrome or Edge. Firefox/Safari not supported.',
-    };
-  }
-
-  if ('showDirectoryPicker' in window) {
-    return {
-      supported: true,
-      reason: 'supported',
+      workspaceUiAvailable: false,
+      nativeDirectoryPicker: false,
+      saveFilePickerAvailable: false,
+      reason: 'ssr',
       message: null,
     };
   }
 
   if (!window.isSecureContext) {
     return {
-      supported: false,
+      workspaceUiAvailable: false,
+      nativeDirectoryPicker: false,
+      saveFilePickerAvailable: false,
       reason: 'insecure-context',
-      message: 'Workspace access over the network requires HTTPS in Chrome or Edge. Open EvigStudio via HTTPS or use localhost.',
+      message:
+        'Opening a workspace requires a secure page. Use HTTPS or open EvigStudio at localhost.',
     };
   }
 
+  const nativeDirectoryPicker = typeof window !== 'undefined' && 'showDirectoryPicker' in window;
+  const w = window as Window & { showSaveFilePicker?: (o?: object) => Promise<FileSystemFileHandle> };
+  const saveFilePickerAvailable = typeof w.showSaveFilePicker === 'function';
+
   return {
-    supported: false,
-    reason: 'unsupported-browser',
-    message: 'File System Access requires Chrome or Edge. Firefox/Safari not supported.',
+    workspaceUiAvailable: true,
+    nativeDirectoryPicker,
+    saveFilePickerAvailable,
+    reason: nativeDirectoryPicker ? 'native-fs' : 'upload-folder',
+    message: null,
   };
+}
+
+/** Hint when Save cannot write directly back to disk (upload-backed workspace). Neutral wording — no browser names. */
+export function getNativeFsSupportErrorMessage(): string | null {
+  const s = getFileSystemAccessStatus();
+  if (!s.workspaceUiAvailable) return s.message;
+  if (!s.nativeDirectoryPicker) {
+    return 'Open folder loads a copy in the app. In Chrome or Edge, Open folder can attach the project folder on disk directly. In Firefox, configure the API host with LOCAL_WORKSPACE_MIRROR_ROOT (and token) — see the Files tab banner when enabled. Otherwise use Save-as / download, Save ZIP, or Link disk after Open folder when shown.';
+  }
+  return null;
+}
+
+async function collectNativeFilesForZip(rootHandle: FileSystemDirectoryHandle): Promise<Array<{ rel: string; text: string }>> {
+  const acc: Array<{ rel: string; text: string }> = [];
+
+  async function walk(dir: FileSystemDirectoryHandle, relPrefix: string): Promise<void> {
+    for await (const [name, handle] of (dir as any).entries() as AsyncIterable<[
+      string,
+      FileSystemFileHandle | FileSystemDirectoryHandle,
+    ]>) {
+      const rel = relPrefix ? `${relPrefix}/${name}` : name;
+      if (handle.kind === 'directory') {
+        if (shouldSkipDirectory(name)) continue;
+        await walk(handle as FileSystemDirectoryHandle, rel);
+      } else {
+        const text = await readFile(rootHandle, rel);
+        acc.push({ rel, text });
+      }
+    }
+  }
+
+  await walk(rootHandle, '');
+  return acc;
+}
+
+/** ZIP every workspace root (native or folder-upload). */
+export async function downloadWorkspaceZipBundle(workspaceRoots: WorkspaceRoot[]): Promise<void> {
+  const obj: Record<string, Uint8Array> = {};
+  for (const root of workspaceRoots) {
+    const labelPrefix = `${root.label.replace(/[/\\]/g, '-')}/`;
+    if (isUploadBackedWorkspaceRoot(root)) {
+      for (const rel of collectUploadedWorkspacePaths(root)) {
+        if (!isUploadedLeafFile(root, rel)) continue;
+        const text = await readUploadedWorkspaceFile(root, rel);
+        obj[`${labelPrefix}${rel}`] = strToU8(text);
+      }
+    } else if (root.handle) {
+      const files = await collectNativeFilesForZip(root.handle);
+      for (const { rel, text } of files) {
+        obj[`${labelPrefix}${rel}`] = strToU8(text);
+      }
+    }
+  }
+  const zipped = zipSync(obj);
+  const blob = new Blob([zipped], { type: 'application/zip' });
+  const a = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  a.download =
+    workspaceRoots.length === 1
+      ? `${workspaceRoots[0].label.replace(/[/\\]/g, '-')}-project.zip`
+      : 'evigstudio-workspaces.zip';
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 export async function pickDirectory(): Promise<FileSystemDirectoryHandle | null> {
   try {
-    return await (window as any).showDirectoryPicker({ id: 'evigstudio-workspace', mode: 'readwrite' });
+    // Omit a fixed `id` so each "Add folder" pick is independent (some browsers tie `id` to a single remembered grant/slot).
+    return await (window as any).showDirectoryPicker({ mode: 'readwrite' });
   } catch (err: any) {
     if (err.name === 'AbortError') return null;
     throw err;
@@ -424,9 +600,19 @@ export async function buildWorkspaceTree(
 
       rootNode.children = [];
       emitProgress(true);
-      await buildAnnotatedFileTree(root, root.handle, rootNode.children, () => emitProgress());
-      sortFileNodesInPlace(rootNode.children);
-      emitProgress();
+      if (isUploadBackedWorkspaceRoot(root) && !root.diskDirectoryHandle) {
+        rootNode.children = buildUploadedWorkspaceChildTree(root);
+        sortFileNodesInPlace(rootNode.children);
+        emitProgress();
+      } else if (root.diskDirectoryHandle) {
+        await buildAnnotatedFileTree(root, root.diskDirectoryHandle, rootNode.children, () => emitProgress());
+        sortFileNodesInPlace(rootNode.children);
+        emitProgress();
+      } else if (root.handle) {
+        await buildAnnotatedFileTree(root, root.handle, rootNode.children, () => emitProgress());
+        sortFileNodesInPlace(rootNode.children);
+        emitProgress();
+      }
     }),
   );
 
@@ -443,10 +629,11 @@ export function workspaceRootsMatch(
   currentRoots: Array<Pick<WorkspaceRoot, 'id'>>,
   expectedRoots: Array<Pick<WorkspaceRoot, 'id'>>,
 ): boolean {
-  return (
-    currentRoots.length === expectedRoots.length &&
-    currentRoots.every((root, index) => root.id === expectedRoots[index]?.id)
-  );
+  if (currentRoots.length !== expectedRoots.length) return false;
+  const sortIds = (roots: Array<Pick<WorkspaceRoot, 'id'>>) => [...roots].map((r) => r.id).sort();
+  const a = sortIds(currentRoots);
+  const b = sortIds(expectedRoots);
+  return a.every((id, i) => id === b[i]);
 }
 
 export async function buildFileTree(
@@ -490,6 +677,88 @@ export async function readFile(dirHandle: FileSystemDirectoryHandle, path: strin
   return file.text();
 }
 
+async function ensureFileOrDirectoryWritable(handle: FileSystemFileHandle | FileSystemDirectoryHandle): Promise<void> {
+  const h = handle as { queryPermission?: (o: { mode: string }) => Promise<PermissionState>; requestPermission?: (o: { mode: string }) => Promise<PermissionState> };
+  if (!h.queryPermission) return;
+  const opts = { mode: 'readwrite' } as { mode: string };
+  let status = await h.queryPermission(opts);
+  if (status === 'granted') return;
+  status = (await h.requestPermission?.(opts)) ?? 'denied';
+  if (status !== 'granted') throw new Error('Permission denied');
+}
+
+/**
+ * For folder-upload workspaces: writes bytes to disk when a directory or per-file handle is linked,
+ * or via `showSaveFilePicker` when available, or via the API host mirror (`LOCAL_WORKSPACE_MIRROR_ROOT`).
+ * If none of those apply, triggers a UTF-8 file download so Save still lands bytes on disk, then returns false.
+ * Returns true when a new per-file handle was linked via Save As (persist session to keep it).
+ */
+async function flushUploadBackedFileToDisk(
+  root: WorkspaceRoot,
+  relativePath: string,
+  content: string,
+): Promise<boolean> {
+  if (!isUploadBackedWorkspaceRoot(root)) return false;
+
+  if (root.diskDirectoryHandle) {
+    await writeFile(root.diskDirectoryHandle, relativePath, content);
+    return false;
+  }
+
+  const w = typeof window !== 'undefined' ? (window as Window & { showSaveFilePicker?: (o?: object) => Promise<FileSystemFileHandle> }) : null;
+  let fileHandle = root.diskFileHandles?.get(relativePath);
+  let linkedNewHandle = false;
+
+  if (!fileHandle) {
+    const mirror = await tryWriteWorkspaceMirrorFile(root.label, relativePath, content);
+    if (mirror.ok) return false;
+  }
+
+  if (!fileHandle && typeof w?.showSaveFilePicker === 'function') {
+    try {
+      const suggestedName = relativePath.split('/').pop() || 'file.txt';
+      fileHandle = await w.showSaveFilePicker({
+        suggestedName,
+      });
+      if (!root.diskFileHandles) root.diskFileHandles = new Map();
+      root.diskFileHandles.set(relativePath, fileHandle);
+      linkedNewHandle = true;
+    } catch (e) {
+      const name = e instanceof DOMException ? e.name : (e as Error)?.name;
+      if (name === 'AbortError') {
+        throw new Error('Save cancelled — nothing was written to a folder on disk.');
+      }
+      throw e;
+    }
+  }
+
+  if (!fileHandle) {
+    const acc = getFileSystemAccessStatus();
+    if (!acc.workspaceUiAvailable && acc.message) {
+      throw new Error(acc.message);
+    }
+    if (typeof w?.showSaveFilePicker !== 'function') {
+      showDownloadFallbackHintOnce();
+      saveUploadBackedCopyViaBrowserDownload(root.label, relativePath, content);
+      return false;
+    }
+    const insecure =
+      typeof window !== 'undefined' && window.isSecureContext === false;
+    throw new Error(
+      insecure
+        ? `${UPLOAD_WORKSPACE_DISK_LINK_HINT} (Use https:// or localhost for full disk access.)`
+        : UPLOAD_WORKSPACE_DISK_LINK_HINT,
+    );
+  }
+
+  await ensureFileOrDirectoryWritable(fileHandle);
+  const writable = await (fileHandle as FileSystemFileHandle & { createWritable: () => Promise<FileSystemWritableFileStream> }).createWritable();
+  await writable.write(content);
+  await writable.close();
+
+  return linkedNewHandle;
+}
+
 export async function writeFile(dirHandle: FileSystemDirectoryHandle, path: string, content: string): Promise<void> {
   await ensurePermission(dirHandle, 'readwrite', { request: true });
   const parts = sanitizePath(path);
@@ -516,10 +785,21 @@ export async function workspaceFileExists(workspaceRoots: WorkspaceRoot[], path:
     return true;
   }
 
+  if (isUploadBackedWorkspaceRoot(root)) {
+    if (root.diskDirectoryHandle) {
+      const onDisk = await fileExistsOnDisk(root.diskDirectoryHandle, relativePath);
+      if (onDisk) return true;
+    }
+    return uploadedWorkspaceFileExists(root, relativePath);
+  }
+
   const parts = sanitizePath(relativePath);
   if (parts.length === 0) return false;
 
-  let current: FileSystemDirectoryHandle = root.handle;
+  const diskHandle = root.diskDirectoryHandle ?? root.handle;
+  if (!diskHandle) return false;
+
+  let current: FileSystemDirectoryHandle = diskHandle;
   for (let i = 0; i < parts.length - 1; i++) {
     try {
       current = await current.getDirectoryHandle(parts[i]);
@@ -536,8 +816,8 @@ export async function writeWorkspaceFileVerified(
   path: string,
   content: string,
   options?: { expectCreate?: boolean },
-): Promise<void> {
-  await writeWorkspaceFile(workspaceRoots, path, content);
+): Promise<boolean> {
+  const linkedNewDiskHandle = await writeWorkspaceFile(workspaceRoots, path, content);
 
   if (options?.expectCreate) {
     const exists = await workspaceFileExists(workspaceRoots, path);
@@ -545,6 +825,8 @@ export async function writeWorkspaceFileVerified(
       throw new Error(`${STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE} File: ${path}`);
     }
   }
+
+  return linkedNewDiskHandle;
 }
 
 export async function createDirectory(dirHandle: FileSystemDirectoryHandle, path: string): Promise<void> {
@@ -574,23 +856,58 @@ export async function deleteFileOrDir(dirHandle: FileSystemDirectoryHandle, path
 export async function readWorkspaceFile(workspaceRoots: WorkspaceRoot[], path: string): Promise<string> {
   const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
   if (!relativePath) throw new Error(`Cannot read workspace root: "${path}"`);
+  if (isUploadBackedWorkspaceRoot(root)) {
+    const norm = sanitizePath(relativePath).join('/');
+    const overlay = root.contentOverlay?.get(norm);
+    if (overlay !== undefined) return overlay;
+    if (root.diskDirectoryHandle && (await fileExistsOnDisk(root.diskDirectoryHandle, relativePath))) {
+      return readFile(root.diskDirectoryHandle, relativePath);
+    }
+    return readUploadedWorkspaceFile(root, relativePath);
+  }
+  if (!root.handle) {
+    if (isNativeDiskStubRoot(root)) throw new Error(NATIVE_DISK_RECONNECT_HINT);
+    throw new Error('No workspace folder handle');
+  }
   return readFile(root.handle, relativePath);
 }
 
+/** @returns true when a new on-disk file handle was linked (IndexedDB session should persist handles). */
 export async function writeWorkspaceFile(
   workspaceRoots: WorkspaceRoot[],
   path: string,
   content: string,
-): Promise<void> {
+): Promise<boolean> {
   const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
   if (!relativePath) throw new Error(`Cannot write to workspace root: "${path}"`);
+  if (isUploadBackedWorkspaceRoot(root)) {
+    const linkedNew = await flushUploadBackedFileToDisk(root, relativePath, content);
+    writeUploadedWorkspaceFile(root, relativePath, content);
+    return linkedNew;
+  }
+  if (!root.handle) {
+    if (isNativeDiskStubRoot(root)) throw new Error(NATIVE_DISK_RECONNECT_HINT);
+    throw new Error('No workspace folder handle');
+  }
   await writeFile(root.handle, relativePath, content);
+  return false;
 }
 
 export async function createWorkspaceFile(workspaceRoots: WorkspaceRoot[], path: string): Promise<void> {
   const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
   if (!relativePath) throw new Error(`Cannot create a file at workspace root: "${path}"`);
-  await createFile(root.handle, relativePath);
+  if (isUploadBackedWorkspaceRoot(root)) {
+    if (root.diskDirectoryHandle) {
+      await createFile(root.diskDirectoryHandle, relativePath);
+    }
+    createUploadedEmptyFile(root, relativePath);
+  } else {
+    if (!root.handle) {
+      if (isNativeDiskStubRoot(root)) throw new Error(NATIVE_DISK_RECONNECT_HINT);
+      throw new Error('No workspace folder handle');
+    }
+    await createFile(root.handle, relativePath);
+  }
 
   const exists = await workspaceFileExists(workspaceRoots, path);
   if (!exists) {
@@ -601,6 +918,17 @@ export async function createWorkspaceFile(workspaceRoots: WorkspaceRoot[], path:
 export async function createWorkspaceDirectory(workspaceRoots: WorkspaceRoot[], path: string): Promise<void> {
   const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
   if (!relativePath) throw new Error(`Cannot create a folder at workspace root: "${path}"`);
+  if (isUploadBackedWorkspaceRoot(root)) {
+    if (root.diskDirectoryHandle) {
+      await createDirectory(root.diskDirectoryHandle, relativePath);
+    }
+    createUploadedDirectory(root, relativePath);
+    return;
+  }
+  if (!root.handle) {
+    if (isNativeDiskStubRoot(root)) throw new Error(NATIVE_DISK_RECONNECT_HINT);
+    throw new Error('No workspace folder handle');
+  }
   await createDirectory(root.handle, relativePath);
 }
 
@@ -608,6 +936,17 @@ export async function deleteWorkspacePath(workspaceRoots: WorkspaceRoot[], path:
   const { root, relativePath } = resolveWorkspacePath(workspaceRoots, path);
   if (!relativePath) {
     throw new Error('Cannot delete a workspace root from disk. Remove it from the workspace instead.');
+  }
+  if (isUploadBackedWorkspaceRoot(root)) {
+    if (root.diskDirectoryHandle) {
+      await deleteFileOrDir(root.diskDirectoryHandle, relativePath);
+    }
+    deleteUploadedSubtree(root, relativePath);
+    return;
+  }
+  if (!root.handle) {
+    if (isNativeDiskStubRoot(root)) throw new Error(NATIVE_DISK_RECONNECT_HINT);
+    throw new Error('No workspace folder handle');
   }
   await deleteFileOrDir(root.handle, relativePath);
 }
@@ -625,8 +964,39 @@ export async function renameWorkspacePath(
   }
 
   if (oldResolved.root.id === newResolved.root.id) {
+    if (isUploadBackedWorkspaceRoot(oldResolved.root)) {
+      if (oldResolved.root.diskDirectoryHandle) {
+        await renameFileOrDir(
+          oldResolved.root.diskDirectoryHandle,
+          oldResolved.relativePath,
+          newResolved.relativePath,
+        );
+      }
+      renameUploadedWithinRoot(oldResolved.root, oldResolved.relativePath, newResolved.relativePath);
+      return;
+    }
+    if (!oldResolved.root.handle) {
+      if (isNativeDiskStubRoot(oldResolved.root)) throw new Error(NATIVE_DISK_RECONNECT_HINT);
+      throw new Error('No workspace folder handle');
+    }
     await renameFileOrDir(oldResolved.root.handle, oldResolved.relativePath, newResolved.relativePath);
     return;
+  }
+
+  if (
+    isUploadBackedWorkspaceRoot(oldResolved.root) ||
+    isUploadBackedWorkspaceRoot(newResolved.root)
+  ) {
+    throw new Error(
+      'Moving items between workspace folders is only supported when both sides use the same folder picker (native File System Access).',
+    );
+  }
+
+  if (!oldResolved.root.handle || !newResolved.root.handle) {
+    if (isNativeDiskStubRoot(oldResolved.root) || isNativeDiskStubRoot(newResolved.root)) {
+      throw new Error(NATIVE_DISK_RECONNECT_HINT);
+    }
+    throw new Error('No workspace folder handle');
   }
 
   await copyEntryBetweenDirectories(
@@ -697,18 +1067,54 @@ export async function trashWorkspacePath(
   if (parts.length === 0) throw new Error(`Invalid path: "${path}"`);
 
   // If something is already under the internal trash, just delete it.
-  if (parts[0] === '.evigstudio-trash') {
-    await deleteFileOrDir(root.handle, relativePath);
+  if (parts[0] === EVIGSTUDIO_TRASH_DIR_NAME) {
+    if (isUploadBackedWorkspaceRoot(root)) {
+      if (root.diskDirectoryHandle) {
+        await deleteFileOrDir(root.diskDirectoryHandle, relativePath);
+      }
+      deleteUploadedSubtree(root, relativePath);
+    } else if (root.handle) {
+      await deleteFileOrDir(root.handle, relativePath);
+    }
     return { trashedPath: buildWorkspacePath(root.label, relativePath) };
   }
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const nonce = (globalThis.crypto?.randomUUID?.() ?? Math.random().toString(16).slice(2)).slice(0, 8);
-  const trashBase = `.evigstudio-trash/${stamp}-${nonce}`;
+  const nonce = randomId().replace(/-/g, '').slice(0, 8);
+  const trashBase = `${EVIGSTUDIO_TRASH_DIR_NAME}/${stamp}-${nonce}`;
   const destRel = `${trashBase}/${parts.join('/')}`;
 
-  await renameFileOrDir(root.handle, relativePath, destRel);
+  if (isUploadBackedWorkspaceRoot(root)) {
+    if (root.diskDirectoryHandle) {
+      await renameFileOrDir(root.diskDirectoryHandle, relativePath, destRel);
+    }
+    renameUploadedWithinRoot(root, relativePath, destRel);
+  } else if (root.handle) {
+    await renameFileOrDir(root.handle, relativePath, destRel);
+  } else if (isNativeDiskStubRoot(root)) {
+    throw new Error(NATIVE_DISK_RECONNECT_HINT);
+  }
   return { trashedPath: buildWorkspacePath(root.label, destRel) };
+}
+
+/**
+ * For a path under `.evigstudio-trash/<batch>/…`, returns the original workspace path (same root).
+ * Returns null for the Trash root, a batch folder alone, or paths outside Trash.
+ */
+export function getRestoreDestinationWorkspacePath(
+  workspaceRoots: WorkspaceRoot[],
+  trashedWorkspacePath: string,
+): string | null {
+  try {
+    const { root, relativePath } = resolveWorkspacePath(workspaceRoots, trashedWorkspacePath);
+    const parts = sanitizePath(relativePath);
+    if (parts[0] !== EVIGSTUDIO_TRASH_DIR_NAME || parts.length < 3) return null;
+    const originalRel = parts.slice(2).join('/');
+    if (!originalRel) return null;
+    return buildWorkspacePath(root.label, originalRel);
+  } catch {
+    return null;
+  }
 }
 
 export function getFileExtension(name: string): string {
@@ -770,5 +1176,12 @@ export async function listWorkspaceDirectoryContents(
   }
 
   const { root, relativePath } = resolveWorkspacePath(workspaceRoots, trimmed);
+  if (isUploadBackedWorkspaceRoot(root)) {
+    if (root.diskDirectoryHandle) {
+      return listDirectoryContents(root.diskDirectoryHandle, relativePath);
+    }
+    return listUploadedDirectoryContents(root, relativePath);
+  }
+  if (!root.handle) return [];
   return listDirectoryContents(root.handle, relativePath);
 }

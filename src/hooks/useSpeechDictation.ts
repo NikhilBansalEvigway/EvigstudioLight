@@ -42,7 +42,7 @@ export function useSpeechDictation(
   const start = useCallback(() => {
     const Ctor = getSpeechRecognitionCtor();
     if (!Ctor) {
-      onErrorRef.current?.('Speech recognition is not supported in this browser. Try Chrome or Edge.');
+      onErrorRef.current?.('Speech recognition is not supported in this browser.');
       return;
     }
     stop();

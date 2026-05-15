@@ -26,14 +26,23 @@ export const prompts = pgTable(
   }),
 );
 
-export const users = pgTable('users', {
-  id: uuid('id').defaultRandom().primaryKey(),
-  email: text('email').notNull().unique(),
-  passwordHash: text('password_hash').notNull(),
-  displayName: text('display_name').notNull(),
-  role: userRoleEnum('role').notNull().default('developer'),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-});
+export const users = pgTable(
+  'users',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    email: text('email').notNull().unique(),
+    passwordHash: text('password_hash').notNull(),
+    displayName: text('display_name').notNull(),
+    role: userRoleEnum('role').notNull().default('developer'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    /** SHA-256 hex of reset token; plain token is only sent by email. */
+    passwordResetTokenHash: text('password_reset_token_hash'),
+    passwordResetExpiresAt: timestamp('password_reset_expires_at', { withTimezone: true }),
+  },
+  (t) => ({
+    passwordResetTokenIdx: index('users_password_reset_token_hash_idx').on(t.passwordResetTokenHash),
+  }),
+);
 
 export const groups = pgTable('groups', {
   id: uuid('id').defaultRandom().primaryKey(),
@@ -91,6 +100,8 @@ export const chats = pgTable(
     versionHistory: jsonb('version_history').notNull().default(sql`'[]'::jsonb`),
     title: text('title').notNull(),
     messages: jsonb('messages').notNull().default([]),
+    /** Serializable workspace snapshot for recovery (tabs, paths, root labels). Not browser handles/files. */
+    workspaceSession: jsonb('workspace_session'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },

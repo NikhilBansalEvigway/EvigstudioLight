@@ -96,6 +96,11 @@ export async function ensurePostgresSchema(): Promise<void> {
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS thread_title text;
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS tags jsonb NOT NULL DEFAULT '[]'::jsonb;
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS version_history jsonb NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE chats ADD COLUMN IF NOT EXISTS workspace_session jsonb;
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token_hash text;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires_at timestamptz;
+    CREATE INDEX IF NOT EXISTS users_password_reset_token_hash_idx ON users (password_reset_token_hash);
 
     CREATE INDEX IF NOT EXISTS group_workspaces_group_idx ON group_workspaces (group_id);
     CREATE INDEX IF NOT EXISTS chats_owner_idx ON chats (owner_id);

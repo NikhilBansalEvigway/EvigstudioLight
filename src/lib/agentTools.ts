@@ -4,9 +4,11 @@ import {
   readWorkspaceFile,
   renameWorkspacePath,
   workspaceFileExists,
+  writeWorkspaceFile,
   writeWorkspaceFileVerified,
 } from '@/lib/fsWorkspace';
 import type { WorkspaceRoot } from '@/types';
+import { useAppStore } from '@/store/useAppStore';
 
 export interface AgentAction {
   type: 'read' | 'edit' | 'write' | 'delete' | 'rename' | 'list';
@@ -282,7 +284,8 @@ export async function executeAgentTools(
       }
 
       const next = current.replace(search, replace);
-      await writeWorkspaceFile(workspaceRoots, path, next);
+      const linkedDisk = await writeWorkspaceFile(workspaceRoots, path, next);
+      if (linkedDisk) useAppStore.getState().bumpWorkspaceSessionRevision();
       options.onFileWritten?.(path, next);
       parts.push(`### Edit File: ${path}\n(Edited successfully, replaced ${search.length} chars with ${replace.length} chars)`);
       actions.push({ type: 'edit', path, success: true });
@@ -297,7 +300,10 @@ export async function executeAgentTools(
     try {
       const sanitizedContent = sanitizeWrittenFileContent(content);
       const existedBefore = await workspaceFileExists(workspaceRoots, path);
-      await writeWorkspaceFileVerified(workspaceRoots, path, sanitizedContent, { expectCreate: !existedBefore });
+      const linkedDisk = await writeWorkspaceFileVerified(workspaceRoots, path, sanitizedContent, {
+        expectCreate: !existedBefore,
+      });
+      if (linkedDisk) useAppStore.getState().bumpWorkspaceSessionRevision();
       options.onFileWritten?.(path, sanitizedContent);
       parts.push(`### Write File: ${path}\n(Written successfully, ${sanitizedContent.length} chars)`);
       actions.push({ type: 'write', path, success: true });

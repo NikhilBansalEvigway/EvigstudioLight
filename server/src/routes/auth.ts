@@ -29,7 +29,20 @@ const changePasswordSchema = z.object({
   newPassword: z.string().min(8).max(128),
 });
 
+/**
+ * LAN / trusted deployments: set a new password from the sign-in flow using only email (no email link, no token).
+ * Not suitable for public internet without additional controls.
+ */
+const selfResetPasswordSchema = z.object({
+  email: z.string().email(),
+  newPassword: z.string().min(8).max(128),
+});
+
 const REMEMBER_ME_MAX_AGE_SECONDS = 60 * 60 * 24 * 30;
+
+/** Throttle self-service password reset per normalized email. */
+const selfResetThrottle = new Map<string, number>();
+const SELF_RESET_THROTTLE_MS = 60_000;
 
 function setSessionCookie(
   c: Parameters<typeof setCookie>[0],
@@ -252,4 +265,77 @@ authRoutes.get('/me', async (c) => {
   return c.json({
     user: { id: u.id, email: u.email, displayName: u.displayName, role: u.role },
   });
+});
+
+/**
+ * Set a new password immediately using account email only (no reset link, no outbound email).
+ * Intended for trusted / LAN deployments. Throttled per email address.
+ */
+authRoutes.post('/self-reset-password', async (c) => {
+  let raw: unknown = {};
+  try {
+    raw = await c.req.json();
+  } catch {
+    /* invalid or empty body */
+  }
+  const body = selfResetPasswordSchema.safeParse(raw);
+  if (!body.success) {
+    return c.json({ error: 'Enter a valid email and a new password (at least 8 characters).' }, 400);
+  }
+
+  const email = body.data.email.toLowerCase();
+  const now = Date.now();
+  const last = selfResetThrottle.get(email) ?? 0;
+  if (now - last < SELF_RESET_THROTTLE_MS) {
+    return c.json({ error: 'Please wait a minute before trying again.' }, 429);
+  }
+  selfResetThrottle.set(email, now);
+
+  const rows = await db.select().from(users).where(eq(users.email, email)).limit(1);
+  const user = rows[0];
+  if (!user) {
+    await writeStructuredAuditLog({
+      action: 'auth.self_password_reset',
+      resourceType: 'user',
+      resourceId: null,
+      actor: null,
+      context: auditRequestContext(c),
+      target: { type: 'user', id: null, label: email },
+      result: { status: 'denied', code: 404, reason: 'no_such_user' },
+    });
+    return c.json({ error: 'No account was found for that email.' }, 404);
+  }
+
+  const sameAsOld = await bcrypt.compare(body.data.newPassword, user.passwordHash);
+  if (sameAsOld) {
+    return c.json({ error: 'New password must be different from your current password.' }, 400);
+  }
+
+  const passwordHash = await bcrypt.hash(body.data.newPassword, 10);
+  await db
+    .update(users)
+    .set({
+      passwordHash,
+      passwordResetTokenHash: null,
+      passwordResetExpiresAt: null,
+    })
+    .where(eq(users.id, user.id));
+
+  await writeStructuredAuditLog({
+    action: 'auth.self_password_reset',
+    resourceType: 'user',
+    resourceId: user.id,
+    actor: null,
+    context: auditRequestContext(c),
+    target: { type: 'user', id: user.id, label: user.email },
+    change: {
+      fields: ['password'],
+      before: { passwordChanged: false },
+      after: { passwordChanged: true },
+    },
+    result: { status: 'success', code: 200 },
+    details: { method: 'email_only_immediate' },
+  });
+
+  return c.json({ ok: true });
 });

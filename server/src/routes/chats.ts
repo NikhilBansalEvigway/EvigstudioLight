@@ -30,6 +30,33 @@ const versionSnapshotSchema = z.object({
   messages: z.array(messageSchema),
 });
 
+const workspaceSessionSnapshotSchema = z.object({
+  updatedAt: z.number().int().nonnegative(),
+  workspaceRoots: z
+    .array(
+      z.object({
+        id: z.string().max(200),
+        label: z.string().max(500),
+        source: z.enum(['native', 'upload']),
+        uploadedPaths: z.array(z.string().max(4096)).max(50000).optional(),
+        contentOverlayKeys: z.array(z.string().max(4096)).max(10000).optional(),
+        virtualEmptyDirs: z.array(z.string().max(4096)).max(10000).optional(),
+      }),
+    )
+    .max(50),
+  openEditorTabs: z
+    .array(
+      z.object({
+        path: z.string().max(4096),
+        content: z.string().max(220_000),
+        savedContent: z.string().max(220_000),
+      }),
+    )
+    .max(25),
+  activeFilePath: z.string().max(4096).nullable(),
+  contextFiles: z.array(z.string().max(4096)).max(200),
+});
+
 const chatBodySchema = z.object({
   title: z.string().min(1).max(500),
   messages: z.array(messageSchema).default([]),
@@ -59,8 +86,9 @@ function serializeChat(
   row: typeof chats.$inferSelect,
   access: { read: boolean; write: boolean; delete: boolean },
   extras?: { ownerDisplayName?: string | null; groupName?: string | null },
+  opts?: { includeWorkspaceSession?: boolean },
 ) {
-  return {
+  const base = {
     id: row.id,
     title: row.title,
     messages: row.messages,
@@ -76,6 +104,13 @@ function serializeChat(
     threadTitle: row.threadTitle,
     tags: (row.tags as string[]) ?? [],
     versionHistory: (row.versionHistory as unknown[]) ?? [],
+  };
+  if (opts?.includeWorkspaceSession === false) {
+    return base;
+  }
+  return {
+    ...base,
+    workspaceSession: row.workspaceSession ?? null,
   };
 }
 
@@ -161,14 +196,91 @@ chatRoutes.get('/', async (c) => {
         memberOfGroupIds: gidSet,
       });
       if (!access.read) return null;
-      return serializeChat(r.chat, access, {
-        ownerDisplayName: r.ownerDisplayName,
-        groupName: r.groupName,
-      });
+      return serializeChat(
+        r.chat,
+        access,
+        {
+          ownerDisplayName: r.ownerDisplayName,
+          groupName: r.groupName,
+        },
+        { includeWorkspaceSession: false },
+      );
     })
     .filter((row): row is NonNullable<typeof row> => row !== null);
 
   return c.json({ chats: out });
+});
+
+chatRoutes.get('/:id/workspace-session', async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  const id = c.req.param('id');
+  const [row] = await db
+    .select({ chat: chats, ownerDisplayName: users.displayName, groupName: groups.name })
+    .from(chats)
+    .innerJoin(users, eq(chats.ownerId, users.id))
+    .leftJoin(groups, eq(chats.groupId, groups.id))
+    .where(eq(chats.id, id))
+    .limit(1);
+  if (!row) return c.json({ error: 'Not found' }, 404);
+
+  const groupIds = await getUserGroupIds(user.id);
+  const access = canAccessChat(user.role, {
+    userId: user.id,
+    chatOwnerId: row.chat.ownerId,
+    chatGroupId: row.chat.groupId,
+    chatPrivacy: (row.chat.privacy ?? 'private') as 'private' | 'shared' | 'group',
+    memberOfGroupIds: new Set(groupIds),
+  });
+  if (!access.read) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  return c.json({ workspaceSession: row.chat.workspaceSession ?? null });
+});
+
+chatRoutes.patch('/:id/workspace-session', async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Unauthorized' }, 401);
+
+  const id = c.req.param('id');
+  const parsed = workspaceSessionSnapshotSchema.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: 'Invalid workspace session payload' }, 400);
+
+  const existing = await db.select().from(chats).where(eq(chats.id, id)).limit(1);
+  const chat = existing[0];
+  if (!chat) return c.json({ error: 'Not found' }, 404);
+
+  const gids = await getUserGroupIds(user.id);
+  const access = canAccessChat(user.role, {
+    userId: user.id,
+    chatOwnerId: chat.ownerId,
+    chatGroupId: chat.groupId,
+    chatPrivacy: (chat.privacy ?? 'private') as 'private' | 'shared' | 'group',
+    memberOfGroupIds: new Set(gids),
+  });
+  if (!access.write) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+  if (!roleHasPermission(user.role, 'chats.write_own')) {
+    return c.json({ error: 'Your role cannot edit chats' }, 403);
+  }
+
+  const now = new Date();
+  const [row] = await db
+    .update(chats)
+    .set({
+      workspaceSession: parsed.data as unknown as Record<string, unknown>,
+      updatedAt: now,
+    })
+    .where(eq(chats.id, id))
+    .returning();
+
+  return c.json({
+    workspaceSession: row.workspaceSession ?? null,
+    updatedAt: row.updatedAt.getTime(),
+  });
 });
 
 chatRoutes.get('/:id', async (c) => {
