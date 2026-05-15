@@ -123,12 +123,43 @@ def _strip_lm_studio_base_url_from_payload(payload: dict[str, Any]) -> dict[str,
     return payload
 
 
+def _strip_identity_metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove gateway identity hints before forwarding to LM Studio.
+
+    We persist identity hints into request_payload_json for observability, but LM Studio
+    doesn't need them and some backends can be strict about unknown metadata keys.
+    """
+    md = payload.get("metadata")
+    if not isinstance(md, dict):
+        return payload
+    drop = {
+        "trace_id",
+        "source_app",
+        "chat_id",
+        "user_id",
+        "user_display_name",
+        "org_id",
+        "org_name",
+    }
+    new_md = {k: v for k, v in md.items() if k not in drop}
+    payload = deepcopy(payload)
+    if new_md:
+        payload["metadata"] = new_md
+    else:
+        payload.pop("metadata", None)
+    return payload
+
+
 def _request_headers(request: Request) -> dict[str, str | None]:
     return {
         "trace_id": request.headers.get("x-trace-id") or request.headers.get("x-request-id"),
         "source_app": request.headers.get("x-source-app"),
         "user_id": request.headers.get("x-user-id"),
+        "user_display_name": request.headers.get("x-user-name")
+        or request.headers.get("x-user-display-name"),
         "org_id": request.headers.get("x-org-id"),
+        "org_name": request.headers.get("x-org-name"),
+        "chat_id": request.headers.get("x-chat-id"),
     }
 
 
@@ -138,14 +169,28 @@ def _request_context(
 ) -> dict[str, str | None]:
     payload_metadata = payload_metadata or {}
     headers = _request_headers(http_request)
+
+    # Prefer gateway-provided headers over client-supplied payload metadata.
+    # (Load tests may still send metadata; keep it as a fallback.)
+    def pick(key: str, *alt_keys: str) -> str | None:
+        raw = headers.get(key)
+        if raw:
+            return str(raw)
+        for k in (key, *alt_keys):
+            v = payload_metadata.get(k)
+            if v is not None and v != "":
+                return str(v)
+        return None
+
     return {
         "request_id": str(uuid.uuid4()),
-        "trace_id": str(payload_metadata.get("trace_id") or headers["trace_id"] or new_trace_id()),
-        "source_app": str(
-            payload_metadata.get("source_app") or headers["source_app"] or "unknown"
-        ),
-        "user_id": payload_metadata.get("user_id") or headers["user_id"],
-        "org_id": payload_metadata.get("org_id") or headers["org_id"],
+        "trace_id": pick("trace_id") or new_trace_id(),
+        "source_app": pick("source_app") or "unknown",
+        "user_id": pick("user_id"),
+        "user_display_name": pick("user_display_name", "user_name", "display_name"),
+        "org_id": pick("org_id"),
+        "org_name": pick("org_name", "team_name", "group_name"),
+        "chat_id": pick("chat_id", "chatId"),
     }
 
 
@@ -170,7 +215,25 @@ async def create_chat_completion(
     request_payload["model"] = model_config.resolved_model
     sanitized_payload = _sanitize_tools_for_lmstudio(request_payload)
     payload = _strip_lm_studio_base_url_from_payload(sanitized_payload)
+    payload = _strip_identity_metadata_from_payload(payload)
     context = _request_context(http_request, request.metadata)
+
+    # Persist identity hints for admin/UI without changing the DB schema.
+    md = request_payload.get("metadata")
+    if not isinstance(md, dict):
+        md = {}
+    md.update(
+        {
+            "trace_id": context.get("trace_id"),
+            "source_app": context.get("source_app"),
+            "chat_id": context.get("chat_id"),
+            "user_id": context.get("user_id"),
+            "user_display_name": context.get("user_display_name"),
+            "org_id": context.get("org_id"),
+            "org_name": context.get("org_name"),
+        }
+    )
+    request_payload["metadata"] = {k: v for k, v in md.items() if v is not None and v != ""}
 
     if request.stream and not use_queue:
         session_factory = get_session_factory()

@@ -84,6 +84,29 @@ def _strip_lm_studio_base_url_from_payload(payload: dict[str, Any]) -> dict[str,
     return payload
 
 
+def _strip_identity_metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove gateway identity hints before forwarding to LM Studio."""
+    md = payload.get("metadata")
+    if not isinstance(md, dict):
+        return payload
+    drop = {
+        "trace_id",
+        "source_app",
+        "chat_id",
+        "user_id",
+        "user_display_name",
+        "org_id",
+        "org_name",
+    }
+    new_md = {k: v for k, v in md.items() if k not in drop}
+    payload = copy.deepcopy(payload)
+    if new_md:
+        payload["metadata"] = new_md
+    else:
+        payload.pop("metadata", None)
+    return payload
+
+
 def _stream_usage_template() -> dict[str, int]:
     return {
         "prompt_tokens": 0,
@@ -265,6 +288,7 @@ class WorkerService:
                     job["request_payload_json"]
                 )
                 to_lm = _strip_lm_studio_base_url_from_payload(sanitized_payload)
+                to_lm = _strip_identity_metadata_from_payload(to_lm)
                 if job.get("stream"):
                     response_payload = await self._run_streaming_job(
                         job_id=job_id,

@@ -231,6 +231,14 @@ llmProxyRoutes.all('*', async (c) => {
   const base = upstreamBase();
   const method = c.req.method;
   const headers = forwardRequestHeaders(c.req.raw.headers, base);
+
+  // Propagate end-user identity into the orchestrator so its dashboard can attribute traffic.
+  // The browser uses session cookies, so the identity must be added server-side.
+  if (!headers.has('x-source-app')) headers.set('x-source-app', 'EvigstudioLight');
+  if (user) {
+    headers.set('x-user-id', user.id);
+    headers.set('x-user-name', user.displayName);
+  }
   const hasBody = method !== 'GET' && method !== 'HEAD';
 
   const waitMs = queueWaitMs();

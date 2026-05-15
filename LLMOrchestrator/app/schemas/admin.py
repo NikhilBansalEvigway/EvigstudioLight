@@ -61,7 +61,10 @@ class RequestSummaryResponse(BaseModel):
     trace_id: str
     source_app: str | None
     user_id: str | None = None
+    user_display_name: str | None = None
     org_id: str | None = None
+    org_name: str | None = None
+    chat_id: str | None = None
     requested_model: str | None
     resolved_model: str | None
     status: str
@@ -104,7 +107,10 @@ class RequestDetailResponse(BaseModel):
     trace_id: str
     source_app: str | None
     user_id: str | None
+    user_display_name: str | None = None
     org_id: str | None
+    org_name: str | None = None
+    chat_id: str | None = None
     requested_model: str | None
     resolved_model: str | None
     backend_url: str | None

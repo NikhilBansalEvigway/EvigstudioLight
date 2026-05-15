@@ -112,6 +112,22 @@ class AdminService:
             end = end.replace(tzinfo=current_timezone())
         return max(int((end - start).total_seconds() * 1000), 0)
 
+    @staticmethod
+    def _identity_hints(request: LLMRequest) -> dict[str, str | None]:
+        """Extract display labels embedded in request_payload_json.metadata."""
+        payload = request.request_payload_json or {}
+        md = payload.get("metadata") if isinstance(payload, dict) else None
+        if not isinstance(md, dict):
+            md = {}
+        user_display_name = md.get("user_display_name") or md.get("user_name")
+        org_name = md.get("org_name") or md.get("team_name") or md.get("group_name")
+        chat_id = md.get("chat_id") or md.get("chatId")
+        return {
+            "user_display_name": str(user_display_name) if user_display_name else None,
+            "org_name": str(org_name) if org_name else None,
+            "chat_id": str(chat_id) if chat_id else None,
+        }
+
     @classmethod
     def _percentile(cls, values: list[int], percentile: float) -> float:
         if not values:
@@ -362,6 +378,7 @@ class AdminService:
                     "source_app": request.source_app,
                     "user_id": request.user_id,
                     "org_id": request.org_id,
+                    **self._identity_hints(request),
                     "requested_model": request.requested_model,
                     "resolved_model": request.resolved_model,
                     "status": request.status,

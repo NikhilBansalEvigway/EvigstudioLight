@@ -252,12 +252,17 @@ async def get_request_detail(
         target_key=request_id,
     )
 
+    identity = service._identity_hints(request)
+
     return RequestDetailResponse(
         request_id=request.request_id,
         trace_id=request.trace_id,
         source_app=request.source_app,
         user_id=request.user_id,
+        user_display_name=identity.get("user_display_name"),
         org_id=request.org_id,
+        org_name=identity.get("org_name"),
+        chat_id=identity.get("chat_id"),
         requested_model=request.requested_model,
         resolved_model=request.resolved_model,
         backend_url=request.backend_url,

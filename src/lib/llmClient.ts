@@ -11,6 +11,11 @@ interface ChatCompletionOptions {
   useVision?: boolean;
   onToken?: (token: string) => void;
   signal?: AbortSignal;
+  requestContext?: {
+    chatId?: string;
+    orgId?: string | null;
+    orgName?: string | null;
+  };
 }
 
 export async function testConnection(settings: AppSettings): Promise<{ ok: boolean; message: string }> {
@@ -51,7 +56,7 @@ export async function testConnection(settings: AppSettings): Promise<{ ok: boole
   }
 }
 
-export async function chatCompletion({ messages, settings, useVision, onToken, signal }: ChatCompletionOptions): Promise<string> {
+export async function chatCompletion({ messages, settings, useVision, onToken, signal, requestContext }: ChatCompletionOptions): Promise<string> {
   const model = useVision ? settings.visionModel : settings.textModel;
   const body: any = {
     model: model === 'auto' ? undefined : model,
@@ -61,11 +66,17 @@ export async function chatCompletion({ messages, settings, useVision, onToken, s
     stream: settings.stream,
   };
 
+  const contextHeaders: Record<string, string> = {};
+  if (requestContext?.chatId) contextHeaders['x-chat-id'] = requestContext.chatId;
+  if (requestContext?.orgId) contextHeaders['x-org-id'] = requestContext.orgId;
+  if (requestContext?.orgName) contextHeaders['x-org-name'] = requestContext.orgName;
+
   const res = await fetch(`${settings.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...(settings.apiKey ? { 'Authorization': `Bearer ${settings.apiKey}` } : {}),
+      ...contextHeaders,
     },
     body: JSON.stringify(body),
     signal,

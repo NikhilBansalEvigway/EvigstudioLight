@@ -1,15 +1,43 @@
-# Offline override: run EvigStudio Light fully offline.
+# Offline stack: run EvigStudio Light fully offline.
 # UI -> API (/api/llm) -> LLM Orchestrator queue -> LM Studio
 #
 # Usage:
-#   docker compose -f docker-compose.yml -f docker-compose.offline.yml up -d --build
+#   docker compose -f docker-compose.offline.yml up -d --build
 
 services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  # The API connects to this via the docker network hostname `db`.
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: evigstudio
+      POSTGRES_PASSWORD: evigstudio
+      POSTGRES_DB: evigstudio
+    volumes:
+      - evigstudio_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evigstudio"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   api:
     image: evigstudiolight-api:latest
+    build:
+      context: ./server
+      dockerfile: Dockerfile
     # Use a dedicated env file for offline/orchestrator configuration.
     env_file: ./server/.env.offline
+    environment:
+      # IMPORTANT: inside Docker, 127.0.0.1 is the container itself.
+      # Always point at the `db` service over the Compose network.
+      DATABASE_URL: postgresql://evigstudio:evigstudio@db:5432/evigstudio
     depends_on:
+      db:
+        condition: service_healthy
       llm-orch:
         condition: service_started
 
@@ -73,9 +101,19 @@ services:
 
   frontend:
     image: evigstudiolight-frontend:latest
+    build:
+      context: .
+      dockerfile: src/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
 
 volumes:
-  # Reuse existing orchestrator volume (keeps queue history/config).
+  # Orchestrator state (queue DB). Compose will create this volume if missing.
   llm-db-data:
-    external: true
-    name: evig-studio_llm-db-data
+
+  # PostgreSQL data
+  evigstudio_pgdata:

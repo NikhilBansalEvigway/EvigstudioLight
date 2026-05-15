@@ -18,6 +18,7 @@ import {
   hasGatherTools,
   hasMutationTools,
   executeAgentTools,
+  stripChannelTokens,
   type AgentAction,
 } from '@/lib/agentTools';
 import { applyPatch, containsPatches, parsePatches } from '@/lib/patchApply';
@@ -942,6 +943,13 @@ export function ChatPane() {
 
     let loopMessages: LLMMessage[] = candidateMessages;
 
+     const chatForContext = useAppStore.getState().chats.find((c) => c.id === chatId) ?? null;
+     const requestContext = {
+       chatId,
+       orgId: chatForContext?.groupId ?? null,
+       orgName: chatForContext?.groupName ?? null,
+     };
+
     try {
       let streamedContent = '';
       const allActions: AgentAction[] = [];
@@ -963,12 +971,13 @@ export function ChatPane() {
           useVision: hasVision && iter === 1,
           onToken: (full) => updateLastAssistantMessage(chatId, full),
           signal: abortRef.current!.signal,
+          requestContext,
         });
 
         if (!isAgentMode) break;
         if (iter >= maxIter) break;
 
-        const tools = parseToolCalls(streamedContent);
+        const tools = parseToolCalls(stripChannelTokens(streamedContent));
         if (!hasAgentTools(tools)) break;
 
         const roots = useAppStore.getState().workspaceRoots;
@@ -1339,6 +1348,11 @@ export function ChatPane() {
           maxTokens: Math.min(2048, Math.max(512, Math.floor(settings.maxTokens / 2))),
         },
         useVision: false,
+        requestContext: {
+          chatId,
+          orgId: chat.groupId ?? null,
+          orgName: chat.groupName ?? null,
+        },
       })).trim();
 
       if (!summary) {

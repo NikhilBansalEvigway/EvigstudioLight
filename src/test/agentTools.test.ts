@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { hasMutationTools, parseToolCalls, sanitizeWrittenFileContent, stripToolMarkers } from '@/lib/agentTools';
+import {
+  hasMutationTools,
+  parseToolCalls,
+  sanitizeWrittenFileContent,
+  stripChannelTokens,
+  stripToolMarkers,
+} from '@/lib/agentTools';
 
 describe('parseToolCalls', () => {
   it('parses plain and ranged read-file requests', () => {
@@ -69,5 +75,19 @@ describe('parseToolCalls', () => {
     expect(
       sanitizeWrittenFileContent(['src/example.ts', '```ts', 'export const answer = 42;', '```'].join('\n')),
     ).toBe('export const answer = 42;');
+  });
+
+  it('can strip model channel prefixes so tool calls still parse', () => {
+    const raw = [
+      '<|channel>thought I will inspect the folder.',
+      '<channel|>*** List Directory: src',
+      '<|assistant|>*** Read File: src/main.tsx#L1-L5',
+    ].join('\n');
+
+    const cleaned = stripChannelTokens(raw);
+    const parsed = parseToolCalls(cleaned);
+
+    expect(parsed.listDirs).toEqual(['src']);
+    expect(parsed.readFiles[0]).toEqual({ path: 'src/main.tsx', startLine: 1, endLine: 5 });
   });
 });

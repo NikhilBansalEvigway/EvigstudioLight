@@ -342,6 +342,18 @@ export function stripThinkingBlocks(text: string): string {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 }
 
+/**
+ * Some model servers prefix lines with channel markers like "<|channel|>" or "<channel|>".
+ * These break our ^*** tool line parsing, so strip them (line-start only).
+ */
+export function stripChannelTokens(text: string): string {
+  return text
+    // e.g. "<|assistant>" / "<|channel>thought" (no trailing "|>")
+    .replace(/^\s*<\|[^>\n]{1,64}>\s*/gim, '')
+    .replace(/^\s*<\|[^>\n]*\|>\s*/gim, '')
+    .replace(/^\s*<[^>\n]*\|>\s*/gim, '');
+}
+
 /** Strip agent tool markers from displayed text so users see clean output. */
 export function stripToolMarkers(text: string): string {
   let cleaned = text;

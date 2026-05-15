@@ -485,8 +485,8 @@ async function openRequestDetail(requestId) {
           <div><strong>Trace ID</strong><div>${escapeHtml(detail.trace_id)}</div></div>
           <div><strong>Source</strong><div>${escapeHtml(detail.source_app || "unknown")}</div></div>
           <div><strong>Status</strong><div>${badge(detail.status)}</div></div>
-          <div><strong>User</strong><div>${escapeHtml(detail.user_id || "-")}</div></div>
-          <div><strong>Org</strong><div>${escapeHtml(detail.org_id || "-")}</div></div>
+          <div><strong>User</strong><div>${escapeHtml(detail.user_display_name || detail.user_id || "-")}</div></div>
+          <div><strong>Org</strong><div>${escapeHtml(detail.org_name || detail.org_id || "-")}</div></div>
           <div><strong>Model</strong><div>${escapeHtml(detail.resolved_model || detail.requested_model || "-")}</div></div>
           <div><strong>Latency</strong><div>${formatNumber(detail.processing_time_ms || 0)} ms</div></div>
           <div><strong>Queue Wait</strong><div>${formatNumber(detail.queue_wait_ms || 0)} ms</div></div>
@@ -608,7 +608,8 @@ async function renderRequests() {
         requests.map((request) => [
           `<button class="small-btn alt" data-request-id="${request.request_id}">Open</button>`,
           escapeHtml(request.source_app || "unknown"),
-          escapeHtml(request.user_id || "-"),
+          escapeHtml(request.user_display_name || request.user_id || "-"),
+          escapeHtml(request.org_name || request.org_id || "-"),
           escapeHtml(request.resolved_model || request.requested_model || "-"),
           badge(request.status),
           escapeHtml(request.error_code || "-"),
@@ -616,7 +617,7 @@ async function renderRequests() {
           `${formatNumber(request.processing_time_ms || 0)} ms`,
           formatDate(request.created_at),
         ]),
-        ["Request", "Source", "User", "Model", "Status", "Error", "Tokens", "Latency", "Created"],
+        ["Request", "Source", "User", "Org", "Model", "Status", "Error", "Tokens", "Latency", "Created"],
       )}
     </div>`;
 
