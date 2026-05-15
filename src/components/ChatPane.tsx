@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo, useLayoutEffect } from 'react';
 import { useAppStore } from '@/store/useAppStore';
 import { chatCompletion, type ChatMessage as LLMMessage } from '@/lib/llmClient';
 import {
@@ -63,6 +63,8 @@ const KEY_PROJECT_FILES = [
 const CONTEXT_WARNING_RATIO = 0.86;
 const AUTO_SUMMARY_HEADER = 'Conversation summary (auto-generated):';
 const AUTO_SUMMARY_FOOTER = 'Continue chatting with this summary as context.';
+const INPUT_MIN_HEIGHT_PX = 56;
+const INPUT_MAX_HEIGHT_PX = 220;
 
 export function ChatPane() {
   const {
@@ -99,6 +101,20 @@ export function ChatPane() {
   const abortRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const resizeInputTextarea = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = 'auto';
+    const nextHeight = Math.max(INPUT_MIN_HEIGHT_PX, Math.min(textarea.scrollHeight, INPUT_MAX_HEIGHT_PX));
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = textarea.scrollHeight > INPUT_MAX_HEIGHT_PX ? 'auto' : 'hidden';
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeInputTextarea();
+  }, [input, resizeInputTextarea]);
 
   const onDictationFinal = useCallback((t: string) => {
     setInput((prev) => {

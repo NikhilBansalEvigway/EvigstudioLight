@@ -22,6 +22,7 @@ import { SYSTEM_PROMPT } from '@/types';
 import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus, X, Copy, Users, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useState, useCallback, useEffect, useRef } from 'react';
+import { useActiveUsers } from '@/hooks/useActiveUsers';
 import { useTheme } from 'next-themes';
 import Editor, { loader } from '@monaco-editor/react';
 import * as monaco from 'monaco-editor';
@@ -353,6 +354,7 @@ export function WorkspacePane() {
     { id: 'files' as const, label: 'Files', icon: FolderOpen },
     { id: 'editor' as const, label: 'Editor', icon: FileCode },
     { id: 'context' as const, label: 'Context', icon: BookOpen },
+    ...(user?.role === 'admin' ? [{ id: 'users' as const, label: 'Users', icon: Users }] : []),
   ];
 
   return (
@@ -724,6 +726,15 @@ export function WorkspacePane() {
           </div>
         )}
 
+        {rightPaneTab === 'users' && (
+          <div className="flex flex-col h-full">
+            <div className="pane-header px-3 py-2 border-b border-border flex items-center justify-between">
+              <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">Active Users</span>
+            </div>
+            <ActiveUsersTabContent />
+          </div>
+        )}
+
         {rightPaneTab === 'prompt' && (
           <div className="p-3">
             <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">System Prompt (Read-Only)</span>
@@ -733,6 +744,97 @@ export function WorkspacePane() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function getInitials(name: string): string {
+  return name
+    .split(' ')
+    .map((n) => n[0])
+    .join('')
+    .toUpperCase()
+    .slice(0, 2);
+}
+
+function getAvatarColor(id: string): string {
+  const colors = [
+    'bg-blue-500', 'bg-violet-500', 'bg-emerald-500',
+    'bg-rose-500', 'bg-amber-500', 'bg-cyan-500', 'bg-pink-500',
+  ];
+  const index = id.charCodeAt(0) % colors.length;
+  return colors[index];
+}
+
+function formatLastSeen(lastSeen: number | null): string {
+  if (lastSeen === null) return 'Never logged in';
+  const seconds = Math.floor((Date.now() - lastSeen) / 1000);
+  if (seconds < 10) return 'Just now';
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;   // ← replaces the bare return
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function ActiveUsersTabContent() {
+  const { user, serverAvailable } = useAuth();
+  const users = useActiveUsers(!!user && serverAvailable);
+  const [, forceUpdate] = useState(0);
+
+  // Re-render every 10s so "last seen" stays fresh
+  useEffect(() => {
+    const timer = setInterval(() => forceUpdate((n) => n + 1), 10_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <div className="flex-1 overflow-y-auto px-2 py-3 space-y-1">
+      <p className="text-[10px] text-muted-foreground px-2 pb-2">
+        {users.length} user{users.length === 1 ? '' : 's'} online now
+      </p>
+      {users.length === 0 ? (
+        <div className="text-xs text-muted-foreground text-center py-8">
+          No users online
+        </div>
+      ) : (
+        users.map((u) => (
+          <div key={u.id} className="flex items-center gap-2.5 px-2 py-2 rounded-xl hover:bg-secondary/50 transition-colors text-xs">
+            {/* Avatar with initials */}
+            <div className={`relative shrink-0 flex h-7 w-7 items-center justify-center rounded-full text-white text-[10px] font-bold ${getAvatarColor(u.id)}`}>
+              {getInitials(u.displayName)}
+              {/* Status dot */}
+              <span className="absolute -bottom-0.5 -right-0.5 flex h-2.5 w-2.5 items-center justify-center rounded-full bg-background">
+                <span className="relative flex h-2 w-2">
+                  {u.status === 'active' && (
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                  )}
+                  <span className={`relative inline-flex rounded-full h-2 w-2 ${u.status === 'active' ? 'bg-green-500' : 'bg-red-500'}`} />
+                </span>
+              </span>
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate font-medium text-foreground">
+                {u.displayName}
+                {u.id === user?.id && (
+                  <span className="ml-1 text-[10px] text-muted-foreground">(you)</span>
+                )}
+              </div>
+              <div className="truncate text-[10px] text-muted-foreground">{u.email}</div>
+            </div>
+            {/* Last active */}
+            <div className="shrink-0 text-[10px] text-muted-foreground">
+              {u.status === 'active' ? (
+                <span className="text-green-500 font-medium">Online</span>
+              ) : (
+                formatLastSeen(u.lastSeen)
+              )}
+            </div>
+          </div>
+        ))
+      )}
     </div>
   );
 }

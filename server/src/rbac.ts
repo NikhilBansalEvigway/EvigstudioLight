@@ -33,7 +33,7 @@ const ROLE_PERMISSIONS: Record<RoleName, Set<Permission | '*'>> = {
     'workspace.shares_manage',
   ]),
   tester: new Set(['chats.read_own', 'chats.write_own', 'groups.read']),
-  auditor: new Set(['chats.read_all', 'groups.read', 'audit.read']),
+  auditor: new Set(['groups.read', 'audit.read']),
 };
 
 export function roleHasPermission(role: RoleName, permission: Permission): boolean {

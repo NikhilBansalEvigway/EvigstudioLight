@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { and, desc, eq, inArray, or } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { chats, groups, users } from '../db/schema.js';
 import {
@@ -129,27 +129,12 @@ chatRoutes.get('/', async (c) => {
   const groupIds = await getUserGroupIds(user.id);
   const gidSet = new Set(groupIds);
 
-  let rows;
-  if (user.role === 'admin' || user.role === 'auditor') {
-    rows = await db
-      .select({ chat: chats, ownerDisplayName: users.displayName, groupName: groups.name })
-      .from(chats)
-      .innerJoin(users, eq(chats.ownerId, users.id))
-      .leftJoin(groups, eq(chats.groupId, groups.id))
-      .orderBy(desc(chats.updatedAt));
-  } else {
-    const conds = [eq(chats.ownerId, user.id), eq(chats.privacy, 'shared')];
-    if (groupIds.length > 0) {
-      conds.push(and(eq(chats.privacy, 'group'), inArray(chats.groupId, groupIds))!);
-    }
-    rows = await db
-      .select({ chat: chats, ownerDisplayName: users.displayName, groupName: groups.name })
-      .from(chats)
-      .innerJoin(users, eq(chats.ownerId, users.id))
-      .leftJoin(groups, eq(chats.groupId, groups.id))
-      .where(or(...conds))
-      .orderBy(desc(chats.updatedAt));
-  }
+  const rows = await db
+    .select({ chat: chats, ownerDisplayName: users.displayName, groupName: groups.name })
+    .from(chats)
+    .innerJoin(users, eq(chats.ownerId, users.id))
+    .leftJoin(groups, eq(chats.groupId, groups.id))
+    .orderBy(desc(chats.updatedAt));
 
   const out = rows
     .map((r) => {
