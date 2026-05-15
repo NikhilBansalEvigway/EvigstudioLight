@@ -793,7 +793,7 @@ function ActiveUsersTabContent() {
   return (
     <div className="flex-1 overflow-y-auto px-2 py-3 space-y-1">
       <p className="text-[10px] text-muted-foreground px-2 pb-2">
-        {users.length} user{users.length === 1 ? '' : 's'} online now
+        {users.filter(u => u.status === 'active').length} user{users.filter(u => u.status === 'active').length === 1 ? '' : 's'} online now
       </p>
       {users.length === 0 ? (
         <div className="text-xs text-muted-foreground text-center py-8">
