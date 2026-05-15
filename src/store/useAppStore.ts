@@ -127,6 +127,10 @@ interface AppState {
   /** Team server: context filtering rules for what files can be attached to the agent. */
   serverContextRules: ContextRules | null;
   refreshServerContextRules: () => Promise<void>;
+
+  /** Team server: shared chat limits (applies to all users). */
+  serverChatLimits: { contextBudgetChars: number } | null;
+  refreshServerChatLimits: () => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -753,6 +757,29 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ serverContextRules: rules });
     } catch {
       set({ serverContextRules: null });
+    }
+  },
+
+  serverChatLimits: null,
+  refreshServerChatLimits: async () => {
+    try {
+      const r = await fetch('/api/chat-limits', { credentials: 'include' });
+      if (!r.ok) {
+        set({ serverChatLimits: null });
+        return;
+      }
+      const d = (await r.json()) as { limits?: unknown };
+      const raw = d.limits && typeof d.limits === 'object' ? (d.limits as Record<string, unknown>) : {};
+      const v = typeof raw.contextBudgetChars === 'number' ? raw.contextBudgetChars : 120_000;
+      const contextBudgetChars = Math.min(500_000, Math.max(40_000, Math.round(v)));
+      set((s) => ({
+        serverChatLimits: { contextBudgetChars },
+        contextBudgetChars,
+        // Preserve current usage; only update the shared budget.
+        contextUsedChars: Math.max(0, s.contextUsedChars || 0),
+      }));
+    } catch {
+      set({ serverChatLimits: null });
     }
   },
 }));

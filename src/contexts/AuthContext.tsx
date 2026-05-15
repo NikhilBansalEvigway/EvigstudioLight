@@ -94,10 +94,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!ready || !serverAvailable || !user) {
-      useAppStore.setState({ serverSystemPrompts: null });
+      useAppStore.setState({ serverSystemPrompts: null, serverChatLimits: null, serverContextRules: null });
       return;
     }
     void useAppStore.getState().refreshServerSystemPrompts();
+    void useAppStore.getState().refreshServerChatLimits();
+    void useAppStore.getState().refreshServerContextRules();
   }, [ready, serverAvailable, user]);
 
   useEffect(() => {

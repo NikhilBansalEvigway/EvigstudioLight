@@ -314,6 +314,7 @@ export default function AdminPage() {
   const { user, serverAvailable } = useAuth();
   const refreshServerSystemPrompts = useAppStore((s) => s.refreshServerSystemPrompts);
   const refreshServerContextRules = useAppStore((s) => s.refreshServerContextRules);
+  const refreshServerChatLimits = useAppStore((s) => s.refreshServerChatLimits);
 
   const [users, setUsers] = useState<UserRow[]>([]);
   const [userTotal, setUserTotal] = useState(0);
@@ -398,6 +399,10 @@ export default function AdminPage() {
   const [contextAllowDotEnv, setContextAllowDotEnv] = useState(DEFAULT_CONTEXT_RULES.allowDotEnv);
   const [contextAllowedExtensions, setContextAllowedExtensions] = useState(DEFAULT_CONTEXT_RULES.allowedExtensions.join(', '));
   const [contextAllowedBasenames, setContextAllowedBasenames] = useState(DEFAULT_CONTEXT_RULES.allowedBasenames.join(', '));
+
+  const [chatLimitsLoading, setChatLimitsLoading] = useState(false);
+  const [chatLimitsSaving, setChatLimitsSaving] = useState(false);
+  const [contextBudgetCharsDraft, setContextBudgetCharsDraft] = useState('120000');
 
   useEffect(() => {
     const t = window.setTimeout(() => setUserQuery(userSearchInput.trim()), 350);
@@ -597,6 +602,23 @@ export default function AdminPage() {
     }
   }, [user, serverAvailable]);
 
+  const loadChatLimits = useCallback(async () => {
+    if (!user || user.role !== 'admin' || !serverAvailable) return;
+    setChatLimitsLoading(true);
+    try {
+      const r = await fetch('/api/chat-limits', { credentials: 'include' });
+      if (!r.ok) return;
+      const d = (await r.json()) as { limits?: unknown };
+      const raw = d.limits && typeof d.limits === 'object' ? (d.limits as Record<string, unknown>) : {};
+      const n = typeof raw.contextBudgetChars === 'number' ? raw.contextBudgetChars : 120_000;
+      setContextBudgetCharsDraft(String(Math.round(n)));
+    } catch {
+      toast.error('Could not load chat limits');
+    } finally {
+      setChatLimitsLoading(false);
+    }
+  }, [user, serverAvailable]);
+
   useEffect(() => {
     if (!user || !serverAvailable || user.role !== 'admin') return;
     void loadPromptPanel();
@@ -606,6 +628,11 @@ export default function AdminPage() {
     if (!user || !serverAvailable || user.role !== 'admin') return;
     void loadContextRules();
   }, [user, serverAvailable, user.role, loadContextRules]);
+
+  useEffect(() => {
+    if (!user || !serverAvailable || user.role !== 'admin') return;
+    void loadChatLimits();
+  }, [user, serverAvailable, user.role, loadChatLimits]);
 
   useEffect(() => {
     if (!user || !serverAvailable || user.role !== 'admin') return;
@@ -737,6 +764,32 @@ export default function AdminPage() {
       await loadContextRules();
     } finally {
       setContextRulesSaving(false);
+    }
+  };
+
+  const saveChatLimits = async () => {
+    setChatLimitsSaving(true);
+    try {
+      const parsed = Math.round(Number(contextBudgetCharsDraft));
+      if (!Number.isFinite(parsed) || parsed < 40_000 || parsed > 500_000) {
+        toast.error('Context budget must be between 40,000 and 500,000 characters');
+        return;
+      }
+      const r = await fetch('/api/admin/chat-limits', {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contextBudgetChars: parsed }),
+      });
+      if (!r.ok) {
+        toast.error('Could not save chat limits');
+        return;
+      }
+      toast.success('Saved. New limits apply on the next LLM request.');
+      await refreshServerChatLimits();
+      await loadChatLimits();
+    } finally {
+      setChatLimitsSaving(false);
     }
   };
 
@@ -1864,6 +1917,54 @@ export default function AdminPage() {
               Control which file types are eligible to be sent to the agent as context. Non-matching files (images,
               logos, binaries) are skipped even if a user pins them.
             </p>
+
+            <div className="rounded-md border border-border bg-card p-4 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">Context window budget</div>
+                  <div className="text-[11px] text-muted-foreground">
+                    Sets the <span className="font-mono">Ctx</span> meter budget for all users and caps how much workspace context is attached per request.
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 text-xs"
+                    disabled={chatLimitsSaving}
+                    onClick={() => setContextBudgetCharsDraft('120000')}
+                  >
+                    Reset defaults
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="h-8 text-xs"
+                    disabled={chatLimitsSaving || chatLimitsLoading}
+                    onClick={() => void saveChatLimits()}
+                  >
+                    Save
+                  </Button>
+                </div>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <Label className="text-xs">Budget (characters)</Label>
+                  <Input
+                    value={contextBudgetCharsDraft}
+                    onChange={(e) => setContextBudgetCharsDraft(e.target.value)}
+                    className="h-9 text-xs font-mono"
+                    inputMode="numeric"
+                    placeholder="120000"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Allowed range: <span className="font-mono">40000</span> to <span className="font-mono">500000</span>.
+                  </p>
+                </div>
+              </div>
+            </div>
 
             <div className="rounded-md border border-border bg-card p-4 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3">

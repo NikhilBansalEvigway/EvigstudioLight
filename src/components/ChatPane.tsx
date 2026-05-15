@@ -80,6 +80,13 @@ export function ChatPane() {
   const [agentGatherStep, setAgentGatherStep] = useState<number | null>(null);
   const [showContextActionsDialog, setShowContextActionsDialog] = useState(false);
   const [isCondensingChat, setIsCondensingChat] = useState(false);
+  const pendingContextActionInputRef = useRef<{
+    input: string;
+    images: string[];
+    mentionedFiles: string[];
+    /** Present when the input was already appended to chat history. */
+    sentUserMessageId?: string;
+  } | null>(null);
   const [contextPressure, setContextPressure] = useState<{
     usedChars: number;
     budgetChars: number;
@@ -249,8 +256,7 @@ export function ChatPane() {
     const historyChars = messages.reduce((sum, message) => sum + getMessageText(message).length + 48, 0);
     const pendingChars = Math.max(0, pendingText.length) + Math.max(0, pendingImageCount) * 8_000 + 512;
     const workspaceChars = Math.max(0, contextUsedChars || 0);
-    const tokenBudgetChars = Math.max(24_000, Math.min(320_000, Math.round((settings.maxTokens || 8192) * 4)));
-    const budgetChars = Math.max(60_000, Math.max(tokenBudgetChars, contextBudgetChars || 120_000));
+    const budgetChars = Math.max(40_000, contextBudgetChars || 120_000);
     const usedChars = historyChars + workspaceChars + pendingChars;
     const ratio = budgetChars > 0 ? usedChars / budgetChars : 0;
     return {
@@ -262,7 +268,41 @@ export function ChatPane() {
       ratio,
       shouldPrompt: ratio >= CONTEXT_WARNING_RATIO,
     };
-  }, [contextBudgetChars, contextUsedChars, settings.maxTokens]);
+  }, [contextBudgetChars, contextUsedChars]);
+
+  const estimateContextPressureForApi = useCallback((apiMessages: LLMMessage[]) => {
+    // Rough (but consistent) approximation: chars ~ tokens*4.
+    // Intentionally over-count slightly with per-message overhead.
+    const usedChars = apiMessages.reduce((sum, message) => {
+      const content = typeof message.content === 'string'
+        ? message.content
+        : message.content
+            .map((p) => (p.type === 'text' ? p.text : '[image]'))
+            .join(' ');
+      return sum + content.length + 48;
+    }, 0);
+    const budgetChars = Math.max(40_000, contextBudgetChars || 120_000);
+    const ratio = budgetChars > 0 ? usedChars / budgetChars : 0;
+    return {
+      usedChars,
+      budgetChars,
+      ratio,
+      shouldPrompt: ratio >= CONTEXT_WARNING_RATIO,
+    };
+  }, [contextBudgetChars]);
+
+  const isContextLengthError = useCallback((msg: string) => {
+    const t = msg.toLowerCase();
+    return (
+      t.includes('context length') ||
+      t.includes('maximum context') ||
+      t.includes('max context') ||
+      t.includes('prompt is too long') ||
+      t.includes('too many tokens') ||
+      t.includes('token limit') ||
+      t.includes('context window')
+    );
+  }, []);
 
   const buildCondenseTranscript = useCallback((messages: Message[], maxChars = 90_000) => {
     const chunks: string[] = [];
@@ -434,7 +474,7 @@ export function ChatPane() {
 
   const buildContextMessages = useCallback(async (messageMentionedFiles: string[] = []): Promise<{ role: 'user'; content: string }[]> => {
     if (workspaceRoots.length === 0) {
-      useAppStore.getState().setContextUsage(0, 120_000);
+      useAppStore.getState().setContextUsage(0, Math.max(40_000, contextBudgetChars || 120_000));
       return [];
     }
 
@@ -446,7 +486,7 @@ export function ChatPane() {
     const MAX_FILE_CHARS_AUTO = 2_000;
     const MAX_FILE_CHARS_EXPLICIT = 60_000;
     const MAX_FOLDER_FILE_CONTENTS = 8;
-    const MAX_TOTAL_CONTEXT_CHARS = 120_000;
+    const MAX_TOTAL_CONTEXT_CHARS = Math.max(40_000, contextBudgetChars || 120_000);
 
     const truncate = (content: string, maxChars: number) => ({
       text: content.length > maxChars ? `${content.slice(0, maxChars)}\n\n... [truncated]` : content,
@@ -597,7 +637,7 @@ export function ChatPane() {
     const content = `Workspace context (use paths below as ground truth; do not invent paths that are not listed):\n${summary}\n\n${parts.join('\n\n')}`;
     useAppStore.getState().setContextUsage(content.length, MAX_TOTAL_CONTEXT_CHARS);
     return [{ role: 'user' as const, content }];
-  }, [workspaceRoots, fileTree, contextFiles, serverContextRules]);
+  }, [workspaceRoots, fileTree, contextFiles, contextBudgetChars, serverContextRules]);
 
   const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
@@ -811,10 +851,11 @@ export function ChatPane() {
     baseMessages: Message[];
     hasVision: boolean;
     mentionedFilePaths?: string[];
-  }) => {
+  }): Promise<boolean> => {
     if (getChatPersistenceMode() === 'server') {
       await useAppStore.getState().refreshServerSystemPrompts();
       await useAppStore.getState().refreshServerContextRules();
+      await useAppStore.getState().refreshServerChatLimits();
     }
     const isAgentMode = chatMode === 'agent';
     const sp = useAppStore.getState().serverSystemPrompts;
@@ -827,6 +868,60 @@ export function ChatPane() {
     const shouldIncludeWorkspaceContext =
       workspaceRoots.length > 0 && (isAgentMode || turnContextPaths.length > 0 || contextFiles.length > 0);
     const contextMsgs = shouldIncludeWorkspaceContext ? await buildContextMessages(turnContextPaths) : [];
+
+    let needsContextAction = false;
+
+    // Re-check context pressure using the actual messages we will send.
+    // The UI pre-check uses cached workspace context size and can be stale when context pins/@mentions change.
+    const toApi = (message: Message): LLMMessage => ({ role: message.role, content: message.content });
+
+    const messageChars = (m: LLMMessage) => {
+      const content = typeof m.content === 'string'
+        ? m.content
+        : m.content
+            .map((p) => (p.type === 'text' ? p.text : '[image]'))
+            .join(' ');
+      return content.length + 48;
+    };
+
+    const candidateMessages: LLMMessage[] = [
+      { role: 'system', content: systemPrompt },
+      ...contextMsgs,
+      ...baseMessages.map(toApi),
+      { role: 'assistant', content: '' },
+    ];
+    const apiPressure = estimateContextPressureForApi(candidateMessages);
+    if (apiPressure.shouldPrompt) {
+      const systemChars = messageChars({ role: 'system', content: systemPrompt });
+      const workspaceChars = contextMsgs.reduce((sum, m) => sum + messageChars(m), 0);
+      const baseChars = baseMessages.map(toApi).reduce((sum, m) => sum + messageChars(m), 0);
+      const assistantStubChars = messageChars({ role: 'assistant', content: '' });
+      const historyChars = systemChars + baseChars + assistantStubChars;
+      setContextPressure((prev) => {
+        if (prev) {
+          return {
+            ...prev,
+            usedChars: apiPressure.usedChars,
+            budgetChars: apiPressure.budgetChars,
+            historyChars,
+            workspaceChars,
+            pendingChars: 0,
+            ratio: apiPressure.ratio,
+          };
+        }
+        return {
+          usedChars: apiPressure.usedChars,
+          budgetChars: apiPressure.budgetChars,
+          historyChars,
+          workspaceChars,
+          pendingChars: 0,
+          ratio: apiPressure.ratio,
+        };
+      });
+      setShowContextActionsDialog(true);
+      needsContextAction = true;
+      return false;
+    }
 
     const assistantMsg: Message = {
       id: crypto.randomUUID(),
@@ -845,14 +940,7 @@ export function ChatPane() {
 
     useAppStore.getState().setAgentStepProgress(0, isAgentMode ? maxIter : 0);
 
-    const toApi = (message: Message): LLMMessage => ({ role: message.role, content: message.content });
-
-    let loopMessages: LLMMessage[] = [
-      { role: 'system', content: systemPrompt },
-      ...contextMsgs,
-      ...baseMessages.map(toApi),
-      { role: 'assistant', content: '' },
-    ];
+    let loopMessages: LLMMessage[] = candidateMessages;
 
     try {
       let streamedContent = '';
@@ -966,6 +1054,20 @@ export function ChatPane() {
       const name = err instanceof Error ? err.name : '';
       if (name !== 'AbortError') {
         const errorMsg = err instanceof Error ? err.message : 'Unknown error';
+        if (isContextLengthError(errorMsg)) {
+          // Provider rejected due to context size: prompt user with summarize/clear/new chat actions.
+          const p = estimateContextPressureForApi(loopMessages);
+          setContextPressure({
+            usedChars: p.usedChars,
+            budgetChars: p.budgetChars,
+            historyChars: p.usedChars,
+            workspaceChars: 0,
+            pendingChars: 0,
+            ratio: p.ratio,
+          });
+          setShowContextActionsDialog(true);
+          needsContextAction = true;
+        }
         updateLastAssistantMessage(chatId, `Error: ${errorMsg}\n\nTips:\n- Check your local AI server is running\n- Verify the base URL in settings\n- Enable CORS in your AI server\n- Try a different model`);
         toast.error('Local AI request failed');
       }
@@ -975,7 +1077,9 @@ export function ChatPane() {
       useAppStore.getState().setAgentStepProgress(0, 0);
       abortRef.current = null;
     }
-  }, [addMessage, addPatchedPaths, buildContextMessages, contextFiles.length, refreshFileTree, runAgentAutoApply, runDirectEditAutoApply, setIsStreaming, settings, updateLastAssistantMessage, workspaceRoots.length]);
+
+    return !needsContextAction;
+  }, [addMessage, addPatchedPaths, buildContextMessages, contextFiles.length, estimateContextPressureForApi, isContextLengthError, refreshFileTree, runAgentAutoApply, runDirectEditAutoApply, setIsStreaming, settings, updateLastAssistantMessage, workspaceRoots.length]);
 
   const handleSubmitMessageEdit = useCallback(async (messageId: string, nextText: string) => {
     const chatId = useAppStore.getState().activeChatId;
@@ -1054,6 +1158,11 @@ export function ChatPane() {
 
   const sendCurrentInput = useCallback(async () => {
     if ((!input.trim() && images.length === 0) || isStreaming) return;
+
+    // If we end up prompting for context actions after this send (due to a more accurate
+    // context size check in the LLM pipeline), we can restore and re-send this input.
+    pendingContextActionInputRef.current = { input, images, mentionedFiles };
+
     const state = useAppStore.getState();
     const currentActiveChat = state.activeChatId
       ? state.chats.find((chat) => chat.id === state.activeChatId) ?? null
@@ -1124,6 +1233,14 @@ export function ChatPane() {
       ...(contextRefs.length > 0 ? { contextRefs } : {}),
     };
 
+    // Mark this pending input as already appended to history.
+    pendingContextActionInputRef.current = {
+      input: rawInput,
+      images,
+      mentionedFiles: mentionedFilePaths,
+      sentUserMessageId: userMsg.id,
+    };
+
     addMessage(chatId, userMsg);
     userScrolledUp.current = false;
     setInput('');
@@ -1158,13 +1275,18 @@ export function ChatPane() {
     }
 
     const baseMessages = useAppStore.getState().chats.find((c) => c.id === chatId)?.messages ?? [userMsg];
-    await runAssistantTurn({
+    const turnOk = await runAssistantTurn({
       chatId,
       chatMode: effectiveMode,
       baseMessages,
       hasVision,
       mentionedFilePaths,
     });
+
+    // If the turn completed without requiring context actions, discard the pending re-send.
+    if (turnOk) {
+      pendingContextActionInputRef.current = null;
+    }
   }, [
     input,
     images,
@@ -1285,9 +1407,29 @@ export function ChatPane() {
   }, [saveVersionSnapshot, trimMessageUiState, updateChatFields]);
 
   const handleContextActionSummarize = useCallback(async () => {
+    // If we already captured a pending input (because the turn was blocked by context),
+    // remove the last user message so the transcript doesn't double-count it.
+    if (pendingContextActionInputRef.current?.sentUserMessageId) {
+      const st = useAppStore.getState();
+      const chatId = st.activeChatId;
+      const chat = chatId ? st.chats.find((c) => c.id === chatId) : null;
+      if (chat && canWriteChat(chat)) {
+        const last = chat.messages[chat.messages.length - 1];
+        if (last?.role === 'user' && last.id === pendingContextActionInputRef.current.sentUserMessageId) {
+          updateChatFields(chat.id, { messages: chat.messages.slice(0, -1) });
+        }
+      }
+    }
     const ok = await summarizeActiveChat();
     if (!ok) return;
     setShowContextActionsDialog(false);
+    if (pendingContextActionInputRef.current) {
+      const pending = pendingContextActionInputRef.current;
+      pendingContextActionInputRef.current = null;
+      setInput(pending.input);
+      setImages(pending.images);
+      setMentionedFiles(pending.mentionedFiles);
+    }
     await sendCurrentInput();
   }, [sendCurrentInput, summarizeActiveChat]);
 
@@ -1295,6 +1437,13 @@ export function ChatPane() {
     const ok = clearActiveChat();
     if (!ok) return;
     setShowContextActionsDialog(false);
+    if (pendingContextActionInputRef.current) {
+      const pending = pendingContextActionInputRef.current;
+      pendingContextActionInputRef.current = null;
+      setInput(pending.input);
+      setImages(pending.images);
+      setMentionedFiles(pending.mentionedFiles);
+    }
     await sendCurrentInput();
   }, [clearActiveChat, sendCurrentInput]);
 
@@ -1302,6 +1451,13 @@ export function ChatPane() {
     try {
       await createChat();
       setShowContextActionsDialog(false);
+      if (pendingContextActionInputRef.current) {
+        const pending = pendingContextActionInputRef.current;
+        pendingContextActionInputRef.current = null;
+        setInput(pending.input);
+        setImages(pending.images);
+        setMentionedFiles(pending.mentionedFiles);
+      }
       await sendCurrentInput();
     } catch (e) {
       console.error('[EvigStudio] createChat for context action', e);
@@ -1326,6 +1482,7 @@ export function ChatPane() {
     if (currentActiveChat) {
       const pressure = estimateContextPressure(currentActiveChat.messages, input, images.length);
       if (pressure.shouldPrompt) {
+        pendingContextActionInputRef.current = { input, images, mentionedFiles };
         setContextPressure({
           usedChars: pressure.usedChars,
           budgetChars: pressure.budgetChars,
@@ -1455,6 +1612,29 @@ export function ChatPane() {
               type="button"
               variant="outline"
               onClick={() => {
+                // If this prompt was triggered after we already appended the user's message,
+                // treat Cancel as "undo send" and restore the input.
+                if (pendingContextActionInputRef.current?.sentUserMessageId) {
+                  const st = useAppStore.getState();
+                  const chatId = st.activeChatId;
+                  const chat = chatId ? st.chats.find((c) => c.id === chatId) : null;
+                  if (chat && canWriteChat(chat)) {
+                    const last = chat.messages[chat.messages.length - 1];
+                    if (last?.role === 'user' && last.id === pendingContextActionInputRef.current.sentUserMessageId) {
+                      updateChatFields(chat.id, { messages: chat.messages.slice(0, -1) });
+                    }
+                  }
+
+                  const pending = pendingContextActionInputRef.current;
+                  pendingContextActionInputRef.current = null;
+                  setInput(pending.input);
+                  setImages(pending.images);
+                  setMentionedFiles(pending.mentionedFiles);
+                }
+
+                if (pendingContextActionInputRef.current && !pendingContextActionInputRef.current.sentUserMessageId) {
+                  pendingContextActionInputRef.current = null;
+                }
                 setShowContextActionsDialog(false);
                 setContextPressure(null);
               }}

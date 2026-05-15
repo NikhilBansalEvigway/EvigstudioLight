@@ -12,6 +12,7 @@ dist
 dist-ssr
 *.local
 
+software-agent-sdk/
 # Env files (keep examples tracked)
 .env
 .env.*

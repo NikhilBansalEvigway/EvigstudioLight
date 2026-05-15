@@ -17,6 +17,7 @@ import { auditEventRoutes } from './routes/auditEvents.js';
 import { llmProxyRoutes } from './routes/llmProxy.js';
 import { promptRoutes } from './routes/prompts.js';
 import { contextRulesRoutes } from './routes/contextRules.js';
+import { chatLimitsRoutes } from './routes/chatLimits.js';
 
 await verifyPostgresOrExit();
 await ensurePostgresSchema();
@@ -50,6 +51,7 @@ app.route('/api/groups', groupRoutes);
 app.route('/api/admin', adminRoutes);
 app.route('/api', promptRoutes);
 app.route('/api', contextRulesRoutes);
+app.route('/api', chatLimitsRoutes);
 app.route('/api/audit', auditEventRoutes);
 app.route('/api/llm', llmProxyRoutes);
 

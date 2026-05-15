@@ -17,11 +17,16 @@ import { roleHasPermission, type RoleName } from '../rbac.js';
 export const adminRoutes = new Hono<HonoEnv>();
 
 const CONTEXT_RULES_KEY = 'context_rules';
+const CHAT_LIMITS_KEY = 'chat_limits';
 
 const contextRulesSchema = z.object({
   allowedExtensions: z.array(z.string().min(1).max(24)).max(200).optional(),
   allowedBasenames: z.array(z.string().min(1).max(200)).max(200).optional(),
   allowDotEnv: z.boolean().optional(),
+});
+
+const chatLimitsSchema = z.object({
+  contextBudgetChars: z.number().int().min(40_000).max(500_000),
 });
 
 function escapeLike(s: string): string {
@@ -1042,4 +1047,73 @@ adminRoutes.put('/context-rules', async (c) => {
   });
 
   return c.json({ rules: row.value, updatedAt: row.updatedAt.toISOString() });
+});
+
+adminRoutes.get('/chat-limits', async (c) => {
+  const adminUser = c.get('user');
+  if (!adminUser) return c.json({ error: 'Unauthorized' }, 401);
+  if (adminUser.role !== 'admin') return c.json({ error: 'Forbidden' }, 403);
+
+  const [row] = await db.select().from(appSettings).where(eq(appSettings.key, CHAT_LIMITS_KEY)).limit(1);
+  return c.json({
+    limits: (row?.value as any) ?? null,
+    updatedAt: row?.updatedAt?.toISOString?.() ?? null,
+  });
+});
+
+adminRoutes.put('/chat-limits', async (c) => {
+  const adminUser = c.get('user');
+  if (!adminUser) return c.json({ error: 'Unauthorized' }, 401);
+  if (adminUser.role !== 'admin') {
+    await writeStructuredAuditLog({
+      action: 'admin.chat_limits_update',
+      resourceType: 'chat_limits',
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'denied', code: 403, reason: 'admin_only' },
+    });
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const parsed = chatLimitsSchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    await writeStructuredAuditLog({
+      action: 'admin.chat_limits_update',
+      resourceType: 'chat_limits',
+      actor: auditActorSnapshot(adminUser),
+      context: auditRequestContext(c),
+      result: { status: 'error', code: 400, reason: 'invalid_payload' },
+    });
+    return c.json({ error: 'Invalid payload' }, 400);
+  }
+
+  const limits = {
+    contextBudgetChars: parsed.data.contextBudgetChars,
+  };
+
+  const [row] = await db
+    .insert(appSettings)
+    .values({
+      key: CHAT_LIMITS_KEY,
+      value: limits,
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: appSettings.key,
+      set: { value: limits, updatedAt: new Date() },
+    })
+    .returning();
+
+  await writeStructuredAuditLog({
+    action: 'admin.chat_limits_update',
+    resourceType: 'chat_limits',
+    resourceId: row.key,
+    actor: auditActorSnapshot(adminUser),
+    context: auditRequestContext(c),
+    target: { type: 'chat_limits', id: row.key, label: row.key },
+    result: { status: 'success', code: 200 },
+    details: limits,
+  });
+
+  return c.json({ limits: row.value, updatedAt: row.updatedAt.toISOString() });
 });
