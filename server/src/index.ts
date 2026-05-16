@@ -18,6 +18,7 @@ import { llmProxyRoutes } from './routes/llmProxy.js';
 import { promptRoutes } from './routes/prompts.js';
 import { contextRulesRoutes } from './routes/contextRules.js';
 import { chatLimitsRoutes } from './routes/chatLimits.js';
+import { activeUserRoutes } from './routes/activeUsers.js';
 
 await verifyPostgresOrExit();
 await ensurePostgresSchema();
@@ -54,6 +55,7 @@ app.route('/api', contextRulesRoutes);
 app.route('/api', chatLimitsRoutes);
 app.route('/api/audit', auditEventRoutes);
 app.route('/api/llm', llmProxyRoutes);
+app.route('/api/active-users', activeUserRoutes);
 
 const staticRoot = process.env.STATIC_ROOT?.trim();
 if (staticRoot && existsSync(staticRoot)) {

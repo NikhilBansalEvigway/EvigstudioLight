@@ -97,6 +97,7 @@ export async function ensurePostgresSchema(): Promise<void> {
       updated_at timestamptz NOT NULL DEFAULT now()
     );
 
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen timestamptz;
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS privacy text NOT NULL DEFAULT 'private';
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS thread_id uuid;
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS thread_title text;

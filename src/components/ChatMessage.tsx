@@ -223,7 +223,10 @@ export function ChatMessage({
               [&_a]:text-primary [&_a]:no-underline hover:[&_a]:underline
               [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_h1]:text-foreground [&_h2]:text-foreground [&_h3]:text-foreground
               [&_blockquote]:border-l-primary [&_blockquote]:text-muted-foreground
-              [&_table]:text-xs [&_th]:text-foreground
+              [&_table]:w-full [&_table]:border-collapse [&_table]:text-sm [&_table]:my-3
+              [&_th]:border [&_th]:border-border [&_th]:bg-muted/60 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:text-foreground [&_th]:font-semibold
+              [&_td]:border [&_td]:border-border [&_td]:px-3 [&_td]:py-2 [&_td]:text-foreground
+              [&_tr:nth-child(even)]:bg-muted/20
               text-sm sm:text-[15px]
             "
             >

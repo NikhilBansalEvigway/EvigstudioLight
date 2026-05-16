@@ -162,6 +162,15 @@ authRoutes.post('/logout', async (c) => {
   const u = c.get('user');
   deleteCookie(c, COOKIE_NAME, { path: '/' });
   if (u) {
+    // Update last_seen in DB and remove from active memory on logout
+    try {
+      const { db } = await import('../db/client.js');
+      const { users } = await import('../db/schema.js');
+      const { eq } = await import('drizzle-orm');
+      const { lastSeenMap } = await import('./activeUsers.js');
+      await db.update(users).set({ lastSeen: new Date() }).where(eq(users.id, u.id));
+      lastSeenMap.delete(u.id);
+    } catch {}
     await writeStructuredAuditLog({
       action: 'auth.logout',
       resourceType: 'user',

@@ -33,6 +33,7 @@ export const users = pgTable('users', {
   displayName: text('display_name').notNull(),
   role: userRoleEnum('role').notNull().default('developer'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  lastSeen: timestamp('last_seen', { withTimezone: true }),
 });
 
 export const groups = pgTable('groups', {
