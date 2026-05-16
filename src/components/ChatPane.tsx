@@ -85,6 +85,7 @@ export function ChatPane() {
     input: string;
     images: string[];
     mentionedFiles: string[];
+    selectionRef: Message['selectionRef'] | null;
     /** Present when the input was already appended to chat history. */
     sentUserMessageId?: string;
   } | null>(null);
@@ -104,6 +105,15 @@ export function ChatPane() {
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
   const [mentionedFiles, setMentionedFiles] = useState<string[]>([]);
+  const [selectionAttachment, setSelectionAttachment] = useState<Message['selectionRef'] | null>(null);
+  const [selectionPopover, setSelectionPopover] = useState<{
+    text: string;
+    left: number;
+    top: number;
+    sourceMessageId?: string;
+    sourceRole?: Message['role'];
+    sourceTimestamp?: number;
+  } | null>(null);
   const [showMention, setShowMention] = useState(false);
   const [mentionQuery, setMentionQuery] = useState('');
   const [mentionStartIdx, setMentionStartIdx] = useState(-1);
@@ -111,6 +121,78 @@ export function ChatPane() {
   const abortRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const resolveSelection = () => {
+      const sel = window.getSelection?.();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+        setSelectionPopover(null);
+        return;
+      }
+
+      const range = sel.getRangeAt(0);
+      const rawText = sel.toString();
+      const text = rawText.trim();
+      if (!text) {
+        setSelectionPopover(null);
+        return;
+      }
+
+      const anchorNode = sel.anchorNode;
+      const anchorEl =
+        anchorNode && anchorNode.nodeType === Node.ELEMENT_NODE
+          ? (anchorNode as Element)
+          : anchorNode?.parentElement ?? null;
+      const container = scrollContainerRef.current;
+      if (!anchorEl || !container || !container.contains(anchorEl)) {
+        setSelectionPopover(null);
+        return;
+      }
+
+      // Don’t trigger on selections inside the composer.
+      if (anchorEl.closest('[data-evig-composer]')) {
+        setSelectionPopover(null);
+        return;
+      }
+
+      const msgEl = anchorEl.closest('[data-evig-message-id]') as HTMLElement | null;
+      const sourceMessageId = msgEl?.dataset.evigMessageId;
+      const sourceRole = (msgEl?.dataset.evigMessageRole as Message['role'] | undefined) ?? undefined;
+      const sourceTimestamp = msgEl?.dataset.evigMessageTimestamp
+        ? Number(msgEl.dataset.evigMessageTimestamp)
+        : undefined;
+
+      const rect = range.getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) {
+        setSelectionPopover(null);
+        return;
+      }
+
+      const nextLeft = rect.left + rect.width / 2;
+      const nextTop = rect.bottom + 10;
+      const left = Math.max(12, Math.min(window.innerWidth - 12, nextLeft));
+      const top = Math.max(12, Math.min(window.innerHeight - 12, nextTop));
+
+      setSelectionPopover({
+        text,
+        left,
+        top,
+        sourceMessageId,
+        sourceRole,
+        sourceTimestamp,
+      });
+    };
+
+    document.addEventListener('selectionchange', resolveSelection);
+    window.addEventListener('resize', resolveSelection);
+    // Capture scrolls from nested containers (chat list scroll, etc.).
+    window.addEventListener('scroll', resolveSelection, true);
+    return () => {
+      document.removeEventListener('selectionchange', resolveSelection);
+      window.removeEventListener('resize', resolveSelection);
+      window.removeEventListener('scroll', resolveSelection, true);
+    };
+  }, []);
 
   const resizeInputTextarea = useCallback(() => {
     const textarea = textareaRef.current;
@@ -874,7 +956,42 @@ export function ChatPane() {
 
     // Re-check context pressure using the actual messages we will send.
     // The UI pre-check uses cached workspace context size and can be stale when context pins/@mentions change.
-    const toApi = (message: Message): LLMMessage => ({ role: message.role, content: message.content });
+    const toApi = (message: Message): LLMMessage => {
+      const selection = message.selectionRef?.text?.trim();
+      if (!selection || message.role !== 'user') {
+        return { role: message.role, content: message.content };
+      }
+
+      const header = `Selected text:\n"""\n${selection}\n"""\n\n`;
+
+      if (typeof message.content === 'string') {
+        return {
+          role: 'user',
+          content: header + (message.content ? `Question:\n${message.content}` : 'Question: (none)'),
+        };
+      }
+
+      const parts = message.content;
+      const nextParts: ContentPart[] = [];
+      let injected = false;
+      for (const part of parts) {
+        if (!injected && part.type === 'text') {
+          nextParts.push({
+            type: 'text',
+            text: header + (part.text ? `Question:\n${part.text}` : 'Question: (none)'),
+          });
+          injected = true;
+          continue;
+        }
+        nextParts.push(part);
+      }
+
+      if (!injected) {
+        nextParts.unshift({ type: 'text', text: header + 'Question: (none)' });
+      }
+
+      return { role: 'user', content: nextParts };
+    };
 
     const messageChars = (m: LLMMessage) => {
       const content = typeof m.content === 'string'
@@ -941,14 +1058,14 @@ export function ChatPane() {
 
     useAppStore.getState().setAgentStepProgress(0, isAgentMode ? maxIter : 0);
 
-    let loopMessages: LLMMessage[] = candidateMessages;
+    const chatForContext = useAppStore.getState().chats.find((c) => c.id === chatId) ?? null;
+    const requestContext = {
+      chatId,
+      orgId: chatForContext?.groupId ?? null,
+      orgName: chatForContext?.groupName ?? null,
+    };
 
-     const chatForContext = useAppStore.getState().chats.find((c) => c.id === chatId) ?? null;
-     const requestContext = {
-       chatId,
-       orgId: chatForContext?.groupId ?? null,
-       orgName: chatForContext?.groupName ?? null,
-     };
+    let loopMessages: LLMMessage[] = candidateMessages;
 
     try {
       let streamedContent = '';
@@ -1166,12 +1283,7 @@ export function ChatPane() {
   }, [deriveChatTitle, isStreaming, runAssistantTurn, saveVersionSnapshot, trimMessageUiState, updateChatFields]);
 
   const sendCurrentInput = useCallback(async () => {
-    if ((!input.trim() && images.length === 0) || isStreaming) return;
-
-    // If we end up prompting for context actions after this send (due to a more accurate
-    // context size check in the LLM pipeline), we can restore and re-send this input.
-    pendingContextActionInputRef.current = { input, images, mentionedFiles };
-
+    if ((!input.trim() && images.length === 0 && !selectionAttachment) || isStreaming) return;
     const state = useAppStore.getState();
     const currentActiveChat = state.activeChatId
       ? state.chats.find((chat) => chat.id === state.activeChatId) ?? null
@@ -1200,6 +1312,7 @@ export function ChatPane() {
 
     const hasVision = images.length > 0;
     const rawInput = input;
+    const selectionRef = selectionAttachment;
     const mentionedFilePaths = mentionedFiles;
     const hasWorkspaceContext = mentionedFilePaths.length > 0 || contextFiles.length > 0;
     const shouldUseAgentForEdit =
@@ -1239,6 +1352,7 @@ export function ChatPane() {
       role: 'user',
       content: userContent,
       timestamp: Date.now(),
+      ...(selectionRef ? { selectionRef } : {}),
       ...(contextRefs.length > 0 ? { contextRefs } : {}),
     };
 
@@ -1247,6 +1361,7 @@ export function ChatPane() {
       input: rawInput,
       images,
       mentionedFiles: mentionedFilePaths,
+      selectionRef,
       sentUserMessageId: userMsg.id,
     };
 
@@ -1255,6 +1370,7 @@ export function ChatPane() {
     setInput('');
     setImages([]);
     setMentionedFiles([]);
+    setSelectionAttachment(null);
 
     if (getChatPersistenceMode() === 'server') {
       try {
@@ -1300,6 +1416,7 @@ export function ChatPane() {
     input,
     images,
     mentionedFiles,
+    selectionAttachment,
     activeChat,
     activeChatId,
     contextFiles.length,
@@ -1443,6 +1560,7 @@ export function ChatPane() {
       setInput(pending.input);
       setImages(pending.images);
       setMentionedFiles(pending.mentionedFiles);
+      setSelectionAttachment(pending.selectionRef);
     }
     await sendCurrentInput();
   }, [sendCurrentInput, summarizeActiveChat]);
@@ -1457,6 +1575,7 @@ export function ChatPane() {
       setInput(pending.input);
       setImages(pending.images);
       setMentionedFiles(pending.mentionedFiles);
+      setSelectionAttachment(pending.selectionRef);
     }
     await sendCurrentInput();
   }, [clearActiveChat, sendCurrentInput]);
@@ -1471,6 +1590,7 @@ export function ChatPane() {
         setInput(pending.input);
         setImages(pending.images);
         setMentionedFiles(pending.mentionedFiles);
+        setSelectionAttachment(pending.selectionRef);
       }
       await sendCurrentInput();
     } catch (e) {
@@ -1481,7 +1601,7 @@ export function ChatPane() {
   }, [createChat, sendCurrentInput]);
 
   const handleSend = useCallback(async () => {
-    if ((!input.trim() && images.length === 0) || isStreaming) return;
+    if ((!input.trim() && images.length === 0 && !selectionAttachment) || isStreaming) return;
 
     const state = useAppStore.getState();
     const currentActiveChat = state.activeChatId
@@ -1496,7 +1616,7 @@ export function ChatPane() {
     if (currentActiveChat) {
       const pressure = estimateContextPressure(currentActiveChat.messages, input, images.length);
       if (pressure.shouldPrompt) {
-        pendingContextActionInputRef.current = { input, images, mentionedFiles };
+        pendingContextActionInputRef.current = { input, images, mentionedFiles, selectionRef: selectionAttachment };
         setContextPressure({
           usedChars: pressure.usedChars,
           budgetChars: pressure.budgetChars,
@@ -1511,7 +1631,7 @@ export function ChatPane() {
     }
 
     await sendCurrentInput();
-  }, [estimateContextPressure, images.length, input, isStreaming, sendCurrentInput]);
+  }, [estimateContextPressure, images.length, input, isStreaming, selectionAttachment, sendCurrentInput]);
 
   const handleStop = () => abortRef.current?.abort();
 
@@ -1644,6 +1764,7 @@ export function ChatPane() {
                   setInput(pending.input);
                   setImages(pending.images);
                   setMentionedFiles(pending.mentionedFiles);
+                  setSelectionAttachment(pending.selectionRef);
                 }
 
                 if (pendingContextActionInputRef.current && !pendingContextActionInputRef.current.sentUserMessageId) {
@@ -1678,6 +1799,42 @@ export function ChatPane() {
 
       {/* Messages */}
       <div className="relative flex-1 min-h-0">
+        {selectionPopover && !isLocked && !isStreaming && (
+          <div
+            className="pointer-events-none fixed z-50"
+            style={{ left: selectionPopover.left, top: selectionPopover.top, transform: 'translateX(-50%)' }}
+          >
+            <div className="pointer-events-auto rounded-md border border-border/70 bg-background/95 px-2 py-1 shadow-sm backdrop-blur">
+              <button
+                type="button"
+                onClick={() => {
+                  const cap = 8_000;
+                  const capped =
+                    selectionPopover.text.length > cap
+                      ? selectionPopover.text.slice(0, cap) + '\n\n[Selection truncated]'
+                      : selectionPopover.text;
+                  setSelectionAttachment({
+                    text: capped,
+                    sourceMessageId: selectionPopover.sourceMessageId,
+                    sourceRole: selectionPopover.sourceRole,
+                    sourceTimestamp: selectionPopover.sourceTimestamp,
+                  });
+                  setSelectionPopover(null);
+                  try {
+                    window.getSelection?.()?.removeAllRanges();
+                  } catch {
+                    /* ignore */
+                  }
+                  requestAnimationFrame(() => textareaRef.current?.focus());
+                }}
+                className="rounded px-2 py-1 text-xs font-medium text-primary transition-colors hover:bg-secondary"
+                title="Ask a question about the selected text"
+              >
+                Ask about this
+              </button>
+            </div>
+          </div>
+        )}
         <div ref={scrollContainerRef} className="h-full space-y-4 overflow-y-auto px-3 py-3 sm:px-5">
           {!activeChat || activeChat.messages.length === 0 ? (
             <div className="flex items-center justify-center h-full">
@@ -1694,20 +1851,26 @@ export function ChatPane() {
               </div>
             </div>
           ) : (
-            activeChat.messages.map(msg => (
-              <ChatMessage
+            activeChat.messages.map((msg) => (
+              <div
                 key={msg.id}
-                message={msg}
-                chatMode={chatMode}
-                onApplyPatch={handleApplyPatch}
-                onGetOriginal={handleGetOriginal}
-                autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
-                agentActions={agentActionsByMessageId[msg.id]}
-                onOpenFile={handleOpenEditorFile}
-                onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
-                onRegenerate={isLocked ? undefined : handleRegenerateMessage}
-                busy={isStreaming}
-              />
+                data-evig-message-id={msg.id}
+                data-evig-message-role={msg.role}
+                data-evig-message-timestamp={msg.timestamp}
+              >
+                <ChatMessage
+                  message={msg}
+                  chatMode={chatMode}
+                  onApplyPatch={handleApplyPatch}
+                  onGetOriginal={handleGetOriginal}
+                  autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
+                  agentActions={agentActionsByMessageId[msg.id]}
+                  onOpenFile={handleOpenEditorFile}
+                  onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
+                  onRegenerate={isLocked ? undefined : handleRegenerateMessage}
+                  busy={isStreaming}
+                />
+              </div>
             ))
           )}
           {isStreaming && (
@@ -1792,7 +1955,10 @@ export function ChatPane() {
       )}
 
       {/* Input area */}
-      <div className="border-t border-border bg-card/90 p-3 shadow-[0_-8px_32px_hsl(var(--background)/0.45)] backdrop-blur-md sm:p-4">
+      <div
+        data-evig-composer
+        className="border-t border-border bg-card/90 p-3 shadow-[0_-8px_32px_hsl(var(--background)/0.45)] backdrop-blur-md sm:p-4"
+      >
         <p className="mb-2 hidden text-[11px] text-muted-foreground sm:block">
           {isAgent
             ? 'Describe what to build or fix : the agent will read and edit files directly.'
@@ -1837,6 +2003,28 @@ export function ChatPane() {
               onClose={() => { setShowMention(false); setMentionQuery(''); setMentionStartIdx(-1); }}
               visible={showMention}
             />
+            {selectionAttachment && (
+              <div className="mb-2 flex items-start gap-2 rounded-md border border-border/70 bg-muted/20 px-2.5 py-2 text-xs">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                      Selection
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectionAttachment(null)}
+                      className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                      title="Remove selection"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-words rounded bg-background/60 px-2 py-1.5 text-[12px] leading-relaxed text-muted-foreground">
+                    {selectionAttachment.text}
+                  </pre>
+                </div>
+              </div>
+            )}
             <textarea
               ref={textareaRef}
               value={input}
@@ -1860,7 +2048,7 @@ export function ChatPane() {
             <button
               type="button"
               onClick={handleSend}
-              disabled={isLocked || (!input.trim() && images.length === 0 && mentionedFiles.length === 0)}
+              disabled={isLocked || (!input.trim() && images.length === 0 && mentionedFiles.length === 0 && !selectionAttachment)}
               className="glow-primary shrink-0 rounded bg-primary p-2.5 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30 sm:p-2"
             >
               <Send className="h-5 w-5 sm:h-4 sm:w-4" />

@@ -184,6 +184,13 @@ export function Sidebar() {
   });
   const { noThread, threads } = groupChatsForSidebar(filtered);
   const hasBackground = Boolean(settings.backgroundImageDataUrl);
+  const isAdmin = user?.role === 'admin';
+
+  useEffect(() => {
+    if (!isAdmin && filter === 'locked') {
+      setFilter('all');
+    }
+  }, [filter, isAdmin]);
 
   const startRename = useCallback((chatId: string, currentTitle: string) => {
     setEditingId(chatId);
@@ -250,7 +257,7 @@ export function Sidebar() {
           />
         </div>
         <div className="mt-2 flex flex-wrap gap-1">
-          {SIDEBAR_FILTERS.map((option) => (
+          {(isAdmin ? SIDEBAR_FILTERS : SIDEBAR_FILTERS.filter((f) => f.id !== 'locked')).map((option) => (
             <button
               key={option.id}
               type="button"
