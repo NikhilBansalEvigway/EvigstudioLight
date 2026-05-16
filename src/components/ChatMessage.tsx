@@ -75,6 +75,7 @@ export function ChatMessage({
   const showAutoAppliedBadges =
     isAgent && message.role === 'assistant' && !showAgentActionBadges && (autoAppliedPaths?.length ?? 0) > 0;
   const contextRefs = message.contextRefs ?? [];
+  const selectionRef = message.selectionRef;
   const canCopyMessage = displayText.trim().length > 0 && !isEditing;
   const canEditMessage =
     !busy &&
@@ -248,6 +249,18 @@ export function ChatMessage({
               </ReactMarkdown>
             </div>
           )
+        )}
+
+        {message.role === 'user' && selectionRef?.text?.trim().length > 0 && (
+          <div className="mt-2 rounded-md border border-border/60 bg-background/40 px-2.5 py-2">
+            <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              <Eye className="h-3 w-3" />
+              <span>Selection</span>
+            </div>
+            <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-secondary/40 px-2 py-1.5 text-[12px] leading-relaxed text-muted-foreground">
+              {selectionRef.text}
+            </pre>
+          </div>
         )}
 
         {message.role === 'assistant' && displayText.trim().length > 0 && (

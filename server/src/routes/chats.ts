@@ -20,6 +20,14 @@ const messageSchema = z.object({
   content: z.union([z.string(), z.array(z.unknown())]),
   timestamp: z.number(),
   patches: z.array(z.unknown()).optional(),
+  selectionRef: z
+    .object({
+      text: z.string(),
+      sourceMessageId: z.string().optional(),
+      sourceRole: z.enum(['system', 'user', 'assistant']).optional(),
+      sourceTimestamp: z.number().optional(),
+    })
+    .optional(),
 });
 
 const versionSnapshotSchema = z.object({

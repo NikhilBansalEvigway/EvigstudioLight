@@ -10,6 +10,13 @@ export interface Message {
   content: string | ContentPart[];
   timestamp: number;
   patches?: ParsedPatch[];
+  /** Optional highlighted text the user referenced when asking this question. */
+  selectionRef?: {
+    text: string;
+    sourceMessageId?: string;
+    sourceRole?: 'system' | 'user' | 'assistant';
+    sourceTimestamp?: number;
+  };
   contextRefs?: Array<{
     path: string;
     type: 'file' | 'directory' | 'missing';
