@@ -12,6 +12,8 @@ dist
 dist-ssr
 *.local
 
+docker-images/
+
 software-agent-sdk/
 # Env files (keep examples tracked)
 .env
