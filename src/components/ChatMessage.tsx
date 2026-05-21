@@ -16,6 +16,7 @@ import {
   FileCode,
   Play,
   Eye,
+  X,
   FilePlus,
   FileEdit,
   Trash2,
@@ -31,6 +32,9 @@ interface ChatMessageProps {
   message: Message;
   chatMode?: ChatMode;
   onApplyPatch?: (patch: ParsedPatch) => void;
+  onApprovePatch?: (messageId: string, patch: ParsedPatch) => void;
+  onRejectPatch?: (messageId: string, patch: ParsedPatch) => void;
+  onApplyApprovedPatch?: (messageId: string, patch: ParsedPatch) => Promise<void> | void;
   onGetOriginal?: (filePath: string) => Promise<string>;
   autoAppliedPaths?: string[];
   agentActions?: AgentAction[];
@@ -44,6 +48,9 @@ function ChatMessageImpl({
   message,
   chatMode = 'agent',
   onApplyPatch,
+  onApprovePatch,
+  onRejectPatch,
+  onApplyApprovedPatch,
   onGetOriginal,
   autoAppliedPaths,
   agentActions,
@@ -120,9 +127,9 @@ function ChatMessageImpl({
     message.role === 'assistant' ? normalizeLatexSymbols(displayText) : displayText;
 
   const hasPatch = message.role === 'assistant' && containsPatches(rawText);
-  const patches = hasPatch ? parsePatches(rawText) : [];
+  const patches = message.patches ?? (hasPatch ? parsePatches(rawText) : []);
 
-  const showPatchActions = !isAgent && patches.length > 0;
+  const showPatchActions = message.role === 'assistant' && patches.length > 0;
   const showAgentActionBadges =
     isAgent && message.role === 'assistant' && (agentActions?.length ?? 0) > 0;
   const showAutoAppliedBadges =
@@ -429,15 +436,19 @@ function ChatMessageImpl({
           </div>
         )}
 
-        {/* Chat mode: full patch actions with preview / apply */}
+        {/* Patch actions with preview / approve / reject / apply */}
         {showPatchActions && (
           <div className="mt-3 space-y-2">
             {patches.map((patch, i) => (
               <PatchAction
-                key={`${patch.filePath}-${i}`}
+                key={patch.id ?? `${patch.filePath}-${i}`}
+                messageId={message.id}
                 patch={patch}
                 autoApplied={autoAppliedPaths?.includes(patch.filePath)}
-                onApply={() => onApplyPatch?.(patch)}
+                onApprove={onApprovePatch}
+                onReject={onRejectPatch}
+                onApplyApproved={onApplyApprovedPatch}
+                onApplyLegacy={() => onApplyPatch?.(patch)}
                 onGetOriginal={onGetOriginal}
               />
             ))}
@@ -667,23 +678,31 @@ function ExpandablePre({
 }
 
 function PatchAction({
+  messageId,
   patch,
-  onApply,
+  onApprove,
+  onReject,
+  onApplyApproved,
+  onApplyLegacy,
   onGetOriginal,
   autoApplied,
 }: {
+  messageId: string;
   patch: ParsedPatch;
-  onApply: () => void;
+  onApprove?: (messageId: string, patch: ParsedPatch) => void;
+  onReject?: (messageId: string, patch: ParsedPatch) => void;
+  onApplyApproved?: (messageId: string, patch: ParsedPatch) => Promise<void> | void;
+  onApplyLegacy: () => void;
   onGetOriginal?: (filePath: string) => Promise<string>;
   autoApplied?: boolean;
 }) {
   const { filePath, content, operation = 'update' } = patch;
-  const [userApplied, setUserApplied] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
   const [original, setOriginal] = useState('');
   const [modified, setModified] = useState('');
 
-  const done = userApplied || autoApplied;
+  const status = patch.status ?? (patch.applied || autoApplied ? 'applied' : 'pending');
+  const done = status === 'applied';
 
   const handlePreview = async () => {
     if (operation === 'delete') {
@@ -716,35 +735,67 @@ function PatchAction({
     setShowDiff(true);
   };
 
-  const applyLabel = operation === 'delete' ? 'Remove' : 'Apply';
+  const operationLabel = operation === 'delete' ? 'delete' : operation === 'create' ? 'create' : 'update';
+
+  const canApprove = status === 'pending' && !!onApprove && !!patch.id;
+  const canApply = status === 'approved' && !!onApplyApproved && !!patch.id;
+  const canReject = (status === 'pending' || status === 'approved') && !!onReject && !!patch.id;
+
+  const showFailed = status === 'failed' && patch.error;
 
   return (
     <>
       <div className="flex items-center gap-2 px-3 py-2 rounded bg-secondary/80 border border-border text-xs">
         <FileCode className="w-3.5 h-3.5 text-primary shrink-0" />
         <span className="flex-1 truncate text-foreground">{filePath}</span>
-        {operation === 'delete' && (
-          <span className="text-[10px] text-destructive shrink-0">delete</span>
-        )}
+        <span className={`text-[10px] shrink-0 ${operation === 'delete' ? 'text-destructive' : 'text-muted-foreground'}`}>{operationLabel}</span>
         <button onClick={handlePreview} className="flex items-center gap-1 px-2 py-0.5 rounded bg-muted hover:bg-muted/80 transition-colors">
           <Eye className="w-3 h-3" /> Preview
         </button>
-        {!done ? (
+        {canApprove && (
           <button
-            onClick={() => {
-              onApply();
-              setUserApplied(true);
-            }}
+            onClick={() => onApprove?.(messageId, patch)}
+            className="flex items-center gap-1 px-2 py-0.5 rounded bg-primary/15 text-primary hover:bg-primary/25 transition-colors"
+          >
+            <Check className="w-3 h-3" /> Approve
+          </button>
+        )}
+        {canApply && (
+          <button
+            onClick={() => void onApplyApproved?.(messageId, patch)}
             className="flex items-center gap-1 px-2 py-0.5 rounded bg-accent/20 text-accent hover:bg-accent/30 transition-colors"
           >
-            <Play className="w-3 h-3" /> {applyLabel}
+            <Play className="w-3 h-3" /> Apply
           </button>
-        ) : (
+        )}
+        {canReject && (
+          <button
+            onClick={() => onReject?.(messageId, patch)}
+            className="flex items-center gap-1 px-2 py-0.5 rounded bg-destructive/10 text-destructive hover:bg-destructive/15 transition-colors"
+          >
+            <X className="w-3 h-3" /> Reject
+          </button>
+        )}
+        {(!patch.id || (!onApprove && !onReject && !onApplyApproved)) && !done && (
+          <button
+            onClick={onApplyLegacy}
+            className="flex items-center gap-1 px-2 py-0.5 rounded bg-accent/20 text-accent hover:bg-accent/30 transition-colors"
+          >
+            <Play className="w-3 h-3" /> Apply
+          </button>
+        )}
+        {done && (
           <span className="flex items-center gap-1 text-accent">
             <Check className="w-3 h-3" /> Applied
           </span>
         )}
       </div>
+
+      {showFailed && (
+        <div className="mt-1 rounded border border-destructive/20 bg-destructive/5 px-3 py-2 text-[11px] text-destructive">
+          Failed: {patch.error}
+        </div>
+      )}
 
       {showDiff && (
         <DiffViewer
@@ -753,8 +804,11 @@ function PatchAction({
           modified={modified}
           onClose={() => setShowDiff(false)}
           onApply={() => {
-            onApply();
-            setUserApplied(true);
+            if (canApply) {
+              void onApplyApproved?.(messageId, patch);
+            } else {
+              onApplyLegacy();
+            }
             setShowDiff(false);
           }}
         />

@@ -7,6 +7,7 @@ import type {
   ChatVersionSnapshot,
   FileNode,
   Message,
+  ParsedPatch,
   WorkspaceRoot,
 } from '@/types';
 import {
@@ -103,12 +104,22 @@ interface AppState {
   // UI
   showSettings: boolean;
   setShowSettings: (v: boolean) => void;
-  rightPaneTab: 'files' | 'editor' | 'context' | 'prompt';
-  setRightPaneTab: (t: 'files' | 'editor' | 'context' | 'prompt') => void;
+  rightPaneTab: 'files' | 'editor' | 'context' | 'changes' | 'users' | 'prompt';
+  setRightPaneTab: (t: 'files' | 'editor' | 'context' | 'changes' | 'users' | 'prompt') => void;
   showSidebar: boolean;
   setShowSidebar: (v: boolean) => void;
   showRightPane: boolean;
   setShowRightPane: (v: boolean) => void;
+
+  // Patch proposals (approve/reject/apply)
+  setMessagePatches: (chatId: string, messageId: string, patches: ParsedPatch[]) => void;
+  setPatchStatus: (
+    chatId: string,
+    messageId: string,
+    patchId: string,
+    status: ParsedPatch['status'],
+    error?: string,
+  ) => void;
 
   // Streaming
   isStreaming: boolean;
@@ -173,7 +184,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ chats });
       if (chats.length > 0) {
         set({ activeChatId: chats[0].id });
-        void get().hydrateWorkspaceSession(chats[0].id);
+        await get().hydrateWorkspaceSession(chats[0].id);
       }
       if (getChatPersistenceMode() === 'server' && chats.length > 0) {
         void get().refreshChat(chats[0].id);
@@ -209,21 +220,21 @@ export const useAppStore = create<AppState>((set, get) => ({
           void get().persistWorkspaceSession(prevActive);
         }
         set((s) => ({ chats: [chat, ...s.chats], activeChatId: chat.id }));
-        void get().hydrateWorkspaceSession(chat.id);
+        await get().hydrateWorkspaceSession(chat.id);
         return chat.id;
       }
       if (prevActive && prevActive !== chat.id) {
         void get().persistWorkspaceSession(prevActive);
       }
       set({ activeChatId: chat.id });
-      void get().hydrateWorkspaceSession(chat.id);
+      await get().hydrateWorkspaceSession(chat.id);
       return chat.id;
     }
     if (prevActive && prevActive !== chat.id) {
       void get().persistWorkspaceSession(prevActive);
     }
     set((s) => ({ chats: [chat, ...s.chats], activeChatId: chat.id }));
-    void get().hydrateWorkspaceSession(chat.id);
+    await get().hydrateWorkspaceSession(chat.id);
     return chat.id;
   },
   refreshChat: async (id) => {
@@ -353,6 +364,53 @@ export const useAppStore = create<AppState>((set, get) => ({
       void persistenceSaveChat(chat).catch((err) => console.error('[EvigStudio] streaming save', err));
     }, 900);
     streamingSaveTimers.set(chatId, id);
+  },
+
+  setMessagePatches: (chatId, messageId, patches) => {
+    set((s) => {
+      const chats = s.chats.map((c) => {
+        if (c.id !== chatId) return c;
+        if (!canWriteChat(c)) return c;
+        const msgs = c.messages.map((m) => (m.id === messageId ? { ...m, patches } : m));
+        const updated = normalizeChat({ ...c, messages: msgs, updatedAt: Date.now() });
+        void persistenceSaveChat(updated).catch((err) => console.error('[EvigStudio] setMessagePatches save', err));
+        return updated;
+      });
+      return { chats };
+    });
+  },
+
+  setPatchStatus: (chatId, messageId, patchId, status, error) => {
+    set((s) => {
+      const chats = s.chats.map((c) => {
+        if (c.id !== chatId) return c;
+        if (!canWriteChat(c)) return c;
+        const msgs = c.messages.map((m) => {
+          if (m.id !== messageId) return m;
+          const current = m.patches ?? [];
+          if (current.length === 0) return m;
+          const next = current.map((p) => {
+            if (p.id !== patchId) return p;
+            const nextPatch: ParsedPatch = {
+              ...p,
+              status,
+              applied: status === 'applied',
+            };
+            if (status === 'failed') {
+              nextPatch.error = error ?? 'Failed to apply patch';
+            } else {
+              delete (nextPatch as any).error;
+            }
+            return nextPatch;
+          });
+          return { ...m, patches: next };
+        });
+        const updated = normalizeChat({ ...c, messages: msgs, updatedAt: Date.now() });
+        void persistenceSaveChat(updated).catch((err) => console.error('[EvigStudio] setPatchStatus save', err));
+        return updated;
+      });
+      return { chats };
+    });
   },
   updateChatFields: (chatId, patch) => {
     set((s) => {
