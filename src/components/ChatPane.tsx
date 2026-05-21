@@ -181,6 +181,13 @@ export function ChatPane() {
         return;
       }
 
+      // Avoid re-rendering the whole chat repeatedly while selecting inside code blocks.
+      // Re-renders during selection can cause the browser selection highlight to drop.
+      if (anchorEl.closest('[data-evig-codeblock]')) {
+        setSelectionPopover(null);
+        return;
+      }
+
       const msgEl = anchorEl.closest('[data-evig-message-id]') as HTMLElement | null;
       const sourceMessageId = msgEl?.dataset.evigMessageId;
       const sourceRole = (msgEl?.dataset.evigMessageRole as Message['role'] | undefined) ?? undefined;
@@ -199,13 +206,20 @@ export function ChatPane() {
       const left = Math.max(12, Math.min(window.innerWidth - 12, nextLeft));
       const top = Math.max(12, Math.min(window.innerHeight - 12, nextTop));
 
-      setSelectionPopover({
-        text,
-        left,
-        top,
-        sourceMessageId,
-        sourceRole,
-        sourceTimestamp,
+      setSelectionPopover((prev) => {
+        // Avoid spamming state updates while the user is actively selecting.
+        if (
+          prev &&
+          prev.text === text &&
+          Math.abs(prev.left - left) < 1 &&
+          Math.abs(prev.top - top) < 1 &&
+          prev.sourceMessageId === sourceMessageId &&
+          prev.sourceRole === sourceRole &&
+          prev.sourceTimestamp === sourceTimestamp
+        ) {
+          return prev;
+        }
+        return { text, left, top, sourceMessageId, sourceRole, sourceTimestamp };
       });
     };
 

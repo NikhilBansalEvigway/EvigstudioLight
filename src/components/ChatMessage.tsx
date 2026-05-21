@@ -139,6 +139,21 @@ export function ChatMessage({
     rawText.trim().length > 0;
   const canRegenerateMessage = !busy && message.role === 'assistant' && !!onRegenerate;
 
+  // Persist code block expand/collapse across streaming re-renders.
+  const [expandedCodeBlocks, setExpandedCodeBlocks] = useState<Record<string, boolean>>({});
+
+  const getCodeBlockKey = useCallback(
+    (node: any) => {
+      const pos = node?.position?.start;
+      if (pos && typeof pos.line === 'number' && typeof pos.column === 'number') {
+        return `${message.id}:${pos.line}:${pos.column}`;
+      }
+      // Fallback: stable-ish key.
+      return `${message.id}:pre:unknown`;
+    },
+    [message.id],
+  );
+
   useEffect(() => {
     if (!isEditing) {
       setDraftText(rawText);
@@ -288,7 +303,23 @@ export function ChatMessage({
                 remarkPlugins={[remarkGfm]}
                 rehypePlugins={[rehypeHighlight]}
                 components={{
-                  pre: ({ children }) => <ExpandablePre>{children}</ExpandablePre>,
+                  pre: ({ node, children }) => {
+                    const key = getCodeBlockKey(node);
+                    const expanded = expandedCodeBlocks[key] === true;
+                    return (
+                      <ExpandablePre
+                        expanded={expanded}
+                        onToggle={() =>
+                          setExpandedCodeBlocks((prev) => ({
+                            ...prev,
+                            [key]: !(prev[key] === true),
+                          }))
+                        }
+                      >
+                        {children}
+                      </ExpandablePre>
+                    );
+                  },
                   code: ({ children, className }) => {
                     const isInline = !className;
                     if (isInline) {
@@ -540,11 +571,18 @@ function MessageActionButton({
   );
 }
 
-function ExpandablePre({ children }: { children: React.ReactNode }) {
+function ExpandablePre({
+  children,
+  expanded,
+  onToggle,
+}: {
+  children: React.ReactNode;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
   const preRef = useRef<HTMLPreElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
-  const [expanded, setExpanded] = useState(false);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -575,13 +613,13 @@ function ExpandablePre({ children }: { children: React.ReactNode }) {
     '!mb-0 !mt-0 overflow-x-auto p-3 text-xs leading-relaxed select-text [&_code]:bg-transparent [&_code]:text-[13px]';
 
   return (
-    <div className="my-2 overflow-hidden rounded-md border border-border/60 bg-secondary/50">
+    <div data-evig-codeblock className="my-2 overflow-hidden rounded-md border border-border/60 bg-secondary/50">
       <div className="flex items-center justify-between gap-2 border-b border-border/50 bg-muted/30 px-2 py-1">
         <span className="text-[10px] font-medium text-muted-foreground">Code</span>
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => setExpanded((v) => !v)}
+            onClick={onToggle}
             className="shrink-0 text-[10px] text-muted-foreground hover:text-foreground"
           >
             {expanded ? 'Collapse' : 'Expand'}
