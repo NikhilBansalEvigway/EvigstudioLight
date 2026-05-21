@@ -1,0 +1,21 @@
+## Development override
+## Usage (dev):
+##   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+
+services:
+  api:
+    build:
+      context: ./server
+
+  llm-orch:
+    build:
+      context: ./LLMOrchestrator
+
+  llm-orch-worker:
+    build:
+      context: ./LLMOrchestrator
+
+  frontend:
+    build:
+      context: .
+      dockerfile: ./src/Dockerfile

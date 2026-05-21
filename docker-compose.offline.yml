@@ -2,7 +2,7 @@
 # UI -> API (/api/llm) -> LLM Orchestrator queue -> LM Studio
 #
 # Usage:
-#   docker compose -f docker-compose.offline.yml up -d --build
+#   docker compose -f docker-compose.offline.yml up -d
 
 services:
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
@@ -26,9 +26,6 @@ services:
 
   api:
     image: evigstudiolight-api:latest
-    build:
-      context: ./server
-      dockerfile: Dockerfile
     # Use a dedicated env file for offline/orchestrator configuration.
     env_file: ./server/.env.offline
     environment:
@@ -52,9 +49,6 @@ services:
 
   llm-orch:
     image: evigstudiolight-llm-orch:latest
-    build:
-      context: ./LLMOrchestrator
-      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
       - "3013:3013"
@@ -78,9 +72,6 @@ services:
 
   llm-orch-worker:
     image: evigstudiolight-llm-orch-worker:latest
-    build:
-      context: ./LLMOrchestrator
-      dockerfile: Dockerfile
     restart: unless-stopped
     env_file:
       - ./LLMOrchestrator/.env.offline
@@ -101,9 +92,6 @@ services:
 
   frontend:
     image: evigstudiolight-frontend:latest
-    build:
-      context: .
-      dockerfile: src/Dockerfile
     restart: unless-stopped
     ports:
       - "80:80"
