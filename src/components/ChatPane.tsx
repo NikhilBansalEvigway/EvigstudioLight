@@ -1118,9 +1118,6 @@ export function ChatPane() {
         if (isAgentMode && iter > 1) {
           setAgentGatherStep(iter);
         }
-        if (iter > 1) {
-          updateLastAssistantMessage(chatId, '');
-        }
 
         streamedContent = await chatCompletion({
           messages: loopMessages,

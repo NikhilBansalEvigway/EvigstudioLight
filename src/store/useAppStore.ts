@@ -29,6 +29,8 @@ import {
 } from '@/lib/chatPersistence';
 import { DEFAULT_CONTEXT_RULES, normalizeContextRules, type ContextRules } from '@/lib/contextRules';
 
+const streamingSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 export interface EditorTab {
   path: string;
   content: string;
@@ -134,6 +136,10 @@ interface AppState {
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
+  // Debounced persistence for streaming assistant updates.
+  // Without this, a crash/navigation during streaming can leave an empty assistant stub persisted.
+  // (We still persist at the end of a turn; this just reduces data loss.)
+
   settings: DEFAULT_SETTINGS,
   setSettings: (s) => {
     const newSettings = { ...get().settings, ...s };
@@ -329,6 +335,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
       return { chats };
     });
+
+    // Debounce saves while streaming so we persist partial progress but don't write on every token.
+    // Note: this is safe for both server and IndexedDB persistence modes.
+    const prev = streamingSaveTimers.get(chatId);
+    if (prev) clearTimeout(prev);
+    const id = setTimeout(() => {
+      streamingSaveTimers.delete(chatId);
+      const chat = get().chats.find((c) => c.id === chatId);
+      if (!chat) return;
+      void persistenceSaveChat(chat).catch((err) => console.error('[EvigStudio] streaming save', err));
+    }, 900);
+    streamingSaveTimers.set(chatId, id);
   },
   updateChatFields: (chatId, patch) => {
     set((s) => {
