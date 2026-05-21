@@ -144,6 +144,7 @@ export function ChatPane() {
   const [mentionStartIdx, setMentionStartIdx] = useState(-1);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const abortReasonRef = useRef<'user' | 'stall' | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -1090,6 +1091,7 @@ export function ChatPane() {
     addMessage(chatId, assistantMsg);
 
     setIsStreaming(true);
+    abortReasonRef.current = null;
     abortRef.current = new AbortController();
 
     const maxIter = isAgentMode
@@ -1119,14 +1121,49 @@ export function ChatPane() {
           setAgentGatherStep(iter);
         }
 
-        streamedContent = await chatCompletion({
-          messages: loopMessages,
-          settings,
-          useVision: hasVision && iter === 1,
-          onToken: (full) => updateLastAssistantMessage(chatId, full),
-          signal: abortRef.current!.signal,
-          requestContext,
-        });
+        // Guard against stalled streaming (common when the upstream drops the connection mid-stream).
+        // If we never receive tokens for too long, or we stop receiving tokens for too long, abort so the UI can recover.
+        const startedAt = Date.now();
+        let lastTokenAt = startedAt;
+        let receivedAnyToken = false;
+        const STALL_FIRST_TOKEN_MS = 120_000;
+        const STALL_BETWEEN_TOKENS_MS = 45_000;
+        const STALL_OVERALL_MS = 6 * 60_000;
+        const stallIntervalId = window.setInterval(() => {
+          const ctrl = abortRef.current;
+          if (!ctrl || ctrl.signal.aborted) return;
+          const now = Date.now();
+          const age = now - startedAt;
+          const silence = now - lastTokenAt;
+          const exceeded =
+            age > STALL_OVERALL_MS ||
+            (!receivedAnyToken && silence > STALL_FIRST_TOKEN_MS) ||
+            (receivedAnyToken && silence > STALL_BETWEEN_TOKENS_MS);
+          if (!exceeded) return;
+          abortReasonRef.current = 'stall';
+          try {
+            ctrl.abort();
+          } catch {
+            /* ignore */
+          }
+        }, 2500);
+
+        try {
+          streamedContent = await chatCompletion({
+            messages: loopMessages,
+            settings,
+            useVision: hasVision && iter === 1,
+            onToken: (full) => {
+              receivedAnyToken = true;
+              lastTokenAt = Date.now();
+              updateLastAssistantMessage(chatId, full);
+            },
+            signal: abortRef.current!.signal,
+            requestContext,
+          });
+        } finally {
+          window.clearInterval(stallIntervalId);
+        }
 
         if (!isAgentMode) break;
         if (iter >= maxIter) break;
@@ -1215,7 +1252,22 @@ export function ChatPane() {
       }
     } catch (err: unknown) {
       const name = err instanceof Error ? err.name : '';
-      if (name !== 'AbortError') {
+      if (name === 'AbortError') {
+        // On manual stop, keep partial output silently. On stalled streams, show a recovery hint.
+        if (abortReasonRef.current === 'stall') {
+          useAppStore.getState().setLMConnected(false);
+          const st = useAppStore.getState();
+          const chat = st.chats.find((c) => c.id === chatId);
+          const last = chat?.messages[chat.messages.length - 1];
+          const existing = last && last.role === 'assistant' ? getMessageText(last) : '';
+          const suffix = existing.trim().length > 0 ? '\n\n' : '';
+          updateLastAssistantMessage(
+            chatId,
+            `${existing}${suffix}[Generation stopped: connection stalled. Press Regenerate or send again to retry.]`,
+          );
+          toast.error('Local AI connection stalled');
+        }
+      } else {
         const errorMsg = err instanceof Error ? err.message : 'Unknown error';
         if (isContextLengthError(errorMsg)) {
           // Provider rejected due to context size: prompt user with summarize/clear/new chat actions.
@@ -1246,6 +1298,7 @@ export function ChatPane() {
       setIsStreaming(false);
       useAppStore.getState().setAgentStepProgress(0, 0);
       abortRef.current = null;
+      abortReasonRef.current = null;
     }
 
     return !needsContextAction;
@@ -1699,7 +1752,10 @@ export function ChatPane() {
     await sendCurrentInput();
   }, [estimateContextPressure, images, input, isStreaming, mentionedFiles, selectionAttachment, sendCurrentInput]);
 
-  const handleStop = () => abortRef.current?.abort();
+  const handleStop = () => {
+    abortReasonRef.current = 'user';
+    abortRef.current?.abort();
+  };
 
   const handleImageAttach = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
