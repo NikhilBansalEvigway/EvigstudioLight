@@ -57,7 +57,21 @@ import {
   workspaceFolderLabels,
 } from '@/lib/auditClient';
 import { useSpeechDictation } from '@/hooks/useSpeechDictation';
-import { Send, ImagePlus, Loader2, StopCircle, FileCode, X, Mic, Bot, MessageSquare, Lock, FolderOpen, ChevronDown } from 'lucide-react';
+import {
+  Send,
+  ImagePlus,
+  Loader2,
+  StopCircle,
+  FileCode,
+  X,
+  Mic,
+  Bot,
+  MessageSquare,
+  Lock,
+  FolderOpen,
+  ChevronDown,
+  ChevronUp,
+} from 'lucide-react';
 import { toast } from 'sonner';
 
 const KEY_PROJECT_FILES = [
@@ -262,6 +276,9 @@ export function ChatPane() {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUp = useRef(false);
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
+  const isInitializingScroll = useRef(false);
+  const [isAtTop, setIsAtTop] = useState(true);
+  const [isAtBottom, setIsAtBottom] = useState(true);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
     const container = scrollContainerRef.current;
@@ -275,6 +292,16 @@ export function ChatPane() {
     setShowScrollToLatest(false);
   }, []);
 
+  const scrollToTop = useCallback((behavior: ScrollBehavior = 'auto') => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    try {
+      container.scrollTo({ top: 0, behavior });
+    } catch {
+      container.scrollTop = 0;
+    }
+  }, []);
+
   useEffect(() => {
     if (fileTree.length === 0 || mentionedFiles.length === 0) return;
     setMentionedFiles((prev) => prev.filter((path) => !!findMentionNode(fileTree, path)));
@@ -285,9 +312,24 @@ export function ChatPane() {
     if (!container) return;
     const BOTTOM_THRESHOLD_PX = 96;
     const onScroll = () => {
+      // When switching chats, we intentionally jump to the bottom. During that
+      // initialization window, don't mark the user as "scrolled up".
+      if (isInitializingScroll.current) {
+        userScrolledUp.current = false;
+        setShowScrollToLatest(false);
+        setIsAtTop(true);
+        setIsAtBottom(true);
+        return;
+      }
       const distFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
       const scrolledUp = distFromBottom > BOTTOM_THRESHOLD_PX;
       userScrolledUp.current = scrolledUp;
+
+      const TOP_EPS = 8;
+      const BOTTOM_EPS = 8;
+      setIsAtTop(container.scrollTop <= TOP_EPS);
+      setIsAtBottom(distFromBottom <= BOTTOM_EPS);
+
       if (scrolledUp && isStreaming) {
         setShowScrollToLatest(true);
       }
@@ -314,7 +356,19 @@ export function ChatPane() {
       setShowScrollToLatest(false);
       return;
     }
+    isInitializingScroll.current = true;
+    userScrolledUp.current = false;
+    setShowScrollToLatest(false);
+    // After the message list renders (and after any async refresh loads), snap to the latest.
     requestAnimationFrame(() => scrollToBottom('auto'));
+    const id = window.setTimeout(() => {
+      scrollToBottom('auto');
+      isInitializingScroll.current = false;
+    }, 0);
+    return () => {
+      window.clearTimeout(id);
+      isInitializingScroll.current = false;
+    };
   }, [activeChatId, scrollToBottom]);
 
   const addPatchedPaths = useCallback((paths: string[]) => {
@@ -1973,6 +2027,31 @@ export function ChatPane() {
           )}
           <div ref={messagesEndRef} />
         </div>
+
+        {activeChat && activeChat.messages.length > 0 && (!isAtTop || !isAtBottom) && (
+          <div className="pointer-events-none absolute bottom-3 right-3 z-10 flex flex-col gap-2">
+            {!isAtTop && (
+              <button
+                type="button"
+                onClick={() => scrollToTop('smooth')}
+                className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border border-border/70 bg-background/95 text-muted-foreground shadow-sm backdrop-blur transition-colors hover:text-foreground"
+                title="Go to top"
+              >
+                <ChevronUp className="h-4 w-4" />
+              </button>
+            )}
+            {!isAtBottom && (
+              <button
+                type="button"
+                onClick={() => scrollToBottom('smooth')}
+                className="pointer-events-auto inline-flex h-9 w-9 items-center justify-center rounded-full border border-border/70 bg-background/95 text-muted-foreground shadow-sm backdrop-blur transition-colors hover:text-foreground"
+                title="Go to bottom"
+              >
+                <ChevronDown className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+        )}
 
         {showScrollToLatest && (
           <div className="pointer-events-none absolute bottom-3 left-0 right-0 z-10 flex justify-center px-3 sm:px-5">
