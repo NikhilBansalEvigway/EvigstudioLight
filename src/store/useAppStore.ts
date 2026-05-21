@@ -116,8 +116,14 @@ interface AppState {
 
   // Budgets / telemetry (UI-only)
   contextBudgetChars: number;
+  /** Workspace context chars (pinned/@mentioned files) for the active chat. */
+  workspaceContextUsedChars: number;
+  /** Active chat history chars (user+assistant messages), excluding compacted messages. */
+  historyContextUsedChars: number;
+  /** Convenience: history + workspace for active chat. */
   contextUsedChars: number;
   setContextUsage: (usedChars: number, budgetChars: number) => void;
+  setHistoryContextUsage: (usedChars: number) => void;
   agentStep: number;
   agentStepTotal: number;
   setAgentStepProgress: (step: number, total: number) => void;
@@ -625,7 +631,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       const session = await loadWorkspaceSession(chatId);
       // Reset context usage on chat switch. It is computed lazily when we build the next turn's
       // workspace context, and should not carry over between chats.
-      set({ contextUsedChars: 0 });
+      set((s) => ({
+        workspaceContextUsedChars: 0,
+        contextUsedChars: Math.max(0, (s.historyContextUsedChars || 0) + 0),
+      }));
       if (!session) {
         // No session for this chat: start clean.
         set({
@@ -648,6 +657,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         workspaceRoots: hydratedRoots,
         workspaceHandle: hydratedRoots[0]?.handle ?? null,
         contextFiles: session.contextFiles ?? [],
+        workspaceContextUsedChars: Math.max(0, Number(session.workspaceContextUsedChars ?? 0) || 0),
+        contextUsedChars: Math.max(
+          0,
+          (get().historyContextUsedChars || 0) + Math.max(0, Number(session.workspaceContextUsedChars ?? 0) || 0),
+        ),
         openEditorTabs: session.openEditorTabs ?? [],
         activeFilePath: session.activeFilePath ?? null,
         activeFileContent:
@@ -703,6 +717,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         openEditorTabs: tabs,
         activeFilePath: s.activeFilePath,
         contextFiles: s.contextFiles,
+        workspaceContextUsedChars: s.workspaceContextUsedChars,
       });
     } catch (e) {
       // FileSystemDirectoryHandle may not be serializable in some environments.
@@ -715,6 +730,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           openEditorTabs: tabs,
           activeFilePath: s.activeFilePath,
           contextFiles: s.contextFiles,
+          workspaceContextUsedChars: s.workspaceContextUsedChars,
         });
       } catch (e2) {
         console.warn('[EvigStudio] persistWorkspaceSession failed (no-handles)', e2);
@@ -735,9 +751,22 @@ export const useAppStore = create<AppState>((set, get) => ({
   setIsStreaming: (v) => set({ isStreaming: v }),
 
   contextBudgetChars: 120_000,
+  workspaceContextUsedChars: 0,
+  historyContextUsedChars: 0,
   contextUsedChars: 0,
   setContextUsage: (usedChars, budgetChars) =>
-    set({ contextUsedChars: Math.max(0, usedChars), contextBudgetChars: Math.max(0, budgetChars) }),
+    set((s) => {
+      const workspaceContextUsedChars = Math.max(0, usedChars);
+      const contextBudgetChars = Math.max(0, budgetChars);
+      const contextUsedChars = Math.max(0, (s.historyContextUsedChars || 0) + workspaceContextUsedChars);
+      return { workspaceContextUsedChars, contextBudgetChars, contextUsedChars };
+    }),
+  setHistoryContextUsage: (usedChars) =>
+    set((s) => {
+      const historyContextUsedChars = Math.max(0, usedChars);
+      const contextUsedChars = Math.max(0, historyContextUsedChars + (s.workspaceContextUsedChars || 0));
+      return { historyContextUsedChars, contextUsedChars };
+    }),
   agentStep: 0,
   agentStepTotal: 0,
   setAgentStepProgress: (step, total) => set({ agentStep: Math.max(0, step), agentStepTotal: Math.max(0, total) }),
@@ -796,8 +825,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       set((s) => ({
         serverChatLimits: { contextBudgetChars },
         contextBudgetChars,
-        // Preserve current usage; only update the shared budget.
-        contextUsedChars: Math.max(0, s.contextUsedChars || 0),
+        // Preserve current usage parts; only update the shared budget.
+        contextUsedChars: Math.max(0, (s.historyContextUsedChars || 0) + (s.workspaceContextUsedChars || 0)),
       }));
     } catch {
       set({ serverChatLimits: null });
@@ -815,7 +844,8 @@ useAppStore.subscribe((state) => {
   const tabsSig = state.openEditorTabs.map((t) => `${t.path}:${t.content !== t.savedContent ? 1 : 0}`).join('|');
   const ctxSig = state.contextFiles.join('|');
   const activeSig = state.activeFilePath ?? '';
-  const key = `${chatId}::${rootsSig}::${tabsSig}::${ctxSig}::${activeSig}::${state.workspaceSessionRevision}`;
+  const usageSig = `${state.workspaceContextUsedChars || 0}`;
+  const key = `${chatId}::${rootsSig}::${tabsSig}::${ctxSig}::${activeSig}::${usageSig}::${state.workspaceSessionRevision}`;
   if (key === lastWorkspaceSessionKey) return;
   lastWorkspaceSessionKey = key;
 

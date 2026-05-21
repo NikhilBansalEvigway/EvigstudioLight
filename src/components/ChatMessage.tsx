@@ -23,7 +23,7 @@ import {
   FolderOpen,
   FileSearch,
 } from 'lucide-react';
-import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useLayoutEffect, useRef, memo } from 'react';
 import { DiffViewer } from '@/components/DiffViewer';
 import { MessageTtsBar } from '@/components/MessageTtsBar';
 
@@ -40,7 +40,7 @@ interface ChatMessageProps {
   busy?: boolean;
 }
 
-export function ChatMessage({
+function ChatMessageImpl({
   message,
   chatMode = 'agent',
   onApplyPatch,
@@ -486,6 +486,8 @@ export function ChatMessage({
     </div>
   );
 }
+
+export const ChatMessage = memo(ChatMessageImpl);
 
 const ACTION_ICONS: Record<AgentAction['type'], React.ElementType> = {
   read: FileSearch,

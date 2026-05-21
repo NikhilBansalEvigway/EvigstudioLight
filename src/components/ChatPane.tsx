@@ -94,8 +94,10 @@ const INPUT_MAX_HEIGHT_PX = 220;
 export function ChatPane() {
   const {
     chats, activeChatId, createChat, addMessage, updateLastAssistantMessage, updateChatFields, saveVersionSnapshot,
-    settings, contextFiles, fileTree, isStreaming, setIsStreaming, workspaceRoots, contextUsedChars, contextBudgetChars,
+    settings, contextFiles, fileTree, isStreaming, setIsStreaming, workspaceRoots,
+    workspaceContextUsedChars, contextBudgetChars,
     serverContextRules,
+    setHistoryContextUsage,
   } = useAppStore();
 
   const [autoAppliedPathsByMessageId, setAutoAppliedPathsByMessageId] = useState<Record<string, string[]>>({});
@@ -127,6 +129,23 @@ export function ChatPane() {
     patchedPathsRef.current = new Set();
   }, [activeChatId]);
 
+  const activeChat = chats.find(c => c.id === activeChatId);
+  const isLocked = activeChat ? !canWriteChat(activeChat) : false;
+  const chatMode = activeChat?.mode ?? 'agent';
+  const isAgent = chatMode === 'agent';
+
+  // Keep the context usage indicator tied to the active chat.
+  useEffect(() => {
+    if (!activeChat) {
+      setHistoryContextUsage(0);
+      return;
+    }
+    const historyChars = activeChat.messages
+      .filter((m) => !m.excludedFromContext && (m.role === 'user' || m.role === 'assistant'))
+      .reduce((sum, m) => sum + getMessageText(m).length + 48, 0);
+    setHistoryContextUsage(historyChars);
+  }, [activeChatId, activeChat?.messages, setHistoryContextUsage]);
+
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
   const [mentionedFiles, setMentionedFiles] = useState<string[]>([]);
@@ -155,17 +174,22 @@ export function ChatPane() {
   }, [activeChatId]);
 
   useEffect(() => {
+    let codeblockDebounceTimer: number | null = null;
+
     const resolveSelection = () => {
       const sel = window.getSelection?.();
       if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+        if (codeblockDebounceTimer != null) {
+          window.clearTimeout(codeblockDebounceTimer);
+          codeblockDebounceTimer = null;
+        }
         setSelectionPopover(null);
         return;
       }
 
       const range = sel.getRangeAt(0);
       const rawText = sel.toString();
-      const text = rawText.trim();
-      if (!text) {
+      if (!rawText.trim()) {
         setSelectionPopover(null);
         return;
       }
@@ -187,12 +211,8 @@ export function ChatPane() {
         return;
       }
 
-      // Avoid re-rendering the whole chat repeatedly while selecting inside code blocks.
-      // Re-renders during selection can cause the browser selection highlight to drop.
-      if (anchorEl.closest('[data-evig-codeblock]')) {
-        setSelectionPopover(null);
-        return;
-      }
+      const inCodeBlock = !!anchorEl.closest('[data-evig-codeblock]');
+      const text = inCodeBlock ? rawText : rawText.trim();
 
       const msgEl = anchorEl.closest('[data-evig-message-id]') as HTMLElement | null;
       const sourceMessageId = msgEl?.dataset.evigMessageId;
@@ -212,21 +232,40 @@ export function ChatPane() {
       const left = Math.max(12, Math.min(window.innerWidth - 12, nextLeft));
       const top = Math.max(12, Math.min(window.innerHeight - 12, nextTop));
 
-      setSelectionPopover((prev) => {
-        // Avoid spamming state updates while the user is actively selecting.
-        if (
-          prev &&
-          prev.text === text &&
-          Math.abs(prev.left - left) < 1 &&
-          Math.abs(prev.top - top) < 1 &&
-          prev.sourceMessageId === sourceMessageId &&
-          prev.sourceRole === sourceRole &&
-          prev.sourceTimestamp === sourceTimestamp
-        ) {
-          return prev;
-        }
-        return { text, left, top, sourceMessageId, sourceRole, sourceTimestamp };
-      });
+      const apply = () => {
+        setSelectionPopover((prev) => {
+          // Avoid spamming state updates while the user is actively selecting.
+          if (
+            prev &&
+            prev.text === text &&
+            Math.abs(prev.left - left) < 1 &&
+            Math.abs(prev.top - top) < 1 &&
+            prev.sourceMessageId === sourceMessageId &&
+            prev.sourceRole === sourceRole &&
+            prev.sourceTimestamp === sourceTimestamp
+          ) {
+            return prev;
+          }
+          return { text, left, top, sourceMessageId, sourceRole, sourceTimestamp };
+        });
+      };
+
+      // Updating popover state while dragging a selection inside a highlighted code block can
+      // cause DOM churn that drops the browser selection. Debounce until the user pauses.
+      if (inCodeBlock) {
+        if (codeblockDebounceTimer != null) window.clearTimeout(codeblockDebounceTimer);
+        codeblockDebounceTimer = window.setTimeout(() => {
+          codeblockDebounceTimer = null;
+          apply();
+        }, 120);
+        return;
+      }
+
+      if (codeblockDebounceTimer != null) {
+        window.clearTimeout(codeblockDebounceTimer);
+        codeblockDebounceTimer = null;
+      }
+      apply();
     };
 
     document.addEventListener('selectionchange', resolveSelection);
@@ -234,6 +273,10 @@ export function ChatPane() {
     // Capture scrolls from nested containers (chat list scroll, etc.).
     window.addEventListener('scroll', resolveSelection, true);
     return () => {
+      if (codeblockDebounceTimer != null) {
+        window.clearTimeout(codeblockDebounceTimer);
+        codeblockDebounceTimer = null;
+      }
       document.removeEventListener('selectionchange', resolveSelection);
       window.removeEventListener('resize', resolveSelection);
       window.removeEventListener('scroll', resolveSelection, true);
@@ -272,10 +315,6 @@ export function ChatPane() {
     onDictationError,
   );
 
-  const activeChat = chats.find(c => c.id === activeChatId);
-  const isLocked = activeChat ? !canWriteChat(activeChat) : false;
-  const chatMode = activeChat?.mode ?? 'agent';
-  const isAgent = chatMode === 'agent';
   const mentionStats = useMemo(() => {
     let files = 0;
     let folders = 0;
@@ -426,7 +465,7 @@ export function ChatPane() {
       .filter((m) => !m.excludedFromContext)
       .reduce((sum, message) => sum + getMessageText(message).length + 48, 0);
     const pendingChars = Math.max(0, pendingText.length) + Math.max(0, pendingImageCount) * 8_000 + 512;
-    const workspaceChars = Math.max(0, contextUsedChars || 0);
+    const workspaceChars = Math.max(0, workspaceContextUsedChars || 0);
     const budgetChars = Math.max(40_000, contextBudgetChars || 120_000);
     const usedChars = historyChars + workspaceChars + pendingChars;
     const ratio = budgetChars > 0 ? usedChars / budgetChars : 0;
@@ -439,7 +478,7 @@ export function ChatPane() {
       ratio,
       shouldPrompt: ratio >= CONTEXT_WARNING_RATIO,
     };
-  }, [contextBudgetChars, contextUsedChars]);
+  }, [contextBudgetChars, workspaceContextUsedChars]);
 
   const estimateContextPressureForApi = useCallback((apiMessages: LLMMessage[]) => {
     // Rough (but consistent) approximation: chars ~ tokens*4.

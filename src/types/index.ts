@@ -147,6 +147,8 @@ export interface WorkspaceSession {
   }>;
   activeFilePath: string | null;
   contextFiles: string[];
+  /** UI-only: last computed workspace context usage for this chat (chars). */
+  workspaceContextUsedChars?: number;
 }
 
 export interface ParsedPatch {
