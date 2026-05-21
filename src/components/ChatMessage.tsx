@@ -139,6 +139,11 @@ export function ChatMessage({
     rawText.trim().length > 0;
   const canRegenerateMessage = !busy && message.role === 'assistant' && !!onRegenerate;
 
+  const isAutoSummary = message.meta?.kind === 'auto_summary' && message.role === 'assistant';
+  const compactedCount = message.meta?.compactedMessageCount ?? null;
+  const compactedChars = message.meta?.compactedCharCount ?? null;
+  const compactionDepth = message.meta?.compactionDepth ?? null;
+
   // Persist code block expand/collapse across streaming re-renders.
   const [expandedCodeBlocks, setExpandedCodeBlocks] = useState<Record<string, boolean>>({});
 
@@ -344,6 +349,24 @@ export function ChatMessage({
             <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-secondary/40 px-2 py-1.5 text-[12px] leading-relaxed text-muted-foreground">
               {selectionRef.text}
             </pre>
+          </div>
+        )}
+
+        {isAutoSummary && (
+          <div className="mb-2 flex flex-wrap items-center gap-2 rounded-md border border-primary/20 bg-primary/5 px-2.5 py-2 text-[11px] text-muted-foreground">
+            <span className="font-medium text-foreground">
+              Summary{compactionDepth != null ? ` (compaction #${compactionDepth})` : ''}
+            </span>
+            {compactedCount != null && (
+              <span>
+                Summarized {compactedCount} message{compactedCount === 1 ? '' : 's'}
+              </span>
+            )}
+            {compactedChars != null && compactedChars > 0 && (
+              <span>
+                ({Math.round(compactedChars / 1000)}k chars)
+              </span>
+            )}
           </div>
         )}
 

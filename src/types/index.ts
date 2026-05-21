@@ -10,6 +10,15 @@ export interface Message {
   content: string | ContentPart[];
   timestamp: number;
   patches?: ParsedPatch[];
+  /** UI-only: keep message in the chat view, but omit from future model context (compaction). */
+  excludedFromContext?: boolean;
+  /** Optional metadata for special UI rendering (e.g. compaction summaries). */
+  meta?: {
+    kind?: 'auto_summary';
+    compactedMessageCount?: number;
+    compactedCharCount?: number;
+    compactionDepth?: number;
+  };
   /** Optional highlighted text the user referenced when asking this question. */
   selectionRef?: {
     text: string;

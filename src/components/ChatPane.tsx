@@ -148,6 +148,12 @@ export function ChatPane() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  const [showCompactedHistory, setShowCompactedHistory] = useState(false);
+
+  useEffect(() => {
+    setShowCompactedHistory(false);
+  }, [activeChatId]);
+
   useEffect(() => {
     const resolveSelection = () => {
       const sel = window.getSelection?.();
@@ -416,7 +422,9 @@ export function ChatPane() {
   }, []);
 
   const estimateContextPressure = useCallback((messages: Message[], pendingText: string, pendingImageCount: number) => {
-    const historyChars = messages.reduce((sum, message) => sum + getMessageText(message).length + 48, 0);
+    const historyChars = messages
+      .filter((m) => !m.excludedFromContext)
+      .reduce((sum, message) => sum + getMessageText(message).length + 48, 0);
     const pendingChars = Math.max(0, pendingText.length) + Math.max(0, pendingImageCount) * 8_000 + 512;
     const workspaceChars = Math.max(0, contextUsedChars || 0);
     const budgetChars = Math.max(40_000, contextBudgetChars || 120_000);
@@ -1057,17 +1065,20 @@ export function ChatPane() {
       return content.length + 48;
     };
 
+    // Compaction support: keep full transcript in UI, but omit older messages from model context.
+    const baseMessagesForContext = baseMessages.filter((m) => !m.excludedFromContext);
+
     const candidateMessages: LLMMessage[] = [
       { role: 'system', content: systemPrompt },
       ...contextMsgs,
-      ...baseMessages.map(toApi),
+      ...baseMessagesForContext.map(toApi),
       { role: 'assistant', content: '' },
     ];
     const apiPressure = estimateContextPressureForApi(candidateMessages);
     if (apiPressure.shouldPrompt) {
       const systemChars = messageChars({ role: 'system', content: systemPrompt });
       const workspaceChars = contextMsgs.reduce((sum, m) => sum + messageChars(m), 0);
-      const baseChars = baseMessages.map(toApi).reduce((sum, m) => sum + messageChars(m), 0);
+      const baseChars = baseMessagesForContext.map(toApi).reduce((sum, m) => sum + messageChars(m), 0);
       const assistantStubChars = messageChars({ role: 'assistant', content: '' });
       const historyChars = systemChars + baseChars + assistantStubChars;
       setContextPressure((prev) => {
@@ -1220,14 +1231,14 @@ export function ChatPane() {
         const continueAfterTools = hasGatherTools(tools) || hasMutationTools(tools);
         if (!continueAfterTools) break;
 
-        loopMessages = [
-          { role: 'system', content: systemPrompt },
-          ...contextMsgs,
-          ...baseMessages.map(toApi),
-          { role: 'assistant', content: streamedContent },
-          {
-            role: 'user',
-            content:
+         loopMessages = [
+           { role: 'system', content: systemPrompt },
+           ...contextMsgs,
+           ...baseMessagesForContext.map(toApi),
+           { role: 'assistant', content: streamedContent },
+           {
+             role: 'user',
+             content:
               'Tool results (inspect these results, then continue. If changes succeeded, summarize them briefly. If a tool failed, retry with corrected tool calls or explain the blocker. Do not output patch text for changes already applied by tools.):\n\n' +
               textFeedback,
           },
@@ -1545,6 +1556,12 @@ export function ChatPane() {
     const chatId = state.activeChatId;
     if (!chatId) return false;
 
+    // Avoid compacting while a generation is in-flight.
+    if (state.isStreaming) {
+      toast.error('Please wait for the current generation to finish before summarizing.');
+      return false;
+    }
+
     const chat = state.chats.find((entry) => entry.id === chatId);
     if (!chat || !canWriteChat(chat)) return false;
     const previousSummary = findLatestAutoSummaryBody(chat.messages);
@@ -1566,6 +1583,23 @@ export function ChatPane() {
       toast.error('Not possible to summarize right now. Please use Clear chat or New chat.');
       return false;
     }
+
+    // Compaction policy: keep the full transcript in the UI, but exclude older messages from future model context.
+    // Keep at least a small tail of recent turns unsummarized.
+    const KEEP_TAIL_MESSAGES = 16;
+    const notExcludedIdxs = chat.messages
+      .map((m, idx) => ({ m, idx }))
+      .filter(({ m }) => !m.excludedFromContext)
+      .map(({ idx }) => idx);
+    const cutoffIdx =
+      notExcludedIdxs.length > KEEP_TAIL_MESSAGES
+        ? notExcludedIdxs[notExcludedIdxs.length - KEEP_TAIL_MESSAGES]
+        : null;
+    const toExclude = cutoffIdx == null ? [] : chat.messages.filter((_, idx) => idx < cutoffIdx && !chat.messages[idx].excludedFromContext);
+    const compactedMessageCount = toExclude.length;
+    const compactedCharCount = toExclude.reduce((sum, m) => sum + getMessageText(m).length + 48, 0);
+    const previousCompactionCount = chat.messages.filter((m) => m.meta?.kind === 'auto_summary').length;
+    const compactionDepth = previousCompactionCount + 1;
 
     setIsCondensingChat(true);
     try {
@@ -1610,12 +1644,32 @@ export function ChatPane() {
         role: 'assistant',
         content: `${AUTO_SUMMARY_HEADER}\n\n${mergedSummary}\n\n${AUTO_SUMMARY_FOOTER}`,
         timestamp: Date.now(),
+        meta: {
+          kind: 'auto_summary',
+          compactedMessageCount,
+          compactedCharCount,
+          compactionDepth,
+        },
       };
 
-      trimMessageUiState([summaryMessage]);
-      updateChatFields(chat.id, {
-        messages: [summaryMessage],
+      // Mark older messages as excluded from future model context, but keep them visible in the UI.
+      const nextMessages = chat.messages.map((m, idx) => {
+        if (cutoffIdx != null && idx < cutoffIdx) {
+          return { ...m, excludedFromContext: true };
+        }
+        // Exclude previous auto-summaries from context so only the latest summary is used.
+        if (m.meta?.kind === 'auto_summary') {
+          return { ...m, excludedFromContext: true };
+        }
+        return m;
       });
+
+      // Insert the latest summary right at the cutoff point so the chat reads naturally.
+      const insertAt = cutoffIdx == null ? nextMessages.length : cutoffIdx;
+      nextMessages.splice(insertAt, 0, summaryMessage);
+
+      trimMessageUiState(nextMessages);
+      updateChatFields(chat.id, { messages: nextMessages });
       userScrolledUp.current = false;
       setShowScrollToLatest(false);
       toast.success(
@@ -1675,9 +1729,10 @@ export function ChatPane() {
       const chatId = st.activeChatId;
       const chat = chatId ? st.chats.find((c) => c.id === chatId) : null;
       if (chat && canWriteChat(chat)) {
-        const last = chat.messages[chat.messages.length - 1];
-        if (last?.role === 'user' && last.id === pendingContextActionInputRef.current.sentUserMessageId) {
-          updateChatFields(chat.id, { messages: chat.messages.slice(0, -1) });
+        const id = pendingContextActionInputRef.current.sentUserMessageId;
+        const idx = chat.messages.findIndex((m) => m.id === id);
+        if (idx >= 0 && chat.messages[idx]?.role === 'user') {
+          updateChatFields(chat.id, { messages: [...chat.messages.slice(0, idx), ...chat.messages.slice(idx + 1)] });
         }
       }
     }
@@ -2059,27 +2114,83 @@ export function ChatPane() {
               </div>
             </div>
           ) : (
-            activeChat.messages.map((msg) => (
-              <div
-                key={msg.id}
-                data-evig-message-id={msg.id}
-                data-evig-message-role={msg.role}
-                data-evig-message-timestamp={msg.timestamp}
-              >
-                <ChatMessage
-                  message={msg}
-                  chatMode={chatMode}
-                  onApplyPatch={handleApplyPatch}
-                  onGetOriginal={handleGetOriginal}
-                  autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
-                  agentActions={agentActionsByMessageId[msg.id]}
-                  onOpenFile={handleOpenEditorFile}
-                  onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
-                  onRegenerate={isLocked ? undefined : handleRegenerateMessage}
-                  busy={isStreaming}
-                />
-              </div>
-            ))
+            (() => {
+              const compacted = activeChat.messages.filter((m) => m.excludedFromContext);
+              const visible = activeChat.messages.filter((m) => !m.excludedFromContext);
+              const compactedCount = compacted.length;
+
+              return (
+                <>
+                  {compactedCount > 0 && (
+                    <div className="rounded-md border border-border/70 bg-muted/20 px-3 py-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="font-medium text-foreground">Compacted history</div>
+                          <div className="text-[11px] text-muted-foreground">
+                            {compactedCount} message{compactedCount === 1 ? '' : 's'} summarized (kept in view, omitted from model context).
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setShowCompactedHistory((v) => !v)}
+                          className="shrink-0 rounded-md border border-border/60 bg-background/60 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                        >
+                          {showCompactedHistory ? 'Hide' : 'Show'}
+                        </button>
+                      </div>
+                      {showCompactedHistory && (
+                        <div className="mt-3 space-y-4">
+                          {compacted.map((msg) => (
+                            <div
+                              key={msg.id}
+                              data-evig-message-id={msg.id}
+                              data-evig-message-role={msg.role}
+                              data-evig-message-timestamp={msg.timestamp}
+                              className="opacity-80"
+                            >
+                              <ChatMessage
+                                message={msg}
+                                chatMode={chatMode}
+                                onApplyPatch={handleApplyPatch}
+                                onGetOriginal={handleGetOriginal}
+                                autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
+                                agentActions={agentActionsByMessageId[msg.id]}
+                                onOpenFile={handleOpenEditorFile}
+                                onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
+                                onRegenerate={isLocked ? undefined : handleRegenerateMessage}
+                                busy={isStreaming}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {visible.map((msg) => (
+                    <div
+                      key={msg.id}
+                      data-evig-message-id={msg.id}
+                      data-evig-message-role={msg.role}
+                      data-evig-message-timestamp={msg.timestamp}
+                    >
+                      <ChatMessage
+                        message={msg}
+                        chatMode={chatMode}
+                        onApplyPatch={handleApplyPatch}
+                        onGetOriginal={handleGetOriginal}
+                        autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
+                        agentActions={agentActionsByMessageId[msg.id]}
+                        onOpenFile={handleOpenEditorFile}
+                        onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
+                        onRegenerate={isLocked ? undefined : handleRegenerateMessage}
+                        busy={isStreaming}
+                      />
+                    </div>
+                  ))}
+                </>
+              );
+            })()
           )}
           {isStreaming && (
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
