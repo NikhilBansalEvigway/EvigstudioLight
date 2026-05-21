@@ -34,23 +34,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const resetChats = useAppStore((s) => s.resetChats);
   const initChats = useAppStore((s) => s.initChats);
 
+  // When the server is temporarily unreachable, keep the last known user so we don't
+  // bounce users back to /login. We'll restore auth state when the server returns.
+  const [hadUserSession, setHadUserSession] = useState(false);
+
   const refresh = useCallback(async () => {
-    if (!serverAvailable) {
-      setUser(null);
-      return;
-    }
     try {
       const r = await fetch('/api/auth/me', { credentials: 'include' });
       const data = (await r.json()) as { user?: AuthUser };
       if (r.ok && data.user) {
         setUser(data.user);
       } else {
-        setUser(null);
+        // Only clear the user for real auth failures.
+        if (r.status === 401) {
+          setUser(null);
+          setHadUserSession(false);
+        }
       }
     } catch {
-      setUser(null);
+      // Network/server error: treat as server down, but don't force a relogin.
+      setServerAvailable(false);
     }
-  }, [serverAvailable]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -69,28 +74,43 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  // When the API was down, poll so starting the server later picks up without a full reload.
+  // Continuously monitor API health so temporary disconnects recover without reload/relogin.
   useEffect(() => {
-    if (!ready || serverAvailable) return;
-    const id = window.setInterval(async () => {
+    if (!ready) return;
+    let cancelled = false;
+    let delay = 8_000;
+
+    const tick = async () => {
+      if (cancelled) return;
       try {
-        const r = await fetch('/api/health', { credentials: 'include' });
-        if (r.ok) setServerAvailable(true);
+        const r = await fetch('/api/health', { credentials: 'include', cache: 'no-store' });
+        if (cancelled) return;
+        setServerAvailable(r.ok);
+        delay = r.ok ? 10_000 : Math.min(60_000, Math.round(delay * 1.6));
       } catch {
-        /* still down */
+        if (cancelled) return;
+        setServerAvailable(false);
+        delay = Math.min(60_000, Math.round(delay * 1.6));
       }
-    }, 12000);
-    return () => window.clearInterval(id);
-  }, [ready, serverAvailable]);
+      window.setTimeout(tick, delay);
+    };
+
+    window.setTimeout(tick, delay);
+    return () => {
+      cancelled = true;
+    };
+  }, [ready]);
 
   useEffect(() => {
     if (!ready) return;
     if (serverAvailable) {
       void refresh();
-    } else {
-      setUser(null);
     }
   }, [ready, serverAvailable, refresh]);
+
+  useEffect(() => {
+    if (user) setHadUserSession(true);
+  }, [user]);
 
   useEffect(() => {
     if (!ready || !serverAvailable || !user) {
@@ -104,19 +124,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!ready) return;
-    if (!serverAvailable || !user) {
-      setChatPersistenceMode('idb');
-    } else {
+    // Prefer server persistence whenever the user has an active session.
+    // If the server drops temporarily, stay on server mode and keep showing the current chats.
+    if (serverAvailable && user) {
       setChatPersistenceMode('server');
+      return;
     }
-  }, [ready, serverAvailable, user]);
+    if (user || hadUserSession) {
+      // Keep server mode while reconnecting.
+      setChatPersistenceMode('server');
+      return;
+    }
+    setChatPersistenceMode('idb');
+  }, [ready, serverAvailable, user, hadUserSession]);
 
   /** Load chats after persistence mode matches auth (server vs IndexedDB). */
   useEffect(() => {
     if (!ready) return;
+    // If we have (or had) a server session but the server is currently down,
+    // keep existing chats in memory instead of re-initializing from IndexedDB.
+    if (!serverAvailable && (user || hadUserSession)) return;
     if (serverAvailable && !user) return;
     void initChats();
-  }, [ready, serverAvailable, user, initChats]);
+  }, [ready, serverAvailable, user, hadUserSession, initChats]);
 
   const logout = useCallback(async () => {
     try {
@@ -124,6 +154,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } finally {
       resetChats();
       setUser(null);
+      setHadUserSession(false);
       setChatPersistenceMode('idb');
     }
   }, [resetChats]);
