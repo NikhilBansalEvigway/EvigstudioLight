@@ -25,13 +25,21 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Download, History, Loader2 } from 'lucide-react';
+import { Download, History, Loader2, FileText } from 'lucide-react';
 import { toast } from 'sonner';
 import { format } from 'date-fns';
 
 type GroupRow = { id: string; name: string };
 
-export function ChatToolbar({ chat }: { chat: Chat }) {
+export function ChatToolbar({
+  chat,
+  onSummarize,
+  summarizing = false,
+}: {
+  chat: Chat;
+  onSummarize?: () => void;
+  summarizing?: boolean;
+}) {
   const { user } = useAuth();
   const updateChatFields = useAppStore((s) => s.updateChatFields);
   const saveVersionSnapshot = useAppStore((s) => s.saveVersionSnapshot);
@@ -108,6 +116,20 @@ export function ChatToolbar({ chat }: { chat: Chat }) {
   return (
     <div className="flex flex-col gap-1.5 w-full min-w-0">
       <div className="flex flex-wrap items-center gap-1 justify-end">
+        {onSummarize && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-[11px] gap-1"
+            onClick={onSummarize}
+            disabled={summarizing || !!exporting}
+          >
+            <FileText className="w-3 h-3" />
+            Summarize
+          </Button>
+        )}
+
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button

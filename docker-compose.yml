@@ -110,6 +110,6 @@ volumes:
   # Pin volume names so running compose from different folders
   # does not create a new empty DB volume (which can look like "lost data").
   evigstudio_pgdata:
-    name: evigstudio_pgdata
+    name: evigstudiolight_evigstudio_pgdata
   llm-db-data:
     name: evigstudiolight_llm-db-data

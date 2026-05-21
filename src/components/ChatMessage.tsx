@@ -66,6 +66,59 @@ export function ChatMessage({
       ? stripToolMarkers(stripThinkingBlocks(rawText))
       : rawText;
 
+  const normalizeLatexSymbols = (text: string) => {
+    // We don't render LaTeX in chat; convert common tokens to their Unicode equivalents.
+    // This prevents raw strings like `$\\rightarrow$` from showing up in normal prose.
+    const map: Array<[RegExp, string]> = [
+      [/\$\s*\\rightarrow\s*\$/g, '→'],
+      [/\$\s*\\to\s*\$/g, '→'],
+      [/\\rightarrow\b/g, '→'],
+      [/\\to\b/g, '→'],
+      [/\$\s*\\Rightarrow\s*\$/g, '⇒'],
+      [/\\Rightarrow\b/g, '⇒'],
+      [/\\implies\b/g, '⇒'],
+      [/\$\s*\\leftarrow\s*\$/g, '←'],
+      [/\\leftarrow\b/g, '←'],
+      [/\\gets\b/g, '←'],
+      [/\\leftrightarrow\b/g, '↔'],
+      [/\\mapsto\b/g, '↦'],
+      [/\$\s*\\leq?\s*\$/g, '≤'],
+      [/\\leq?\b/g, '≤'],
+      [/\$\s*\\geq?\s*\$/g, '≥'],
+      [/\\geq?\b/g, '≥'],
+      [/\$\s*\\neq\s*\$/g, '≠'],
+      [/\\neq\b/g, '≠'],
+      [/\$\s*\\approx\s*\$/g, '≈'],
+      [/\\approx\b/g, '≈'],
+      [/\$\s*\\infty\s*\$/g, '∞'],
+      [/\\infty\b/g, '∞'],
+      [/\$\s*\\times\s*\$/g, '×'],
+      [/\\times\b/g, '×'],
+      [/\$\s*\\cdot\s*\$/g, '·'],
+      [/\\cdot\b/g, '·'],
+      [/\$\s*\\pm\s*\$/g, '±'],
+      [/\\pm\b/g, '±'],
+      [/\\ldots\b/g, '…'],
+    ];
+
+    // Avoid rewriting inside fenced code blocks.
+    const parts = text.split(/(```[\s\S]*?```)/g);
+    let out = '';
+    for (const part of parts) {
+      if (part.startsWith('```')) {
+        out += part;
+        continue;
+      }
+      let chunk = part;
+      for (const [re, value] of map) chunk = chunk.replace(re, value);
+      out += chunk;
+    }
+    return out;
+  };
+
+  const markdownToRender =
+    message.role === 'assistant' ? normalizeLatexSymbols(displayText) : displayText;
+
   const hasPatch = message.role === 'assistant' && containsPatches(rawText);
   const patches = hasPatch ? parsePatches(rawText) : [];
 
@@ -245,7 +298,7 @@ export function ChatMessage({
                   },
                 }}
               >
-                {displayText}
+                {markdownToRender}
               </ReactMarkdown>
             </div>
           )
@@ -263,8 +316,8 @@ export function ChatMessage({
           </div>
         )}
 
-        {message.role === 'assistant' && displayText.trim().length > 0 && (
-          <MessageTtsBar rawMarkdown={displayText} />
+        {message.role === 'assistant' && markdownToRender.trim().length > 0 && (
+          <MessageTtsBar rawMarkdown={markdownToRender} />
         )}
 
         {message.role === 'user' && contextRefs.length > 0 && (

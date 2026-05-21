@@ -41,8 +41,15 @@ import { ChatToolbar } from '@/components/ChatToolbar';
 import { getLastUserContextRefPaths, getMessageContextRefPaths } from '@/lib/chatContext';
 import { collectDirectoryFilePaths, findMentionNode, summarizeDirectory, type MentionEntry } from '@/lib/fileMentions';
 import { isWorkspaceEditRequest } from '@/lib/workspaceIntent';
+import {
+  buildCondenseTranscript as buildCondenseTranscriptForSummary,
+  collectChatContextRefPaths as collectChatContextRefPathsForSummary,
+  extractAutoSummaryBody as extractAutoSummaryBodyForSummary,
+} from '@/lib/chatSummarization';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Label } from '@/components/ui/label';
 import {
   buildActiveDocumentAudit,
   buildWorkspaceRootSummaries,
@@ -65,6 +72,8 @@ const KEY_PROJECT_FILES = [
 const CONTEXT_WARNING_RATIO = 0.86;
 const AUTO_SUMMARY_HEADER = 'Conversation summary (auto-generated):';
 const AUTO_SUMMARY_FOOTER = 'Continue chatting with this summary as context.';
+const SUMMARY_TEMP = 0.1;
+const SUMMARY_MAX_TOKENS = 2048;
 const INPUT_MIN_HEIGHT_PX = 56;
 const INPUT_MAX_HEIGHT_PX = 220;
 
@@ -81,6 +90,8 @@ export function ChatPane() {
   const [agentGatherStep, setAgentGatherStep] = useState<number | null>(null);
   const [showContextActionsDialog, setShowContextActionsDialog] = useState(false);
   const [isCondensingChat, setIsCondensingChat] = useState(false);
+  const [showSummarizeDialog, setShowSummarizeDialog] = useState(false);
+  const [summarizePinContext, setSummarizePinContext] = useState(true);
   const pendingContextActionInputRef = useRef<{
     input: string;
     images: string[];
@@ -387,35 +398,11 @@ export function ChatPane() {
     );
   }, []);
 
-  const buildCondenseTranscript = useCallback((messages: Message[], maxChars = 90_000) => {
-    const chunks: string[] = [];
-    let used = 0;
-
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (message.role !== 'user' && message.role !== 'assistant') continue;
-
-      const baseText = getMessageText(message).trim();
-      const fallback = hasImages(message) ? '[Image attachment]' : '(empty)';
-      const messageText = baseText || fallback;
-      const linePrefix = message.role === 'user' ? 'User' : 'Assistant';
-      const line = `${linePrefix}: ${messageText}`;
-
-      if (used + line.length <= maxChars) {
-        chunks.push(line);
-        used += line.length;
-        continue;
-      }
-
-      const remaining = maxChars - used;
-      if (remaining > 24) {
-        chunks.push(`${line.slice(0, remaining)}…`);
-      }
-      break;
-    }
-
-    return chunks.reverse().join('\n\n').trim();
-  }, []);
+  const getSummarizeTranscriptBudget = useCallback(() => {
+    const budget = Math.max(40_000, contextBudgetChars || 120_000);
+    // Leave room for system prompt + instructions + completion.
+    return Math.max(8_000, Math.min(90_000, Math.floor(budget * 0.55)));
+  }, [contextBudgetChars]);
 
   const normalizeSummaryEntity = useCallback((value: string) => {
     return value
@@ -439,26 +426,15 @@ export function ChatPane() {
     return out;
   }, [normalizeSummaryEntity]);
 
-  const extractAutoSummaryBody = useCallback((content: string): string | null => {
-    const markerIndex = content.indexOf(AUTO_SUMMARY_HEADER);
-    if (markerIndex < 0) return null;
-    let body = content.slice(markerIndex + AUTO_SUMMARY_HEADER.length).trim();
-    if (!body) return null;
-    if (body.endsWith(AUTO_SUMMARY_FOOTER)) {
-      body = body.slice(0, -AUTO_SUMMARY_FOOTER.length).trim();
-    }
-    return body || null;
-  }, []);
-
   const findLatestAutoSummaryBody = useCallback((messages: Message[]): string | null => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (message.role !== 'assistant' || typeof message.content !== 'string') continue;
-      const body = extractAutoSummaryBody(message.content);
+      const body = extractAutoSummaryBodyForSummary(message.content);
       if (body) return body;
     }
     return null;
-  }, [extractAutoSummaryBody]);
+  }, []);
 
   const extractSummaryEntities = useCallback((text: string) => {
     const inlineCode = Array.from(text.matchAll(/`([^`]+)`/g)).map((match) => (match[1] ?? '').trim());
@@ -476,7 +452,7 @@ export function ChatPane() {
 
     const apiEndpoints = Array.from(
       text.matchAll(/(?:\b(?:GET|POST|PUT|PATCH|DELETE)\s+)?(\/[A-Za-z0-9._~\-/:?#[\]@!$&'()*+,;=%]{2,})/g),
-    ).map((match) => (match[0] ?? '').trim());
+    ).map((match) => (match[1] ?? match[0] ?? '').trim());
 
     const apiSymbols = Array.from(text.matchAll(/\b[a-z][A-Za-z0-9_]*(?:\.[a-zA-Z0-9_]+)*\s*\(/g)).map((match) => {
       const token = (match[0] ?? '').trim();
@@ -508,13 +484,23 @@ export function ChatPane() {
     const newEntities = extractSummaryEntities(newSummary);
     const normalizedNewSummary = normalizeSummaryEntity(newSummary);
 
+    const appearsAsWholeToken = (haystack: string, needle: string) => {
+      if (!needle) return false;
+      if (needle.includes(' ')) {
+        return haystack.includes(needle);
+      }
+      // Compare on whitespace token boundaries to reduce false positives like `/users` vs `/user`.
+      const tokens = haystack.split(/\s+/).filter(Boolean);
+      return tokens.includes(needle);
+    };
+
     const findMissing = (older: string[], newer: string[]) => {
       const newerSet = new Set(newer.map((value) => normalizeSummaryEntity(value)).filter(Boolean));
       return older.filter((entry) => {
         const normalized = normalizeSummaryEntity(entry);
         if (!normalized) return false;
         if (newerSet.has(normalized)) return false;
-        return !normalizedNewSummary.includes(normalized);
+        return !appearsAsWholeToken(normalizedNewSummary, normalized);
       });
     };
 
@@ -1183,11 +1169,18 @@ export function ChatPane() {
         if (isContextLengthError(errorMsg)) {
           // Provider rejected due to context size: prompt user with summarize/clear/new chat actions.
           const p = estimateContextPressureForApi(loopMessages);
+          const workspaceChars = loopMessages
+            .filter((m) => {
+              if (m.role !== 'user') return false;
+              if (typeof m.content !== 'string') return false;
+              return m.content.startsWith('Workspace context');
+            })
+            .reduce((sum, m) => sum + messageChars(m), 0);
           setContextPressure({
             usedChars: p.usedChars,
             budgetChars: p.budgetChars,
-            historyChars: p.usedChars,
-            workspaceChars: 0,
+            historyChars: Math.max(0, p.usedChars - workspaceChars),
+            workspaceChars,
             pendingChars: 0,
             ratio: p.ratio,
           });
@@ -1419,17 +1412,17 @@ export function ChatPane() {
     selectionAttachment,
     activeChat,
     activeChatId,
-    contextFiles.length,
+    contextFiles,
     fileTree,
     isStreaming,
-    workspaceRoots.length,
+    workspaceRoots,
     settings,
     createChat,
     addMessage,
     runAssistantTurn,
   ]);
 
-  const summarizeActiveChat = useCallback(async (): Promise<boolean> => {
+  const summarizeActiveChat = useCallback(async (opts?: { pinContext?: boolean }): Promise<boolean> => {
     const state = useAppStore.getState();
     const chatId = state.activeChatId;
     if (!chatId) return false;
@@ -1438,7 +1431,19 @@ export function ChatPane() {
     if (!chat || !canWriteChat(chat)) return false;
     const previousSummary = findLatestAutoSummaryBody(chat.messages);
 
-    const transcript = buildCondenseTranscript(chat.messages);
+    const pinContext = opts?.pinContext ?? false;
+
+    // If requested, keep the currently referenced files available after condensing.
+    if (pinContext) {
+      const refs = collectChatContextRefPathsForSummary(chat.messages);
+      if (refs.length > 0) {
+        const st = useAppStore.getState();
+        const nextPinned = [...new Set([...(st.contextFiles ?? []), ...refs])];
+        useAppStore.setState({ contextFiles: nextPinned });
+      }
+    }
+
+    const transcript = buildCondenseTranscriptForSummary(chat.messages, getSummarizeTranscriptBudget());
     if (!transcript) {
       toast.error('Not possible to summarize right now. Please use Clear chat or New chat.');
       return false;
@@ -1462,7 +1467,8 @@ export function ChatPane() {
         settings: {
           ...settings,
           stream: false,
-          maxTokens: Math.min(2048, Math.max(512, Math.floor(settings.maxTokens / 2))),
+          temperature: SUMMARY_TEMP,
+          maxTokens: Math.min(SUMMARY_MAX_TOKENS, Math.max(256, Math.floor(settings.maxTokens / 2))),
         },
         useVision: false,
         requestContext: {
@@ -1508,8 +1514,8 @@ export function ChatPane() {
       setIsCondensingChat(false);
     }
   }, [
-    buildCondenseTranscript,
     findLatestAutoSummaryBody,
+    getSummarizeTranscriptBudget,
     mergeSummaryWithEntityRetention,
     saveVersionSnapshot,
     settings,
@@ -1538,8 +1544,14 @@ export function ChatPane() {
   }, [saveVersionSnapshot, trimMessageUiState, updateChatFields]);
 
   const handleContextActionSummarize = useCallback(async () => {
-    // If we already captured a pending input (because the turn was blocked by context),
-    // remove the last user message so the transcript doesn't double-count it.
+    setShowContextActionsDialog(false);
+    setSummarizePinContext(true);
+    setShowSummarizeDialog(true);
+  }, []);
+
+  const handleConfirmSummarize = useCallback(async () => {
+    // If this prompt was triggered after we already appended the user's message,
+    // remove it so the transcript doesn't double-count it.
     if (pendingContextActionInputRef.current?.sentUserMessageId) {
       const st = useAppStore.getState();
       const chatId = st.activeChatId;
@@ -1551,9 +1563,12 @@ export function ChatPane() {
         }
       }
     }
-    const ok = await summarizeActiveChat();
+
+    setShowSummarizeDialog(false);
+    const ok = await summarizeActiveChat({ pinContext: summarizePinContext });
     if (!ok) return;
-    setShowContextActionsDialog(false);
+
+    // If this summarize was part of a context-pressure continuation flow, restore and re-send.
     if (pendingContextActionInputRef.current) {
       const pending = pendingContextActionInputRef.current;
       pendingContextActionInputRef.current = null;
@@ -1561,9 +1576,9 @@ export function ChatPane() {
       setImages(pending.images);
       setMentionedFiles(pending.mentionedFiles);
       setSelectionAttachment(pending.selectionRef);
+      await sendCurrentInput();
     }
-    await sendCurrentInput();
-  }, [sendCurrentInput, summarizeActiveChat]);
+  }, [sendCurrentInput, summarizePinContext, summarizeActiveChat, updateChatFields]);
 
   const handleContextActionClear = useCallback(async () => {
     const ok = clearActiveChat();
@@ -1631,7 +1646,7 @@ export function ChatPane() {
     }
 
     await sendCurrentInput();
-  }, [estimateContextPressure, images.length, input, isStreaming, selectionAttachment, sendCurrentInput]);
+  }, [estimateContextPressure, images, input, isStreaming, mentionedFiles, selectionAttachment, sendCurrentInput]);
 
   const handleStop = () => abortRef.current?.abort();
 
@@ -1683,7 +1698,16 @@ export function ChatPane() {
             )}
           </div>
         </div>
-        {activeChat && <ChatToolbar chat={activeChat} />}
+        {activeChat && (
+          <ChatToolbar
+            chat={activeChat}
+            onSummarize={() => {
+              setSummarizePinContext(true);
+              setShowSummarizeDialog(true);
+            }}
+            summarizing={isCondensingChat}
+          />
+        )}
       </div>
 
       {activeChat && isLocked && (
@@ -1784,6 +1808,69 @@ export function ChatPane() {
               New chat
             </Button>
             <Button type="button" onClick={() => void handleContextActionSummarize()} disabled={isCondensingChat}>
+              {isCondensingChat ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Summarizing…
+                </>
+              ) : (
+                'Summarize'
+              )}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={showSummarizeDialog}
+        onOpenChange={(open) => {
+          setShowSummarizeDialog(open);
+          if (!open) {
+            // Reset to a sane default each time.
+            setSummarizePinContext(true);
+          }
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-base">Summarize conversation</DialogTitle>
+            <DialogDescription>
+              Condense the chat into a compact continuity summary so you can keep going without hitting the context window.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <label className="flex items-start gap-2">
+              <Checkbox
+                checked={summarizePinContext}
+                onCheckedChange={(v) => setSummarizePinContext(v === true)}
+                disabled={isCondensingChat}
+              />
+              <div className="grid gap-0.5">
+                <Label className="text-sm">Keep referenced files in context</Label>
+                <p className="text-xs text-muted-foreground">
+                  Recommended for coding chats. EvigStudio will add files you referenced in this conversation to “Injected Files”, so the next turn still has the right code context.
+                </p>
+              </div>
+            </label>
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setShowSummarizeDialog(false);
+                // If we opened this from the context-pressure flow, send the user back.
+                if (pendingContextActionInputRef.current) {
+                  setShowContextActionsDialog(true);
+                }
+              }}
+              disabled={isCondensingChat}
+            >
+              Cancel
+            </Button>
+            <Button type="button" onClick={() => void handleConfirmSummarize()} disabled={isCondensingChat}>
               {isCondensingChat ? (
                 <>
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
