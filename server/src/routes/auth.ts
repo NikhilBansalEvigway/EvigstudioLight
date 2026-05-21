@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { setCookie, deleteCookie } from 'hono/cookie';
 import { z } from 'zod';
-import { count, eq } from 'drizzle-orm';
+import { count, eq, sql } from 'drizzle-orm';
 import bcrypt from 'bcryptjs';
 import { db } from '../db/client.js';
 import { users } from '../db/schema.js';
@@ -67,10 +67,22 @@ authRoutes.post('/register', async (c) => {
       })
       .returning();
 
+    let sid = row.sessionNonce;
+    if (!sid) {
+      const [forced] = await db
+        .update(users)
+        .set({ sessionNonce: sql`gen_random_uuid()` })
+        .where(eq(users.id, row.id))
+        .returning({ sessionNonce: users.sessionNonce });
+      sid = forced?.sessionNonce ?? null;
+    }
+    if (!sid) return c.json({ error: 'Registration failed' }, 500);
+
     const token = await signSession({
       sub: row.id,
       email: row.email,
       role: row.role,
+      sid,
     });
 
     setSessionCookie(c, token);
@@ -127,11 +139,30 @@ authRoutes.post('/login', async (c) => {
   }
 
   const rememberMe = body.data.rememberMe === true;
+
+  // Enforce single active login: rotate the per-user session nonce on every login.
+  const [rotated] = await db
+    .update(users)
+    .set({ sessionNonce: sql`gen_random_uuid()` })
+    .where(eq(users.id, user.id))
+    .returning({ sessionNonce: users.sessionNonce });
+  let sid = rotated?.sessionNonce ?? user.sessionNonce;
+  if (!sid) {
+    const [forced] = await db
+      .update(users)
+      .set({ sessionNonce: sql`gen_random_uuid()` })
+      .where(eq(users.id, user.id))
+      .returning({ sessionNonce: users.sessionNonce });
+    sid = forced?.sessionNonce ?? null;
+  }
+  if (!sid) return c.json({ error: 'Login failed' }, 500);
+
   const token = await signSession(
     {
       sub: user.id,
       email: user.email,
       role: user.role,
+      sid,
     },
     rememberMe ? '30d' : '7d',
   );

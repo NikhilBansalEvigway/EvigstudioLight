@@ -20,6 +20,11 @@ export async function sessionMiddleware(c: Context<HonoEnv>, next: Next) {
   if (session?.sub) {
     const rows = await db.select().from(users).where(eq(users.id, session.sub)).limit(1);
     user = rows[0] ?? null;
+
+    // Enforce single active login: session must match the current per-user nonce.
+    if (user && session.sid && user.sessionNonce && session.sid !== user.sessionNonce) {
+      user = null;
+    }
   }
   c.set('user', user);
   c.set('sessionSub', session?.sub ?? null);

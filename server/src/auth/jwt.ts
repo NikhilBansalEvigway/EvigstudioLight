@@ -14,6 +14,7 @@ export type SessionPayload = {
   sub: string;
   email: string;
   role: string;
+  sid: string;
   iat?: number;
   exp?: number;
 };
@@ -22,7 +23,7 @@ export async function signSession(
   payload: Omit<SessionPayload, 'iat' | 'exp'>,
   expiresIn: string = '7d',
 ): Promise<string> {
-  return new SignJWT({ email: payload.email, role: payload.role })
+  return new SignJWT({ email: payload.email, role: payload.role, sid: payload.sid })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(payload.sub)
     .setIssuedAt()
@@ -36,8 +37,10 @@ export async function verifySession(token: string): Promise<SessionPayload | nul
     const sub = typeof payload.sub === 'string' ? payload.sub : null;
     const email = typeof payload.email === 'string' ? payload.email : '';
     const role = typeof payload.role === 'string' ? payload.role : 'developer';
+    const sid = typeof (payload as any).sid === 'string' ? (payload as any).sid : null;
     if (!sub) return null;
-    return { sub, email, role };
+    if (!sid) return null;
+    return { sub, email, role, sid };
   } catch {
     return null;
   }

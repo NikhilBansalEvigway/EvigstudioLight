@@ -30,7 +30,8 @@ export async function ensurePostgresSchema(): Promise<void> {
       password_hash text NOT NULL,
       display_name text NOT NULL,
       role user_role NOT NULL DEFAULT 'developer',
-      created_at timestamptz NOT NULL DEFAULT now()
+      created_at timestamptz NOT NULL DEFAULT now(),
+      session_nonce uuid NOT NULL DEFAULT gen_random_uuid()
     );
 
     CREATE TABLE IF NOT EXISTS prompts (
@@ -98,6 +99,10 @@ export async function ensurePostgresSchema(): Promise<void> {
     );
 
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen timestamptz;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS session_nonce uuid;
+    ALTER TABLE users ALTER COLUMN session_nonce SET DEFAULT gen_random_uuid();
+    UPDATE users SET session_nonce = gen_random_uuid() WHERE session_nonce IS NULL;
+    ALTER TABLE users ALTER COLUMN session_nonce SET NOT NULL;
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS privacy text NOT NULL DEFAULT 'private';
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS thread_id uuid;
     ALTER TABLE chats ADD COLUMN IF NOT EXISTS thread_title text;

@@ -34,6 +34,7 @@ export const users = pgTable('users', {
   role: userRoleEnum('role').notNull().default('developer'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   lastSeen: timestamp('last_seen', { withTimezone: true }),
+  sessionNonce: uuid('session_nonce'),
 });
 
 export const groups = pgTable('groups', {
