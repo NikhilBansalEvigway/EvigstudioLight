@@ -18,22 +18,25 @@ interface ChatCompletionOptions {
   };
 }
 
-export async function testConnection(settings: AppSettings): Promise<{ ok: boolean; message: string }> {
+export async function testConnection(
+  settings: AppSettings,
+  options?: { quiet?: boolean },
+): Promise<{ ok: boolean; message: string }> {
   const url = `${settings.baseUrl}/models`;
-  console.log('[EvigStudio] Testing connection to:', url);
+  if (!options?.quiet) console.log('[EvigStudio] Testing connection to:', url);
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    console.log('[EvigStudio] Response status:', res.status);
+    if (!options?.quiet) console.log('[EvigStudio] Response status:', res.status);
     if (res.ok) {
       const text = await res.text();
-      console.log('[EvigStudio] Raw response:', text);
+      if (!options?.quiet) console.log('[EvigStudio] Raw response:', text);
       let data: any;
       try {
         data = JSON.parse(text);
       } catch {
         return { ok: false, message: `Server returned invalid JSON. Base URL: ${settings.baseUrl}` };
       }
-      console.log('[EvigStudio] Parsed data:', data);
+      if (!options?.quiet) console.log('[EvigStudio] Parsed data:', data);
       const count = data?.data?.length ?? 0;
       if (count === 0) {
         return { ok: true, message: `Connected (via ${settings.baseUrl}), but 0 models were returned. Check the configured provider and credentials.` };
@@ -45,7 +48,7 @@ export async function testConnection(settings: AppSettings): Promise<{ ok: boole
     }
     return { ok: false, message: `Server returned ${res.status}: ${res.statusText}` };
   } catch (err: any) {
-    console.error('[EvigStudio] Connection error:', err);
+    if (!options?.quiet) console.error('[EvigStudio] Connection error:', err);
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
       return { ok: false, message: `Connection timed out. Use Base URL /api/llm/v1 when using the server proxy (current: ${settings.baseUrl})` };
     }

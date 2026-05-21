@@ -12,8 +12,16 @@ export function SettingsBootstrap() {
     void (async () => {
       await initSettings();
       if (cancelled) return;
-      const result = await testConnection(useAppStore.getState().settings);
-      if (!cancelled) setLMConnected(result.ok);
+      let delay = 3_000;
+      const tick = async () => {
+        if (cancelled) return;
+        const result = await testConnection(useAppStore.getState().settings, { quiet: true });
+        if (cancelled) return;
+        setLMConnected(result.ok);
+        delay = result.ok ? 15_000 : Math.min(60_000, Math.round(delay * 1.6));
+        window.setTimeout(tick, delay);
+      };
+      void tick();
     })();
     return () => {
       cancelled = true;
