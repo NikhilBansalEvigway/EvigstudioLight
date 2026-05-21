@@ -623,6 +623,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   hydrateWorkspaceSession: async (chatId) => {
     try {
       const session = await loadWorkspaceSession(chatId);
+      // Reset context usage on chat switch. It is computed lazily when we build the next turn's
+      // workspace context, and should not carry over between chats.
+      set({ contextUsedChars: 0 });
       if (!session) {
         // No session for this chat: start clean.
         set({
