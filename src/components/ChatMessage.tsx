@@ -549,7 +549,19 @@ function ExpandablePre({ children }: { children: React.ReactNode }) {
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el || expanded) return;
-    el.scrollTop = el.scrollHeight;
+    // Only auto-follow when the user was already near the bottom, and don't fight text selection.
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const nearBottom = distFromBottom < 24;
+    const sel = window.getSelection?.();
+    const selectingInside =
+      !!sel &&
+      sel.rangeCount > 0 &&
+      !sel.isCollapsed &&
+      !!preRef.current &&
+      (preRef.current.contains(sel.anchorNode) || preRef.current.contains(sel.focusNode));
+    if (nearBottom && !selectingInside) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [children, expanded]);
 
   const handleCopy = useCallback(() => {
@@ -560,7 +572,7 @@ function ExpandablePre({ children }: { children: React.ReactNode }) {
   }, []);
 
   const preClass =
-    '!mb-0 !mt-0 overflow-x-auto p-3 text-xs leading-relaxed [&_code]:bg-transparent [&_code]:text-[13px]';
+    '!mb-0 !mt-0 overflow-x-auto p-3 text-xs leading-relaxed select-text [&_code]:bg-transparent [&_code]:text-[13px]';
 
   return (
     <div className="my-2 overflow-hidden rounded-md border border-border/60 bg-secondary/50">
