@@ -316,18 +316,6 @@ export function SettingsDialog() {
           {/* Toggles */}
           <Section title="Behavior">
             <Toggle label="Stream responses" checked={settings.stream} onChange={v => setSettings({ stream: v })} />
-            <Toggle
-              label="Require approval for patch edits"
-              desc="When enabled, code patches are proposed as diffs until you approve + apply them"
-              checked={settings.requirePatchApproval}
-              onChange={(v) => setSettings({ requirePatchApproval: v })}
-            />
-            <Toggle
-              label="Agent loop (multi-step)"
-              desc="Allow the agent to do multiple read/list tool rounds before answering"
-              checked={settings.agentLoop}
-              onChange={(v) => setSettings({ agentLoop: v })}
-            />
             <Field label={`Agent max tool rounds: ${Math.min(10, Math.max(1, settings.agentMaxIterations ?? 5))}`}>
               <input
                 type="range"

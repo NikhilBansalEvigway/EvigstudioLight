@@ -4,10 +4,12 @@ import { chatCompletion, type ChatMessage as LLMMessage } from '@/lib/llmClient'
 import {
   buildWorkspacePath,
   buildWorkspaceTree,
+  deleteWorkspacePath,
   isWorkspacePathIgnored,
   readWorkspaceFile,
   serializeFileTree,
   STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE,
+  writeWorkspaceFile,
 } from '@/lib/fsWorkspace';
 import { DEFAULT_CONTEXT_RULES, isAllowedContextPath } from '@/lib/contextRules';
 import {
@@ -19,8 +21,7 @@ import {
   stripChannelTokens,
   type AgentAction,
 } from '@/lib/agentTools';
-import { containsPatches, parsePatches } from '@/lib/patchApply';
-import { applyPatchToWorkspace } from '@/lib/workspacePatch';
+import { applyPatch, containsPatches, parsePatches } from '@/lib/patchApply';
 import { ChatMessage } from '@/components/ChatMessage';
 import { ChatModeToggle } from '@/components/ChatModeToggle';
 import { FileMentionPopover } from '@/components/FileMentionPopover';
@@ -132,25 +133,6 @@ export function ChatPane() {
   const isLocked = activeChat ? !canWriteChat(activeChat) : false;
   const chatMode = activeChat?.mode ?? 'agent';
   const isAgent = chatMode === 'agent';
-
-  // Backfill patch metadata for older assistant messages so they show approve/reject UI.
-  useEffect(() => {
-    if (!activeChatId || !activeChat) return;
-    if (!settings.requirePatchApproval) return;
-    for (const msg of activeChat.messages) {
-      if (msg.role !== 'assistant') continue;
-      if (msg.patches && msg.patches.length > 0) continue;
-      const text = typeof msg.content === 'string' ? msg.content : '';
-      if (!containsPatches(text)) continue;
-      const raw = parsePatches(text);
-      if (raw.length === 0) continue;
-      useAppStore.getState().setMessagePatches(
-        activeChatId,
-        msg.id,
-        raw.map((p) => ({ ...p, id: crypto.randomUUID(), status: 'pending', applied: false })),
-      );
-    }
-  }, [activeChat, activeChatId, settings.requirePatchApproval]);
 
   // Keep the context usage indicator tied to the active chat.
   useEffect(() => {
@@ -894,9 +876,27 @@ export function ChatPane() {
     useAppStore.getState().setFileTree(tree);
   }, []);
 
-  const applyPatchToWorkspaceWithRoots = useCallback(async (patch: ParsedPatch) => {
+  const applyPatchToWorkspace = useCallback(async (patch: ParsedPatch) => {
     const roots = useAppStore.getState().workspaceRoots;
-    await applyPatchToWorkspace(roots, patch);
+    if (roots.length === 0) throw new Error('No workspace folder open');
+
+    const { filePath, content, operation = 'update' } = patch;
+
+    if (operation === 'delete') {
+      await deleteWorkspacePath(roots, filePath);
+      useAppStore.getState().removeWorkspacePathReferences(filePath);
+      return;
+    }
+
+    let original = '';
+    try {
+      original = await readWorkspaceFile(roots, filePath);
+    } catch {
+      /* new or missing file */
+    }
+    const result = applyPatch(original, patch);
+    await writeWorkspaceFile(roots, filePath, result);
+    useAppStore.getState().syncEditorFileContent(filePath, result);
   }, []);
 
   const handleOpenEditorFile = useCallback(async (filePath: string) => {
@@ -923,7 +923,7 @@ export function ChatPane() {
         return;
       }
       try {
-        await applyPatchToWorkspaceWithRoots(patch);
+        await applyPatchToWorkspace(patch);
         addPatchedPaths([patch.filePath]);
         toast.success(
           patch.operation === 'delete' ? `Removed ${patch.filePath}` : `Saved ${patch.filePath}`,
@@ -934,90 +934,26 @@ export function ChatPane() {
         toast.error(`Failed to apply patch: ${msg}`);
       }
     },
-    [applyPatchToWorkspaceWithRoots, refreshFileTree, addPatchedPaths],
+    [applyPatchToWorkspace, refreshFileTree, addPatchedPaths],
   );
 
-  const handleApprovePatch = useCallback(
-    (messageId: string, patch: ParsedPatch) => {
-      const chatId = useAppStore.getState().activeChatId;
-      if (!chatId || !patch.id) return;
-      useAppStore.getState().setPatchStatus(chatId, messageId, patch.id, 'approved');
-      toast.success(`Approved ${patch.filePath}`);
-    },
-    [],
-  );
-
-  const handleRejectPatch = useCallback(
-    (messageId: string, patch: ParsedPatch) => {
-      const chatId = useAppStore.getState().activeChatId;
-      if (!chatId || !patch.id) return;
-      useAppStore.getState().setPatchStatus(chatId, messageId, patch.id, 'rejected');
-      toast.message(`Rejected ${patch.filePath}`);
-    },
-    [],
-  );
-
-  const handleApplyApprovedPatch = useCallback(
-    async (messageId: string, patch: ParsedPatch) => {
-      const chatId = useAppStore.getState().activeChatId;
-      if (!chatId || !patch.id) return;
-      if (useAppStore.getState().workspaceRoots.length === 0) {
-        toast.error('No workspace folder open');
-        return;
-      }
-      try {
-        await applyPatchToWorkspaceWithRoots(patch);
-        addPatchedPaths([patch.filePath]);
-        useAppStore.getState().setPatchStatus(chatId, messageId, patch.id, 'applied');
-        setAutoAppliedPathsByMessageId((prev) => ({
-          ...prev,
-          [messageId]: [...new Set([...(prev[messageId] ?? []), patch.filePath])],
-        }));
-        toast.success(patch.operation === 'delete' ? `Removed ${patch.filePath}` : `Saved ${patch.filePath}`);
-        await refreshFileTree();
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        useAppStore.getState().setPatchStatus(chatId, messageId, patch.id, 'failed', msg);
-        toast.error(`Failed to apply patch: ${msg}`);
-      }
-    },
-    [addPatchedPaths, applyPatchToWorkspaceWithRoots, refreshFileTree],
-  );
-
-  const finalizeAssistantPatches = useCallback(
-    async (chatId: string, assistantMessageId: string, text: string, isAgentMode: boolean) => {
-      if (!containsPatches(text)) return;
-      const raw = parsePatches(text);
-      if (raw.length === 0) return;
-
-      const patches: ParsedPatch[] = raw.map((p) => ({
-        ...p,
-        id: crypto.randomUUID(),
-        status: 'pending',
-        applied: false,
-      }));
-
-      useAppStore.getState().setMessagePatches(chatId, assistantMessageId, patches);
-
-      if (settings.requirePatchApproval) {
-        return;
-      }
-
+  const runAgentAutoApply = useCallback(
+    async (assistantMessageId: string, text: string) => {
       const st = useAppStore.getState();
       if (st.workspaceRoots.length === 0) return;
+      if (!containsPatches(text)) return;
+      const patches = parsePatches(text);
+      if (patches.length === 0) return;
 
       const appliedPaths: string[] = [];
       const errors: string[] = [];
-
       for (const p of patches) {
         try {
-          await applyPatchToWorkspace(st.workspaceRoots, p);
+          await applyPatchToWorkspace(p);
           appliedPaths.push(p.filePath);
-          if (p.id) st.setPatchStatus(chatId, assistantMessageId, p.id, 'applied');
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           errors.push(`${p.filePath}: ${msg}`);
-          if (p.id) st.setPatchStatus(chatId, assistantMessageId, p.id, 'failed', msg);
         }
       }
 
@@ -1029,21 +965,63 @@ export function ChatPane() {
           [assistantMessageId]: [...new Set([...(prev[assistantMessageId] ?? []), ...appliedPaths])],
         }));
 
-        if (isAgentMode) {
-          const actions: AgentAction[] = appliedPaths.map((path) => ({ type: 'write', path, success: true }));
-          setAgentActionsByMessageId((prev) => ({
-            ...prev,
-            [assistantMessageId]: [...(prev[assistantMessageId] ?? []), ...actions],
-          }));
-        }
+        const actions: AgentAction[] = appliedPaths.map((path) => {
+          const patch = patches.find((p) => p.filePath === path);
+          const type = patch?.operation === 'create' ? 'write' : patch?.operation === 'delete' ? 'delete' : 'write';
+          return { type, path, success: true };
+        });
+        setAgentActionsByMessageId((prev) => ({
+          ...prev,
+          [assistantMessageId]: [...(prev[assistantMessageId] ?? []), ...actions],
+        }));
 
         toast.success(`Applied ${appliedPaths.length} change(s)`);
       }
       if (errors.length > 0) {
-        toast.error(`Some patches failed: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? '…' : ''}`);
+        toast.error(
+          `Some patches failed: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? '…' : ''}`,
+        );
       }
     },
-    [addPatchedPaths, refreshFileTree, settings.requirePatchApproval],
+    [applyPatchToWorkspace, refreshFileTree, addPatchedPaths],
+  );
+
+  const runDirectEditAutoApply = useCallback(
+    async (assistantMessageId: string, text: string) => {
+      const st = useAppStore.getState();
+      if (!st.settings.directEditMode || st.workspaceRoots.length === 0) return;
+      if (!containsPatches(text)) return;
+      const patches = parsePatches(text);
+      if (patches.length === 0) return;
+
+      const appliedPaths: string[] = [];
+      const errors: string[] = [];
+      for (const p of patches) {
+        try {
+          await applyPatchToWorkspace(p);
+          appliedPaths.push(p.filePath);
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          errors.push(`${p.filePath}: ${msg}`);
+        }
+      }
+
+      if (appliedPaths.length > 0) {
+        addPatchedPaths(appliedPaths);
+        await refreshFileTree();
+        setAutoAppliedPathsByMessageId((prev) => ({
+          ...prev,
+          [assistantMessageId]: [...new Set([...(prev[assistantMessageId] ?? []), ...appliedPaths])],
+        }));
+        toast.success(`Direct edit: applied ${appliedPaths.length} change(s) to the folder`);
+      }
+      if (errors.length > 0) {
+        toast.error(
+          `Some patches failed: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? '…' : ''}`,
+        );
+      }
+    },
+    [applyPatchToWorkspace, refreshFileTree, addPatchedPaths],
   );
 
   const runAssistantTurn = useCallback(async ({
@@ -1327,9 +1305,13 @@ export function ChatPane() {
 
       if (typeof streamedContent === 'string' && streamedContent.length > 0) {
         try {
-          await finalizeAssistantPatches(chatId, assistantMsg.id, streamedContent, isAgentMode);
+          if (isAgentMode) {
+            await runAgentAutoApply(assistantMsg.id, streamedContent);
+          } else {
+            await runDirectEditAutoApply(assistantMsg.id, streamedContent);
+          }
         } catch (e) {
-          console.error('[EvigStudio] finalizeAssistantPatches', e);
+          console.error('[EvigStudio] auto-apply', e);
         }
       }
     } catch (err: unknown) {
@@ -1384,7 +1366,7 @@ export function ChatPane() {
     }
 
     return !needsContextAction;
-  }, [addMessage, addPatchedPaths, buildContextMessages, contextFiles.length, estimateContextPressureForApi, finalizeAssistantPatches, isContextLengthError, refreshFileTree, setIsStreaming, settings, updateLastAssistantMessage, workspaceRoots.length]);
+  }, [addMessage, addPatchedPaths, buildContextMessages, contextFiles.length, estimateContextPressureForApi, isContextLengthError, refreshFileTree, runAgentAutoApply, runDirectEditAutoApply, setIsStreaming, settings, updateLastAssistantMessage, workspaceRoots.length]);
 
   const handleSubmitMessageEdit = useCallback(async (messageId: string, nextText: string) => {
     const chatId = useAppStore.getState().activeChatId;
@@ -2232,9 +2214,6 @@ export function ChatPane() {
                                 message={msg}
                                 chatMode={chatMode}
                                 onApplyPatch={handleApplyPatch}
-                                onApprovePatch={isLocked ? undefined : handleApprovePatch}
-                                onRejectPatch={isLocked ? undefined : handleRejectPatch}
-                                onApplyApprovedPatch={isLocked ? undefined : handleApplyApprovedPatch}
                                 onGetOriginal={handleGetOriginal}
                                 autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
                                 agentActions={agentActionsByMessageId[msg.id]}
@@ -2261,9 +2240,6 @@ export function ChatPane() {
                         message={msg}
                         chatMode={chatMode}
                         onApplyPatch={handleApplyPatch}
-                        onApprovePatch={isLocked ? undefined : handleApprovePatch}
-                        onRejectPatch={isLocked ? undefined : handleRejectPatch}
-                        onApplyApprovedPatch={isLocked ? undefined : handleApplyApprovedPatch}
                         onGetOriginal={handleGetOriginal}
                         autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
                         agentActions={agentActionsByMessageId[msg.id]}

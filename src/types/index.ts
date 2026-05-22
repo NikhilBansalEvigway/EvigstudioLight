@@ -152,15 +152,10 @@ export interface WorkspaceSession {
 }
 
 export interface ParsedPatch {
-  /** Stable UI id for approve/reject/apply flows. */
-  id?: string;
   filePath: string;
   content: string;
   /** From agent patch header; defaults to update when omitted. */
   operation?: 'update' | 'create' | 'delete';
-  status?: 'pending' | 'approved' | 'rejected' | 'applied' | 'failed';
-  error?: string;
-  /** Legacy: prefer `status === 'applied'`. */
   applied?: boolean;
 }
 
@@ -182,8 +177,6 @@ export interface AppSettings {
   maxTokens: number;
   stream: boolean;
   directEditMode: boolean;
-  /** When enabled, agent patch suggestions require explicit approve/apply by the user. */
-  requirePatchApproval: boolean;
   strictOffline: boolean;
   /** Built-in palette (works with light/dark) */
   uiThemePreset: UiThemePresetId;
@@ -227,8 +220,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   temperature: 0.2,
   maxTokens: MAX_MAX_TOKENS,
   stream: true,
-  directEditMode: false,
-  requirePatchApproval: true,
+  directEditMode: true,
   strictOffline: true,
   uiThemePreset: 'default',
   brandName: 'EvigStudio',

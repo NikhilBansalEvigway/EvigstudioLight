@@ -12,8 +12,6 @@ import {
   writeWorkspaceFileVerified,
   workspaceRootsMatch,
 } from '@/lib/fsWorkspace';
-import { applyPatchToWorkspace } from '@/lib/workspacePatch';
-import { containsPatches, parsePatches } from '@/lib/patchApply';
 import {
   buildActiveDocumentAudit,
   buildWorkspaceRootSummaries,
@@ -21,10 +19,10 @@ import {
   postWorkspaceAuditEvent,
   workspaceFolderLabels,
 } from '@/lib/auditClient';
-import { SYSTEM_PROMPT, type ParsedPatch, type WorkspaceRoot } from '@/types';
-import { FolderOpen, FileCode, BookOpen, Terminal, Save, AlertTriangle, FilePlus, X, Copy, Users, Loader2 } from 'lucide-react';
+import { SYSTEM_PROMPT } from '@/types';
+import { FolderOpen, FileCode, BookOpen, Save, AlertTriangle, FilePlus, X, Copy, Users, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
-import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useActiveUsers } from '@/hooks/useActiveUsers';
 import { useTheme } from 'next-themes';
 import Editor, { loader } from '@monaco-editor/react';
@@ -61,8 +59,6 @@ export function WorkspacePane() {
     workspaceRoots, clearWorkspace, setFileTree,
     openEditorTabs, activeFilePath, activeFileContent, setActiveFileContent, setActiveEditorFile, closeEditorFile, markEditorFileSaved,
     contextFiles, toggleContextFile, clearContextFiles, settings, fileTree,
-    chats, activeChatId,
-    setMessagePatches, setPatchStatus,
   } = useAppStore();
   const { serverAvailable, user } = useAuth();
 
@@ -359,30 +355,8 @@ export function WorkspacePane() {
     { id: 'files' as const, label: 'Files', icon: FolderOpen },
     { id: 'editor' as const, label: 'Editor', icon: FileCode },
     { id: 'context' as const, label: 'Context', icon: BookOpen },
-    { id: 'changes' as const, label: 'Changes', icon: Terminal },
     ...(user?.role === 'admin' ? [{ id: 'users' as const, label: 'Users', icon: Users }] : []),
   ];
-
-  const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
-
-  useEffect(() => {
-    if (rightPaneTab !== 'changes') return;
-    if (!activeChat) return;
-
-    for (const msg of activeChat.messages) {
-      if (msg.role !== 'assistant') continue;
-      if (msg.patches && msg.patches.length > 0) continue;
-      const text = typeof msg.content === 'string' ? msg.content : '';
-      if (!containsPatches(text)) continue;
-      const raw = parsePatches(text);
-      if (raw.length === 0) continue;
-      setMessagePatches(
-        activeChat.id,
-        msg.id,
-        raw.map((p) => ({ ...p, id: crypto.randomUUID(), status: 'pending', applied: false })),
-      );
-    }
-  }, [activeChat, rightPaneTab, setMessagePatches]);
 
   return (
     <div className={`flex flex-col h-full ${hasBackground ? 'bg-card/74 backdrop-blur-md' : 'bg-card'}`}>
@@ -656,14 +630,6 @@ export function WorkspacePane() {
           </div>
         )}
 
-        {rightPaneTab === 'changes' && (
-          <ChangesTab
-            chatId={activeChat?.id ?? null}
-            workspaceRoots={workspaceRoots}
-            onRefresh={handleRefresh}
-          />
-        )}
-
         {rightPaneTab === 'context' && (
           <div className="p-3 space-y-2">
             {serverAvailable && user && (
@@ -777,281 +743,6 @@ export function WorkspacePane() {
               {SYSTEM_PROMPT}
             </pre>
           </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ChangesTab({
-  chatId,
-  workspaceRoots,
-  onRefresh,
-}: {
-  chatId: string | null;
-  workspaceRoots: WorkspaceRoot[];
-  onRefresh: () => Promise<void>;
-}) {
-  const { chats, setPatchStatus, setRightPaneTab, setActiveFile } = useAppStore();
-  const chat = chatId ? chats.find((c) => c.id === chatId) ?? null : null;
-  const [filter, setFilter] = useState<'pending' | 'approved' | 'all'>('pending');
-  const [applying, setApplying] = useState(false);
-
-  const rows = useMemo(() => {
-    if (!chat) return [] as Array<{ messageId: string; patch: ParsedPatch; timestamp: number }>;
-
-    const out: Array<{ messageId: string; patch: ParsedPatch; timestamp: number }> = [];
-    for (const msg of chat.messages) {
-      if (msg.role !== 'assistant') continue;
-      for (const patch of msg.patches ?? []) {
-        out.push({ messageId: msg.id, patch, timestamp: msg.timestamp });
-      }
-    }
-    out.sort((a, b) => b.timestamp - a.timestamp);
-    return out;
-  }, [chat]);
-
-  const counts = useMemo(() => {
-    let pending = 0;
-    let approved = 0;
-    let applied = 0;
-    let failed = 0;
-    let rejected = 0;
-    for (const r of rows) {
-      const st = r.patch.status ?? (r.patch.applied ? 'applied' : 'pending');
-      if (st === 'pending') pending++;
-      if (st === 'approved') approved++;
-      if (st === 'applied') applied++;
-      if (st === 'failed') failed++;
-      if (st === 'rejected') rejected++;
-    }
-    return { pending, approved, applied, failed, rejected };
-  }, [rows]);
-
-  const filtered = useMemo(() => {
-    if (filter === 'all') return rows;
-    if (filter === 'approved') return rows.filter((r) => r.patch.status === 'approved');
-    // pending
-    return rows.filter((r) => {
-      const st = r.patch.status ?? (r.patch.applied ? 'applied' : 'pending');
-      return st === 'pending' || st === 'failed';
-    });
-  }, [filter, rows]);
-
-  const openFile = useCallback(
-    async (path: string) => {
-      if (workspaceRoots.length === 0) return;
-      try {
-        const content = await readWorkspaceFile(workspaceRoots, path);
-        setRightPaneTab('editor');
-        setActiveFile(path, content);
-      } catch {
-        toast.error(`Could not open ${path}`);
-      }
-    },
-    [setActiveFile, setRightPaneTab, workspaceRoots],
-  );
-
-  const approveAll = useCallback(() => {
-    if (!chatId) return;
-    for (const { messageId, patch } of rows) {
-      if (!patch?.id) continue;
-      const st = patch.status ?? (patch.applied ? 'applied' : 'pending');
-      if (st !== 'pending') continue;
-      setPatchStatus(chatId, messageId, patch.id, 'approved');
-    }
-    toast.success('Approved pending changes');
-  }, [chatId, rows, setPatchStatus]);
-
-  const rejectAll = useCallback(() => {
-    if (!chatId) return;
-    for (const { messageId, patch } of rows) {
-      if (!patch?.id) continue;
-      const st = patch.status ?? (patch.applied ? 'applied' : 'pending');
-      if (st !== 'pending' && st !== 'approved') continue;
-      setPatchStatus(chatId, messageId, patch.id, 'rejected');
-    }
-    toast.message('Rejected changes');
-  }, [chatId, rows, setPatchStatus]);
-
-  const applyApproved = useCallback(async () => {
-    if (!chatId) return;
-    if (workspaceRoots.length === 0) {
-      toast.error('Open a workspace folder first');
-      return;
-    }
-
-    const approved = rows.filter((r) => r.patch.status === 'approved' && r.patch.id);
-    if (approved.length === 0) return;
-
-    setApplying(true);
-    try {
-      let appliedCount = 0;
-      let failedCount = 0;
-      for (const { messageId, patch } of approved) {
-        try {
-          await applyPatchToWorkspace(workspaceRoots, patch);
-          setPatchStatus(chatId, messageId, patch.id, 'applied');
-          appliedCount++;
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
-          setPatchStatus(chatId, messageId, patch.id, 'failed', msg);
-          failedCount++;
-        }
-      }
-      if (appliedCount > 0) {
-        await onRefresh();
-        toast.success(`Applied ${appliedCount} change(s)`);
-      }
-      if (failedCount > 0) {
-        toast.error(`${failedCount} change(s) failed to apply`);
-      }
-    } finally {
-      setApplying(false);
-    }
-  }, [chatId, onRefresh, rows, setPatchStatus, workspaceRoots]);
-
-  if (!chat) {
-    return (
-      <div className="p-3 text-xs text-muted-foreground">
-        No active chat.
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex h-full flex-col">
-      <div className="border-b border-border bg-muted/20 px-3 py-2">
-        <div className="flex items-center justify-between gap-2">
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Proposed changes
-          </div>
-          <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-            <span>Pending {counts.pending}</span>
-            <span>Approved {counts.approved}</span>
-          </div>
-        </div>
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <div className="flex items-center overflow-hidden rounded border border-border/70">
-            <button
-              type="button"
-              onClick={() => setFilter('pending')}
-              className={`px-2 py-1 text-[10px] ${filter === 'pending' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground'}`}
-            >
-              Pending
-            </button>
-            <button
-              type="button"
-              onClick={() => setFilter('approved')}
-              className={`px-2 py-1 text-[10px] ${filter === 'approved' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground'}`}
-            >
-              Approved
-            </button>
-            <button
-              type="button"
-              onClick={() => setFilter('all')}
-              className={`px-2 py-1 text-[10px] ${filter === 'all' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground'}`}
-            >
-              All
-            </button>
-          </div>
-          <button
-            type="button"
-            onClick={approveAll}
-            className="rounded border border-border/70 bg-background px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground"
-          >
-            Approve all
-          </button>
-          <button
-            type="button"
-            onClick={rejectAll}
-            className="rounded border border-border/70 bg-background px-2 py-1 text-[10px] text-muted-foreground hover:text-destructive"
-          >
-            Reject all
-          </button>
-          <button
-            type="button"
-            onClick={() => void applyApproved()}
-            disabled={applying || counts.approved === 0}
-            className="rounded bg-accent/20 px-2 py-1 text-[10px] font-semibold text-accent hover:bg-accent/30 disabled:opacity-50"
-          >
-            {applying ? 'Applying…' : `Apply approved (${counts.approved})`}
-          </button>
-        </div>
-      </div>
-
-      <div className="flex-1 overflow-y-auto p-3 space-y-2">
-        {filtered.length === 0 ? (
-          <div className="text-xs text-muted-foreground">No changes.</div>
-        ) : (
-          filtered.map(({ messageId, patch }) => {
-            const st = patch.status ?? (patch.applied ? 'applied' : 'pending');
-            return (
-              <div key={patch.id ?? `${messageId}:${patch.filePath}`} className="rounded border border-border/70 bg-background/50 p-2">
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => void openFile(patch.filePath)}
-                    className="min-w-0 flex-1 truncate text-left text-xs text-foreground hover:underline"
-                    title={patch.filePath}
-                  >
-                    {patch.filePath}
-                  </button>
-                  <span className="text-[10px] text-muted-foreground">{patch.operation ?? 'update'}</span>
-                  <span className={`text-[10px] ${st === 'approved' ? 'text-primary' : st === 'applied' ? 'text-accent' : st === 'failed' ? 'text-destructive' : st === 'rejected' ? 'text-muted-foreground' : 'text-muted-foreground'}`}>
-                    {st}
-                  </span>
-                </div>
-                {st === 'failed' && patch.error && (
-                  <div className="mt-1 text-[11px] text-destructive">{patch.error}</div>
-                )}
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {patch.id && st === 'pending' && (
-                    <button
-                      type="button"
-                      onClick={() => setPatchStatus(chatId!, messageId, patch.id, 'approved')}
-                      className="rounded bg-primary/15 px-2 py-1 text-[10px] font-semibold text-primary hover:bg-primary/25"
-                    >
-                      Approve
-                    </button>
-                  )}
-                  {patch.id && st === 'approved' && (
-                    <button
-                      type="button"
-                      disabled={applying}
-                      onClick={() => void (async () => {
-                        setApplying(true);
-                        try {
-                          await applyPatchToWorkspace(workspaceRoots, patch);
-                          setPatchStatus(chatId!, messageId, patch.id, 'applied');
-                          await onRefresh();
-                          toast.success(`Applied ${patch.filePath}`);
-                        } catch (e: unknown) {
-                          const msg = e instanceof Error ? e.message : String(e);
-                          setPatchStatus(chatId!, messageId, patch.id, 'failed', msg);
-                          toast.error(`Failed: ${msg}`);
-                        } finally {
-                          setApplying(false);
-                        }
-                      })()}
-                      className="rounded bg-accent/20 px-2 py-1 text-[10px] font-semibold text-accent hover:bg-accent/30 disabled:opacity-50"
-                    >
-                      Apply
-                    </button>
-                  )}
-                  {patch.id && (st === 'pending' || st === 'approved') && (
-                    <button
-                      type="button"
-                      onClick={() => setPatchStatus(chatId!, messageId, patch.id, 'rejected')}
-                      className="rounded bg-destructive/10 px-2 py-1 text-[10px] font-semibold text-destructive hover:bg-destructive/15"
-                    >
-                      Reject
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })
         )}
       </div>
     </div>
