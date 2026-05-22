@@ -750,7 +750,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   isStreaming: false,
   setIsStreaming: (v) => set({ isStreaming: v }),
 
-  contextBudgetChars: 120_000,
+  contextBudgetChars: 200_000,
   workspaceContextUsedChars: 0,
   historyContextUsedChars: 0,
   contextUsedChars: 0,
@@ -820,8 +820,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       const d = (await r.json()) as { limits?: unknown };
       const raw = d.limits && typeof d.limits === 'object' ? (d.limits as Record<string, unknown>) : {};
-      const v = typeof raw.contextBudgetChars === 'number' ? raw.contextBudgetChars : 120_000;
-      const contextBudgetChars = Math.min(500_000, Math.max(40_000, Math.round(v)));
+      const v = typeof raw.contextBudgetChars === 'number' ? raw.contextBudgetChars : 200_000;
+      const contextBudgetChars = Math.min(200_000, Math.max(10_000, Math.round(v)));
       set((s) => ({
         serverChatLimits: { contextBudgetChars },
         contextBudgetChars,

@@ -402,7 +402,7 @@ export default function AdminPage() {
 
   const [chatLimitsLoading, setChatLimitsLoading] = useState(false);
   const [chatLimitsSaving, setChatLimitsSaving] = useState(false);
-  const [contextBudgetCharsDraft, setContextBudgetCharsDraft] = useState('120000');
+  const [contextBudgetCharsDraft, setContextBudgetCharsDraft] = useState('200000');
 
   useEffect(() => {
     const t = window.setTimeout(() => setUserQuery(userSearchInput.trim()), 350);
@@ -610,7 +610,7 @@ export default function AdminPage() {
       if (!r.ok) return;
       const d = (await r.json()) as { limits?: unknown };
       const raw = d.limits && typeof d.limits === 'object' ? (d.limits as Record<string, unknown>) : {};
-      const n = typeof raw.contextBudgetChars === 'number' ? raw.contextBudgetChars : 120_000;
+      const n = typeof raw.contextBudgetChars === 'number' ? raw.contextBudgetChars : 200_000;
       setContextBudgetCharsDraft(String(Math.round(n)));
     } catch {
       toast.error('Could not load chat limits');
@@ -771,8 +771,8 @@ export default function AdminPage() {
     setChatLimitsSaving(true);
     try {
       const parsed = Math.round(Number(contextBudgetCharsDraft));
-      if (!Number.isFinite(parsed) || parsed < 40_000 || parsed > 500_000) {
-        toast.error('Context budget must be between 40,000 and 500,000 characters');
+      if (!Number.isFinite(parsed) || parsed < 10_000 || parsed > 200_000) {
+        toast.error('Context budget must be between 10,000 and 200,000 characters');
         return;
       }
       const r = await fetch('/api/admin/chat-limits', {
@@ -1933,7 +1933,7 @@ export default function AdminPage() {
                     size="sm"
                     className="h-8 text-xs"
                     disabled={chatLimitsSaving}
-                    onClick={() => setContextBudgetCharsDraft('120000')}
+                    onClick={() => setContextBudgetCharsDraft('200000')}
                   >
                     Reset defaults
                   </Button>
@@ -1957,10 +1957,10 @@ export default function AdminPage() {
                     onChange={(e) => setContextBudgetCharsDraft(e.target.value)}
                     className="h-9 text-xs font-mono"
                     inputMode="numeric"
-                    placeholder="120000"
+                    placeholder="200000"
                   />
                   <p className="text-[11px] text-muted-foreground">
-                    Allowed range: <span className="font-mono">40000</span> to <span className="font-mono">500000</span>.
+                    Allowed range: <span className="font-mono">10000</span> to <span className="font-mono">200000</span>.
                   </p>
                 </div>
               </div>

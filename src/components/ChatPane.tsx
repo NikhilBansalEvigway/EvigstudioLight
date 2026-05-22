@@ -466,7 +466,7 @@ export function ChatPane() {
       .reduce((sum, message) => sum + getMessageText(message).length + 48, 0);
     const pendingChars = Math.max(0, pendingText.length) + Math.max(0, pendingImageCount) * 8_000 + 512;
     const workspaceChars = Math.max(0, workspaceContextUsedChars || 0);
-    const budgetChars = Math.max(40_000, contextBudgetChars || 120_000);
+    const budgetChars = Math.max(10_000, contextBudgetChars || 200_000);
     const usedChars = historyChars + workspaceChars + pendingChars;
     const ratio = budgetChars > 0 ? usedChars / budgetChars : 0;
     return {
@@ -491,7 +491,7 @@ export function ChatPane() {
             .join(' ');
       return sum + content.length + 48;
     }, 0);
-    const budgetChars = Math.max(40_000, contextBudgetChars || 120_000);
+    const budgetChars = Math.max(10_000, contextBudgetChars || 200_000);
     const ratio = budgetChars > 0 ? usedChars / budgetChars : 0;
     return {
       usedChars,
@@ -515,7 +515,7 @@ export function ChatPane() {
   }, []);
 
   const getSummarizeTranscriptBudget = useCallback(() => {
-    const budget = Math.max(40_000, contextBudgetChars || 120_000);
+    const budget = Math.max(10_000, contextBudgetChars || 200_000);
     // Leave room for system prompt + instructions + completion.
     return Math.max(8_000, Math.min(90_000, Math.floor(budget * 0.55)));
   }, [contextBudgetChars]);
@@ -659,7 +659,7 @@ export function ChatPane() {
 
   const buildContextMessages = useCallback(async (messageMentionedFiles: string[] = []): Promise<{ role: 'user'; content: string }[]> => {
     if (workspaceRoots.length === 0) {
-      useAppStore.getState().setContextUsage(0, Math.max(40_000, contextBudgetChars || 120_000));
+      useAppStore.getState().setContextUsage(0, Math.max(10_000, contextBudgetChars || 200_000));
       return [];
     }
 
@@ -671,7 +671,7 @@ export function ChatPane() {
     const MAX_FILE_CHARS_AUTO = 2_000;
     const MAX_FILE_CHARS_EXPLICIT = 60_000;
     const MAX_FOLDER_FILE_CONTENTS = 8;
-    const MAX_TOTAL_CONTEXT_CHARS = Math.max(40_000, contextBudgetChars || 120_000);
+    const MAX_TOTAL_CONTEXT_CHARS = Math.max(10_000, contextBudgetChars || 200_000);
 
     const truncate = (content: string, maxChars: number) => ({
       text: content.length > maxChars ? `${content.slice(0, maxChars)}\n\n... [truncated]` : content,
@@ -1776,9 +1776,11 @@ export function ChatPane() {
       }
     }
 
-    setShowSummarizeDialog(false);
     const ok = await summarizeActiveChat({ pinContext: summarizePinContext });
     if (!ok) return;
+
+    // Keep the dialog open while summarizing so users see progress.
+    setShowSummarizeDialog(false);
 
     // If this summarize was part of a context-pressure continuation flow, restore and re-send.
     if (pendingContextActionInputRef.current) {
@@ -2263,6 +2265,12 @@ export function ChatPane() {
                   : 'Generating…'}
               </span>
               <span className="animate-blink">▋</span>
+            </div>
+          )}
+          {!isStreaming && isCondensingChat && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="w-3 h-3 animate-spin" />
+              <span>Summarizing conversation…</span>
             </div>
           )}
           <div ref={messagesEndRef} />

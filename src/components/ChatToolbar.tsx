@@ -125,8 +125,12 @@ export function ChatToolbar({
             onClick={onSummarize}
             disabled={summarizing || !!exporting}
           >
-            <FileText className="w-3 h-3" />
-            Summarize
+            {summarizing ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : (
+              <FileText className="w-3 h-3" />
+            )}
+            {summarizing ? 'Summarizing…' : 'Summarize'}
           </Button>
         )}
 

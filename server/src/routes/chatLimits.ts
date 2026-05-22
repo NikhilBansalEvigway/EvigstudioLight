@@ -14,7 +14,7 @@ export type ChatLimits = {
 };
 
 const DEFAULT_CHAT_LIMITS: ChatLimits = {
-  contextBudgetChars: 120_000,
+  contextBudgetChars: 200_000,
 };
 
 function normalizeLimits(value: unknown): ChatLimits {
@@ -23,7 +23,7 @@ function normalizeLimits(value: unknown): ChatLimits {
   const bounded = Number.isFinite(n) ? Math.round(n) : DEFAULT_CHAT_LIMITS.contextBudgetChars;
   // Keep it sane and bounded.
   return {
-    contextBudgetChars: Math.min(500_000, Math.max(40_000, bounded)),
+    contextBudgetChars: Math.min(200_000, Math.max(10_000, bounded)),
   };
 }
 

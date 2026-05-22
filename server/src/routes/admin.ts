@@ -26,7 +26,7 @@ const contextRulesSchema = z.object({
 });
 
 const chatLimitsSchema = z.object({
-  contextBudgetChars: z.number().int().min(40_000).max(500_000),
+  contextBudgetChars: z.number().int().min(10_000).max(200_000),
 });
 
 function escapeLike(s: string): string {
