@@ -105,7 +105,12 @@ function queueEnabled(): boolean {
   const raw = process.env.LLM_ENABLE_QUEUE?.trim().toLowerCase();
   if (raw === 'true' || raw === '1') return true;
   if (raw === 'false' || raw === '0') return false;
-  return llmProvider() === 'orchestrator';
+  // Default behavior:
+  // - When proxying to the orchestrator, do not apply an additional API-side gate.
+  //   The orchestrator's per-model concurrency_limit + worker parallelism control
+  //   how many requests can reach LM Studio.
+  // - When proxying directly to LM Studio, keep the gate enabled to protect the API.
+  return llmProvider() === 'lmstudio';
 }
 
 function maxConcurrent(): number {

@@ -235,190 +235,46 @@ async def create_chat_completion(
     )
     request_payload["metadata"] = {k: v for k, v in md.items() if v is not None and v != ""}
 
-    if request.stream and not use_queue:
-        session_factory = get_session_factory()
-        async with session_factory() as session:
-            async with session.begin():
-                await request_store.create_request(
-                    session,
-                    request_id=context["request_id"],
-                    trace_id=context["trace_id"],
-                    source_app=context["source_app"],
-                    user_id=context["user_id"],
-                    org_id=context["org_id"],
-                    requested_model=request.model,
-                    resolved_model=model_config.resolved_model,
-                    backend_url=model_config.backend_url,
-                    request_payload_json=request_payload,
-                    input_text=_extract_input_text(request.messages),
-                    status="processing",
-                    event_type="processing_started",
-                    event_details_json={"mode": "direct_stream"},
-                )
-
-        async def direct_stream():
-            started = perf_counter()
-            content_parts: list[str] = []
-            finish_reason: str | None = None
-            usage = _stream_usage_template()
-            try:
-                async for sse in lm_client.chat_completion_stream(
-                    _ensure_stream_usage_payload(payload),
-                    timeout_seconds=model_config.timeout_seconds,
-                    lm_studio_base_url=model_config.backend_url,
-                ):
-                    stripped = sse.strip()
-                    if stripped.startswith("data: "):
-                        data = stripped.removeprefix("data: ").strip()
-                        if data != "[DONE]":
-                            try:
-                                chunk = json.loads(data)
-                            except json.JSONDecodeError:
-                                chunk = None
-                            if isinstance(chunk, dict):
-                                _merge_usage(usage, chunk)
-                                choices = chunk.get("choices") or []
-                                if choices:
-                                    choice = choices[0] or {}
-                                    delta = choice.get("delta") or {}
-                                    delta_content = delta.get("content")
-                                    if isinstance(delta_content, str) and delta_content:
-                                        content_parts.append(delta_content)
-                                    if choice.get("finish_reason"):
-                                        finish_reason = choice["finish_reason"]
-                    yield sse
-
-                response_payload = {
-                    "id": f"chatcmpl-{context['request_id']}",
-                    "object": "chat.completion",
-                    "created": 0,
-                    "model": model_config.resolved_model,
-                    "usage": usage,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": "".join(content_parts),
-                            },
-                            "finish_reason": finish_reason or "stop",
-                        }
-                    ],
-                }
-                async with session_factory() as session:
-                    db_request = await request_store.get_request(session, context["request_id"])
-                    await request_store.mark_success(
-                        session,
-                        request=db_request,
-                        response_payload_json=response_payload,
-                        output_text="".join(content_parts),
-                        finish_reason=finish_reason or "stop",
-                        processing_time_ms=elapsed_ms(started),
-                    )
-            except asyncio.CancelledError:
-                async with session_factory() as session:
-                    await request_store.add_event(
-                        session,
-                        request_id=context["request_id"],
-                        event_type="client_cancelled",
-                        details_json={"mode": "direct_stream"},
-                    )
-                    await session.commit()
-                raise
-            except httpx.TimeoutException as exc:
-                async with session_factory() as session:
-                    db_request = await request_store.get_request(session, context["request_id"])
-                    await request_store.mark_failure(
-                        session,
-                        request=db_request,
-                        error_code="upstream_timeout",
-                        error_message=str(exc).strip() or "LM Studio request timed out",
-                        processing_time_ms=elapsed_ms(started),
-                    )
-                raise
-            except httpx.HTTPStatusError as exc:
-                async with session_factory() as session:
-                    db_request = await request_store.get_request(session, context["request_id"])
-                    await request_store.mark_failure(
-                        session,
-                        request=db_request,
-                        error_code=f"http_{exc.response.status_code}",
-                        error_message=exc.response.text,
-                        processing_time_ms=elapsed_ms(started),
-                    )
-                raise
-            except httpx.RequestError as exc:
-                async with session_factory() as session:
-                    db_request = await request_store.get_request(session, context["request_id"])
-                    await request_store.mark_failure(
-                        session,
-                        request=db_request,
-                        error_code="upstream_request_error",
-                        error_message=str(exc).strip() or "LM Studio unreachable",
-                        processing_time_ms=elapsed_ms(started),
-                    )
-                raise
-            except Exception as exc:
-                logger.exception("chat_completion_stream_unhandled_error")
-                async with session_factory() as session:
-                    db_request = await request_store.get_request(session, context["request_id"])
-                    await request_store.mark_failure(
-                        session,
-                        request=db_request,
-                        error_code="internal_proxy_error",
-                        error_message=str(exc).strip() or "Internal proxy error",
-                        processing_time_ms=elapsed_ms(started),
-                    )
-                raise
-
-        try:
-            return StreamingResponse(
-                direct_stream(),
-                media_type="text/event-stream",
-                headers=_response_headers(context["request_id"], context["trace_id"]),
-            )
-        except httpx.TimeoutException as exc:
-            raise HTTPException(status_code=504, detail="LM Studio request timed out") from exc
-        except httpx.HTTPStatusError as exc:
-            detail = exc.response.text if exc.response is not None else str(exc)
-            raise HTTPException(status_code=502, detail=detail) from exc
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail="LM Studio unreachable") from exc
-        except Exception as exc:
-            logger.exception("chat_completion_stream_unhandled_error")
-            raise HTTPException(status_code=500, detail="Internal proxy error") from exc
+    # Pipeline alignment: always use the orchestrator queue.
+    # Per-model concurrency_limit + worker parallelism are the single source of truth
+    # for how many requests can reach LM Studio concurrently.
+    use_queue = True
 
     if use_queue:
         session_factory = get_session_factory()
         job_queue = JobQueueService()
         job_id = str(uuid.uuid4())
 
-        async with session_factory() as session:
-            async with session.begin():
-                await request_store.create_request(
-                    session,
-                    request_id=context["request_id"],
-                    trace_id=context["trace_id"],
-                    source_app=context["source_app"],
-                    user_id=context["user_id"],
-                    org_id=context["org_id"],
-                    requested_model=request.model,
-                    resolved_model=model_config.resolved_model,
-                    backend_url=model_config.backend_url,
-                    request_payload_json=request_payload,
-                    input_text=_extract_input_text(request.messages),
-                    status="queued",
-                    event_type="queued",
-                    event_details_json={"job_id": job_id, "mode": "queued"},
-                )
+        # DB writes are best-effort; do not fail the request if SQL is unhealthy.
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    await request_store.create_request(
+                        session,
+                        request_id=context["request_id"],
+                        trace_id=context["trace_id"],
+                        source_app=context["source_app"],
+                        user_id=context["user_id"],
+                        org_id=context["org_id"],
+                        requested_model=request.model,
+                        resolved_model=model_config.resolved_model,
+                        backend_url=model_config.backend_url,
+                        request_payload_json=request_payload,
+                        input_text=_extract_input_text(request.messages),
+                        status="queued",
+                        event_type="queued",
+                        event_details_json={"job_id": job_id, "mode": "queued"},
+                    )
 
-                queue_job = QueueJob(
-                    job_id=job_id,
-                    request_id=context["request_id"],
-                    model_name=model_config.resolved_model,
-                    status="queued",
-                )
-                session.add(queue_job)
+                    queue_job = QueueJob(
+                        job_id=job_id,
+                        request_id=context["request_id"],
+                        model_name=model_config.resolved_model,
+                        status="queued",
+                    )
+                    session.add(queue_job)
+        except Exception:
+            pass
 
         try:
             await job_queue.enqueue(
@@ -438,22 +294,30 @@ async def create_chat_completion(
                 queue_limit=model_config.queue_limit or 100,
             )
         except RuntimeError as exc:
-            async with session_factory() as session:
-                db_request = await request_store.get_request(session, context["request_id"])
-                await request_store.mark_rejected(
-                    session,
-                    request=db_request,
-                    error_code="queue_full",
-                    error_message="Queue is full for the selected model",
-                    details_json={"job_id": job_id, "model_name": model_config.resolved_model},
-                )
-                result = await session.execute(
-                    select(QueueJob).where(QueueJob.job_id == job_id)
-                )
-                queue_job = result.scalar_one_or_none()
-                if queue_job is not None:
-                    await session.delete(queue_job)
-                    await session.commit()
+            try:
+                async with session_factory() as session:
+                    db_request = await request_store.get_request(
+                        session, context["request_id"]
+                    )
+                    await request_store.mark_rejected(
+                        session,
+                        request=db_request,
+                        error_code="queue_full",
+                        error_message="Queue is full for the selected model",
+                        details_json={
+                            "job_id": job_id,
+                            "model_name": model_config.resolved_model,
+                        },
+                    )
+                    result = await session.execute(
+                        select(QueueJob).where(QueueJob.job_id == job_id)
+                    )
+                    queue_job = result.scalar_one_or_none()
+                    if queue_job is not None:
+                        await session.delete(queue_job)
+                        await session.commit()
+            except Exception:
+                pass
             raise HTTPException(status_code=429, detail="Queue is full") from exc
 
         if request.stream:
@@ -484,14 +348,20 @@ async def create_chat_completion(
                         elif event_type == "done":
                             break
                 except asyncio.CancelledError:
-                    async with session_factory() as session:
-                        await request_store.add_event(
-                            session,
-                            request_id=context["request_id"],
-                            event_type="client_cancelled",
-                            details_json={"mode": "queued_stream", "job_id": job_id},
-                        )
-                        await session.commit()
+                    try:
+                        async with session_factory() as session:
+                            await request_store.add_event(
+                                session,
+                                request_id=context["request_id"],
+                                event_type="client_cancelled",
+                                details_json={
+                                    "mode": "queued_stream",
+                                    "job_id": job_id,
+                                },
+                            )
+                            await session.commit()
+                    except Exception:
+                        pass
                     raise
 
             return StreamingResponse(
@@ -512,92 +382,6 @@ async def create_chat_completion(
             )
 
         response_payload = result["response_payload"]
-    else:
-        session_factory = get_session_factory()
-        async with session_factory() as session:
-            async with session.begin():
-                await request_store.create_request(
-                    session,
-                    request_id=context["request_id"],
-                    trace_id=context["trace_id"],
-                    source_app=context["source_app"],
-                    user_id=context["user_id"],
-                    org_id=context["org_id"],
-                    requested_model=request.model,
-                    resolved_model=model_config.resolved_model,
-                    backend_url=model_config.backend_url,
-                    request_payload_json=request_payload,
-                    input_text=_extract_input_text(request.messages),
-                    status="processing",
-                    event_type="processing_started",
-                    event_details_json={"mode": "direct"},
-                )
-        started = perf_counter()
-        try:
-            response_payload = await lm_client.chat_completion(
-                payload,
-                timeout_seconds=model_config.timeout_seconds,
-                lm_studio_base_url=model_config.backend_url,
-            )
-        except httpx.TimeoutException as exc:
-            async with session_factory() as session:
-                db_request = await request_store.get_request(session, context["request_id"])
-                await request_store.mark_failure(
-                    session,
-                    request=db_request,
-                    error_code="upstream_timeout",
-                    error_message="LM Studio request timed out",
-                    processing_time_ms=elapsed_ms(started),
-                )
-            raise HTTPException(status_code=504, detail="LM Studio request timed out") from exc
-        except httpx.HTTPStatusError as exc:
-            async with session_factory() as session:
-                db_request = await request_store.get_request(session, context["request_id"])
-                await request_store.mark_failure(
-                    session,
-                    request=db_request,
-                    error_code=f"http_{exc.response.status_code}",
-                    error_message=exc.response.text,
-                    processing_time_ms=elapsed_ms(started),
-                )
-            detail = exc.response.text if exc.response is not None else str(exc)
-            raise HTTPException(status_code=502, detail=detail) from exc
-        except httpx.RequestError as exc:
-            async with session_factory() as session:
-                db_request = await request_store.get_request(session, context["request_id"])
-                await request_store.mark_failure(
-                    session,
-                    request=db_request,
-                    error_code="upstream_request_error",
-                    error_message="LM Studio unreachable",
-                    processing_time_ms=elapsed_ms(started),
-                )
-            raise HTTPException(status_code=502, detail="LM Studio unreachable") from exc
-        except Exception as exc:
-            logger.exception("chat_completion_unhandled_error_direct_mode")
-            async with session_factory() as session:
-                db_request = await request_store.get_request(session, context["request_id"])
-                await request_store.mark_failure(
-                    session,
-                    request=db_request,
-                    error_code="internal_proxy_error",
-                    error_message="Internal proxy error",
-                    processing_time_ms=elapsed_ms(started),
-                )
-            raise HTTPException(status_code=500, detail="Internal proxy error") from exc
-
-        output_text, finish_reason = _extract_output_text(response_payload)
-        async with session_factory() as session:
-            db_request = await request_store.get_request(session, context["request_id"])
-            await request_store.mark_success(
-                session,
-                request=db_request,
-                response_payload_json=response_payload,
-                output_text=output_text,
-                finish_reason=finish_reason,
-                processing_time_ms=elapsed_ms(started),
-            )
-
     return JSONResponse(
         content=response_payload,
         headers=_response_headers(context["request_id"], context["trace_id"]),

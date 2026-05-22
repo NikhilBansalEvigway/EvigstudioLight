@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 
 import httpx
+import asyncio
 from sqlalchemy import select
 
 from app.core.runtime_config import RuntimeConfigService
@@ -187,11 +188,36 @@ class ModelRegistryService:
                 pass
 
         session_factory = get_session_factory()
-        async with session_factory() as session:
-            result = await session.execute(
-                select(ModelConfig).order_by(ModelConfig.name.asc())
-            )
-            return list(result.scalars().all())
+        try:
+            async with session_factory() as session:
+                result = await asyncio.wait_for(
+                    session.execute(select(ModelConfig).order_by(ModelConfig.name.asc())),
+                    timeout=1.0,
+                )
+                return list(result.scalars().all())
+        except Exception:
+            # If the SQL DB is unhealthy, keep the orchestrator running.
+            # Return a minimal in-memory model card so clients still have something
+            # to target, and let the worker consume dynamically discovered Redis queues.
+            settings = get_settings()
+            try:
+                effective_base_url = await self._get_effective_base_url()
+                configured_default = await self._get_runtime_default_model()
+                effective_default = await self._get_effective_default_model(configured_default)
+            except Exception:
+                effective_base_url = settings.lm_studio_base_url
+                effective_default = settings.default_model
+            return [
+                ModelConfig(
+                    name=effective_default,
+                    alias=effective_default,
+                    backend_url=effective_base_url,
+                    timeout_seconds=settings.default_request_timeout_seconds,
+                    concurrency_limit=1,
+                    queue_limit=100,
+                    is_enabled=True,
+                )
+            ]
 
     async def resolve(self, model_name: str | None) -> ResolvedModelConfig:
         settings = get_settings()
@@ -201,23 +227,33 @@ class ModelRegistryService:
         requested_model = await self._get_effective_default_model(requested_model)
         session_factory = get_session_factory()
 
-        async with session_factory() as session:
-            # Prefer row where `name` matches — prevents MultipleResultsFound when
-            # another row matches only via `alias` (same string as name on one row
-            # and alias on another).
-            name_match = await session.execute(
-                select(ModelConfig)
-                .where(ModelConfig.name == requested_model)
-                .limit(1)
-            )
-            model = name_match.scalar_one_or_none()
-            if model is None:
-                alias_match = await session.execute(
-                    select(ModelConfig)
-                    .where(ModelConfig.alias == requested_model)
-                    .limit(1)
+        model: ModelConfig | None = None
+        try:
+            async with session_factory() as session:
+                # Prefer row where `name` matches — prevents MultipleResultsFound when
+                # another row matches only via `alias` (same string as name on one row
+                # and alias on another).
+                name_match = await asyncio.wait_for(
+                    session.execute(
+                        select(ModelConfig)
+                        .where(ModelConfig.name == requested_model)
+                        .limit(1)
+                    ),
+                    timeout=1.0,
                 )
-                model = alias_match.scalar_one_or_none()
+                model = name_match.scalar_one_or_none()
+                if model is None:
+                    alias_match = await asyncio.wait_for(
+                        session.execute(
+                            select(ModelConfig)
+                            .where(ModelConfig.alias == requested_model)
+                            .limit(1)
+                        ),
+                        timeout=1.0,
+                    )
+                    model = alias_match.scalar_one_or_none()
+        except Exception:
+            model = None
 
         if model is None:
             fallback_model = requested_model

@@ -28,20 +28,23 @@ class Settings(BaseSettings):
     database_max_overflow: int = Field(default=20, alias="DATABASE_MAX_OVERFLOW")
     # SQLite only: busy timeout to reduce "database is locked" at higher write concurrency.
     database_sqlite_busy_timeout_seconds: int = Field(
-        default=30,
+        # Keep this low by default; the orchestrator must remain responsive even
+        # when SQL persistence is unhealthy. Metrics/history are best-effort.
+        default=2,
         alias="DATABASE_SQLITE_BUSY_TIMEOUT_SECONDS",
     )
     # SQLite only: retry commits/flushes on transient SQLITE_BUSY/LOCKED.
     database_sqlite_lock_retry_attempts: int = Field(
-        default=8,
+        # Keep retries small; persistence is best-effort.
+        default=2,
         alias="DATABASE_SQLITE_LOCK_RETRY_ATTEMPTS",
     )
     database_sqlite_lock_retry_base_delay_ms: int = Field(
-        default=40,
+        default=20,
         alias="DATABASE_SQLITE_LOCK_RETRY_BASE_DELAY_MS",
     )
     database_sqlite_lock_retry_max_delay_ms: int = Field(
-        default=2000,
+        default=200,
         alias="DATABASE_SQLITE_LOCK_RETRY_MAX_DELAY_MS",
     )
 

@@ -345,6 +345,10 @@ async def seed_defaults() -> None:
         "alert_webhook_url": settings.alert_webhook_url,
         "alert_webhook_timeout_seconds": settings.alert_webhook_timeout_seconds,
         "alert_notification_cooldown_seconds": settings.alert_notification_cooldown_seconds,
+        # Concurrency/throughput controls
+        "worker_max_parallel_jobs": settings.worker_max_parallel_jobs,
+        "worker_sqlite_max_parallel_jobs": settings.worker_sqlite_max_parallel_jobs,
+        "scheduler_acquire_timeout_seconds": settings.scheduler_acquire_timeout_seconds,
     }
 
     async with session_factory() as session:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from typing import Any
@@ -32,8 +33,11 @@ class RuntimeConfigService:
         overrides: dict[str, Any] = {}
         try:
             async with session_factory() as session:
-                result = await session.execute(
-                    select(ConfigEntry).where(ConfigEntry.is_active.is_(True))
+                result = await asyncio.wait_for(
+                    session.execute(
+                        select(ConfigEntry).where(ConfigEntry.is_active.is_(True))
+                    ),
+                    timeout=1.0,
                 )
                 for entry in result.scalars().all():
                     overrides[entry.key] = entry.value_json
@@ -72,6 +76,10 @@ class RuntimeConfigService:
             "alert_webhook_url",
             "alert_webhook_timeout_seconds",
             "alert_notification_cooldown_seconds",
+            # Concurrency/throughput controls
+            "worker_max_parallel_jobs",
+            "worker_sqlite_max_parallel_jobs",
+            "scheduler_acquire_timeout_seconds",
         }
         for key, value in overrides.items():
             if key in editable_keys:

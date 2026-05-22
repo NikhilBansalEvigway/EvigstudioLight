@@ -34,6 +34,10 @@ EDITABLE_CONFIG_KEYS = {
     "alert_webhook_url",
     "alert_webhook_timeout_seconds",
     "alert_notification_cooldown_seconds",
+    # Concurrency/throughput controls
+    "worker_max_parallel_jobs",
+    "worker_sqlite_max_parallel_jobs",
+    "scheduler_acquire_timeout_seconds",
 }
 
 SLOW_REQUEST_THRESHOLD_MS = 5000

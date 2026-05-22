@@ -11,6 +11,7 @@ import httpx
 from sqlalchemy import select
 
 from app.core.logging import get_logger
+from app.core.runtime_config import RuntimeConfigService
 from app.core.settings import get_settings
 from app.core.time import now
 from app.db.session import get_session_factory
@@ -137,6 +138,7 @@ def _ensure_stream_usage_payload(payload: dict[str, Any]) -> dict[str, Any]:
 class WorkerService:
     def __init__(self) -> None:
         self.settings = get_settings()
+        self.runtime_config = RuntimeConfigService()
         self.job_queue = JobQueueService()
         self.scheduler = RedisScheduler()
         self.model_registry = ModelRegistryService()
@@ -144,17 +146,49 @@ class WorkerService:
         self.quota_service = QuotaService()
         self.lm_client = LMStudioClient()
         self._max_parallel_jobs = max(1, self.settings.worker_max_parallel_jobs)
-        if self.settings.database_url.startswith("sqlite"):
-            self._max_parallel_jobs = min(
-                self._max_parallel_jobs,
-                max(1, int(self.settings.worker_sqlite_max_parallel_jobs)),
-            )
         self.worker_monitor = WorkerMonitorService()
         self.worker_id = self.worker_monitor.new_worker_id()
+
+    async def _refresh_runtime_limits(self) -> None:
+        if self.runtime_config.is_stale():
+            try:
+                await self.runtime_config.refresh()
+            except Exception:
+                # Best-effort; keep worker running even if DB/runtime config is unavailable.
+                pass
+
+        def as_int(key: str, fallback: int) -> int:
+            raw = self.runtime_config.get(key, fallback)
+            try:
+                value = int(raw)  # type: ignore[arg-type]
+            except Exception:
+                return fallback
+            return value
+
+        max_jobs = max(1, as_int("worker_max_parallel_jobs", int(self.settings.worker_max_parallel_jobs)))
+        if self.settings.database_url.startswith("sqlite"):
+            sqlite_cap = max(
+                1,
+                as_int(
+                    "worker_sqlite_max_parallel_jobs",
+                    int(self.settings.worker_sqlite_max_parallel_jobs),
+                ),
+            )
+            max_jobs = min(max_jobs, sqlite_cap)
+        self._max_parallel_jobs = max_jobs
+
+    def _runtime_int(self, key: str, fallback: int) -> int:
+        raw = self.runtime_config.get(key, fallback)
+        try:
+            value = int(raw)  # type: ignore[arg-type]
+        except Exception:
+            return fallback
+        return value
 
     async def run_forever(self) -> None:
         running_tasks: set[asyncio.Task] = set()
         while True:
+            await self._refresh_runtime_limits()
             try:
                 await self.worker_monitor.publish_heartbeat(
                     worker_id=self.worker_id,
@@ -235,7 +269,10 @@ class WorkerService:
 
         job = await self.job_queue.dequeue_any(
             queue_names,
-            timeout_seconds=self.settings.worker_blocking_pop_timeout_seconds,
+            timeout_seconds=self._runtime_int(
+                "worker_blocking_pop_timeout_seconds",
+                self.settings.worker_blocking_pop_timeout_seconds,
+            ),
         )
         return job
 
@@ -251,160 +288,206 @@ class WorkerService:
         session_factory = get_session_factory()
         max_retries = int(job.get("max_retries", self.settings.default_max_retries))
 
-        async with session_factory() as session:
-            request_result = await session.execute(
-                select(LLMRequest).where(LLMRequest.request_id == request_id)
+        # DB state is best-effort. The orchestrator must keep processing even if
+        # SQL is unhealthy; Redis queue + result channels are the critical path.
+        session = None
+        request: LLMRequest | None = None
+        queue_job: QueueJob | None = None
+        try:
+            session = session_factory()
+        except Exception:
+            session = None
+
+        model_config = await self.model_registry.resolve(model_name)
+        try:
+            scheduler_lease = await self.scheduler.acquire_slot(
+                model_name=model_name,
+                concurrency_limit=model_config.concurrency_limit,
+                wait_timeout_seconds=self._runtime_int(
+                    "scheduler_acquire_timeout_seconds",
+                    self.settings.scheduler_acquire_timeout_seconds,
+                ),
             )
-            request = request_result.scalar_one()
 
-            queue_job_result = await session.execute(
-                select(QueueJob).where(QueueJob.job_id == job_id)
+            if session is not None:
+                try:
+                    async with session as db:
+                        try:
+                            request_result = await db.execute(
+                                select(LLMRequest).where(
+                                    LLMRequest.request_id == request_id
+                                )
+                            )
+                            request = request_result.scalar_one_or_none()
+                        except Exception:
+                            request = None
+
+                        try:
+                            queue_job_result = await db.execute(
+                                select(QueueJob).where(QueueJob.job_id == job_id)
+                            )
+                            queue_job = queue_job_result.scalar_one_or_none()
+                        except Exception:
+                            queue_job = None
+
+                        try:
+                            if queue_job is not None:
+                                queue_job.status = "processing"
+                                queue_job.attempts += 1
+                                queue_job.started_at = utc_now()
+                            if request is not None:
+                                request.status = "processing"
+                            await self.request_store.add_event(
+                                db,
+                                request_id=request_id,
+                                event_type="worker_started",
+                                details_json={
+                                    "job_id": job_id,
+                                    "wait_time_ms": scheduler_lease.wait_time_ms,
+                                },
+                            )
+                            await db.commit()
+                        except Exception:
+                            # Ignore DB write failures.
+                            try:
+                                await db.rollback()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            sanitized_payload = _sanitize_tools_for_lmstudio(job["request_payload_json"])
+            to_lm = _strip_lm_studio_base_url_from_payload(sanitized_payload)
+            to_lm = _strip_identity_metadata_from_payload(to_lm)
+            if job.get("stream"):
+                response_payload = await self._run_streaming_job(
+                    job_id=job_id,
+                    payload=to_lm,
+                    timeout_seconds=model_config.timeout_seconds,
+                    lm_studio_base_url=model_config.backend_url,
+                )
+            else:
+                response_payload = await self.lm_client.chat_completion(
+                    to_lm,
+                    timeout_seconds=model_config.timeout_seconds,
+                    lm_studio_base_url=model_config.backend_url,
+                )
+
+            output_text, finish_reason = self._extract_output_text(response_payload)
+            duration_ms = elapsed_ms(started)
+
+            if session is not None and request is not None:
+                try:
+                    async with session_factory() as db:
+                        try:
+                            # Reload to ensure we have an attached instance.
+                            req_result = await db.execute(
+                                select(LLMRequest).where(
+                                    LLMRequest.request_id == request_id
+                                )
+                            )
+                            db_request = req_result.scalar_one_or_none()
+                            if db_request is not None:
+                                await self.request_store.mark_success(
+                                    db,
+                                    request=db_request,
+                                    response_payload_json=response_payload,
+                                    output_text=output_text,
+                                    finish_reason=finish_reason,
+                                    processing_time_ms=duration_ms,
+                                )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Always publish the result back to the waiting API call.
+            await self.job_queue.publish_result(
+                job_id,
+                {
+                    "status": "completed",
+                    "response_payload": response_payload,
+                },
             )
-            queue_job = queue_job_result.scalar_one()
-
-            model_config = await self.model_registry.resolve(model_name)
-            try:
-                scheduler_lease = await self.scheduler.acquire_slot(
-                    model_name=model_name,
-                    concurrency_limit=model_config.concurrency_limit,
-                    wait_timeout_seconds=self.settings.scheduler_acquire_timeout_seconds,
-                )
-                queue_job.status = "processing"
-                queue_job.attempts += 1
-                queue_job.started_at = utc_now()
-                request.status = "processing"
-                await self.request_store.add_event(
-                    session,
-                    request_id=request_id,
-                    event_type="worker_started",
-                    details_json={
-                        "job_id": job_id,
-                        "wait_time_ms": scheduler_lease.wait_time_ms,
-                    },
-                )
-                await session.commit()
-
-                sanitized_payload = _sanitize_tools_for_lmstudio(
-                    job["request_payload_json"]
-                )
-                to_lm = _strip_lm_studio_base_url_from_payload(sanitized_payload)
-                to_lm = _strip_identity_metadata_from_payload(to_lm)
-                if job.get("stream"):
-                    response_payload = await self._run_streaming_job(
-                        job_id=job_id,
-                        payload=to_lm,
-                        timeout_seconds=model_config.timeout_seconds,
-                        lm_studio_base_url=model_config.backend_url,
-                    )
-                else:
-                    response_payload = await self.lm_client.chat_completion(
-                        to_lm,
-                        timeout_seconds=model_config.timeout_seconds,
-                        lm_studio_base_url=model_config.backend_url,
-                    )
-                output_text, finish_reason = self._extract_output_text(response_payload)
-                duration_ms = elapsed_ms(started)
-                queue_job.status = "completed"
-                queue_job.completed_at = utc_now()
-                await self.request_store.mark_success(
-                    session,
-                    request=request,
-                    response_payload_json=response_payload,
-                    output_text=output_text,
-                    finish_reason=finish_reason,
-                    processing_time_ms=duration_ms,
-                )
-                await session.commit()
-                await self.job_queue.publish_result(
+            if job.get("stream"):
+                await self.job_queue.publish_stream_event(
                     job_id,
-                    {
-                        "status": "completed",
-                        "response_payload": response_payload,
-                    },
+                    {"type": "done"},
+                    ttl_seconds=model_config.timeout_seconds + 300,
                 )
-                if job.get("stream"):
-                    await self.job_queue.publish_stream_event(
-                        job_id,
-                        {"type": "done"},
-                        ttl_seconds=model_config.timeout_seconds + 300,
-                    )
-            except httpx.HTTPStatusError as exc:
-                await self._fail_job(
-                    session,
-                    request=request,
-                    queue_job=queue_job,
-                    model_name=model_name,
-                    job_id=job_id,
-                    job_payload=job,
-                    max_retries=max_retries,
-                    error_code=f"http_{exc.response.status_code}",
-                    error_message=exc.response.text,
-                    duration_ms=elapsed_ms(started),
-                )
-            except httpx.TimeoutException as exc:
-                timeout_message = str(exc).strip() or (
-                    f"LM Studio request timed out after "
-                    f"{model_config.timeout_seconds}s"
-                )
-                await self._fail_job(
-                    session,
-                    request=request,
-                    queue_job=queue_job,
-                    model_name=model_name,
-                    job_id=job_id,
-                    job_payload=job,
-                    max_retries=max_retries,
-                    error_code="upstream_timeout",
-                    error_message=timeout_message,
-                    duration_ms=elapsed_ms(started),
-                )
-            except httpx.RequestError as exc:
-                request_error_message = str(exc).strip() or (
-                    f"LM Studio network error ({exc.__class__.__name__})"
-                )
-                await self._fail_job(
-                    session,
-                    request=request,
-                    queue_job=queue_job,
-                    model_name=model_name,
-                    job_id=job_id,
-                    job_payload=job,
-                    max_retries=max_retries,
-                    error_code="upstream_request_error",
-                    error_message=request_error_message,
-                    duration_ms=elapsed_ms(started),
-                )
-            except TimeoutError as exc:
-                await self._fail_job(
-                    session,
-                    request=request,
-                    queue_job=queue_job,
-                    model_name=model_name,
-                    job_id=job_id,
-                    job_payload=job,
-                    max_retries=max_retries,
-                    error_code="scheduler_slot_timeout",
-                    error_message=str(exc).strip() or "Worker could not acquire model slot in time",
-                    duration_ms=elapsed_ms(started),
-                )
-            except Exception as exc:
-                generic_error_message = str(exc).strip() or exc.__class__.__name__
-                await self._fail_job(
-                    session,
-                    request=request,
-                    queue_job=queue_job,
-                    model_name=model_name,
-                    job_id=job_id,
-                    job_payload=job,
-                    max_retries=max_retries,
-                    error_code="worker_execution_error",
-                    error_message=generic_error_message,
-                    duration_ms=elapsed_ms(started),
-                )
-            finally:
-                if scheduler_lease is not None:
-                    await self.scheduler.release(scheduler_lease)
-                await self.quota_service.release(quota_lease)
+
+        except httpx.HTTPStatusError as exc:
+            await self._fail_job(
+                session_factory=session_factory,
+                request_id=request_id,
+                model_name=model_name,
+                job_id=job_id,
+                job_payload=job,
+                max_retries=max_retries,
+                error_code=f"http_{exc.response.status_code}",
+                error_message=exc.response.text,
+                duration_ms=elapsed_ms(started),
+            )
+        except httpx.TimeoutException as exc:
+            timeout_message = str(exc).strip() or (
+                f"LM Studio request timed out after {model_config.timeout_seconds}s"
+            )
+            await self._fail_job(
+                session_factory=session_factory,
+                request_id=request_id,
+                model_name=model_name,
+                job_id=job_id,
+                job_payload=job,
+                max_retries=max_retries,
+                error_code="upstream_timeout",
+                error_message=timeout_message,
+                duration_ms=elapsed_ms(started),
+            )
+
+        except httpx.RequestError as exc:
+            request_error_message = str(exc).strip() or (
+                f"LM Studio network error ({exc.__class__.__name__})"
+            )
+            await self._fail_job(
+                session_factory=session_factory,
+                request_id=request_id,
+                model_name=model_name,
+                job_id=job_id,
+                job_payload=job,
+                max_retries=max_retries,
+                error_code="upstream_request_error",
+                error_message=request_error_message,
+                duration_ms=elapsed_ms(started),
+            )
+        except TimeoutError as exc:
+            await self._fail_job(
+                session_factory=session_factory,
+                request_id=request_id,
+                model_name=model_name,
+                job_id=job_id,
+                job_payload=job,
+                max_retries=max_retries,
+                error_code="scheduler_slot_timeout",
+                error_message=str(exc).strip() or "Worker could not acquire model slot in time",
+                duration_ms=elapsed_ms(started),
+            )
+        except Exception as exc:
+            generic_error_message = str(exc).strip() or exc.__class__.__name__
+            await self._fail_job(
+                session_factory=session_factory,
+                request_id=request_id,
+                model_name=model_name,
+                job_id=job_id,
+                job_payload=job,
+                max_retries=max_retries,
+                error_code="worker_execution_error",
+                error_message=generic_error_message,
+                duration_ms=elapsed_ms(started),
+            )
+        finally:
+            if scheduler_lease is not None:
+                await self.scheduler.release(scheduler_lease)
+            await self.quota_service.release(quota_lease)
 
     async def _run_streaming_job(
         self,
@@ -476,10 +559,9 @@ class WorkerService:
 
     async def _fail_job(
         self,
-        session,
         *,
-        request: LLMRequest,
-        queue_job: QueueJob,
+        session_factory,
+        request_id: str,
         model_name: str,
         job_id: str,
         job_payload: dict[str, Any],
@@ -488,50 +570,87 @@ class WorkerService:
         error_message: str,
         duration_ms: int,
     ) -> None:
-        queue_job.status = "failed"
-        queue_job.error_message = error_message
-        queue_job.completed_at = utc_now()
-        if queue_job.attempts <= max_retries:
-            queue_job.status = "retrying"
-            await self.request_store.add_event(
-                session,
-                request_id=request.request_id,
-                event_type="retry_scheduled",
-                details_json={
-                    "job_id": job_id,
-                    "attempt": queue_job.attempts,
-                    "max_retries": max_retries,
-                    "error_code": error_code,
-                },
-            )
-            await session.commit()
-            await self.job_queue.enqueue(
-                model_name=model_name,
-                job_id=job_id,
-                payload={**job_payload, "max_retries": max_retries},
-                queue_limit=100000,
-            )
-            return
+        attempts = int(job_payload.get("attempts") or 0)
+        try:
+            async with session_factory() as session:
+                req_result = await session.execute(
+                    select(LLMRequest).where(LLMRequest.request_id == request_id)
+                )
+                request = req_result.scalar_one_or_none()
+                job_result = await session.execute(
+                    select(QueueJob).where(QueueJob.job_id == job_id)
+                )
+                queue_job = job_result.scalar_one_or_none()
 
-        await self.request_store.add_event(
-            session,
-            request_id=request.request_id,
-            event_type="dead_lettered",
-            details_json={
-                "job_id": job_id,
-                "error_code": error_code,
-                "model_name": model_name,
-                "attempts": queue_job.attempts,
-            },
-        )
-        await self.request_store.mark_failure(
-            session,
-            request=request,
-            error_code=error_code,
-            error_message=error_message,
-            processing_time_ms=duration_ms,
-        )
-        await session.commit()
+                if queue_job is not None:
+                    queue_job.status = "failed"
+                    queue_job.error_message = error_message
+                    queue_job.completed_at = utc_now()
+                    attempts = int(queue_job.attempts or 0)
+
+                if queue_job is not None and queue_job.attempts <= max_retries:
+                    queue_job.status = "retrying"
+                    if request is not None:
+                        await self.request_store.add_event(
+                            session,
+                            request_id=request.request_id,
+                            event_type="retry_scheduled",
+                            details_json={
+                                "job_id": job_id,
+                                "attempt": queue_job.attempts,
+                                "max_retries": max_retries,
+                                "error_code": error_code,
+                            },
+                        )
+                    try:
+                        await session.commit()
+                    except Exception:
+                        try:
+                            await session.rollback()
+                        except Exception:
+                            pass
+                    await self.job_queue.enqueue(
+                        model_name=model_name,
+                        job_id=job_id,
+                        payload={**job_payload, "max_retries": max_retries},
+                        queue_limit=100000,
+                    )
+                    return
+
+                if request is not None:
+                    try:
+                        await self.request_store.add_event(
+                            session,
+                            request_id=request.request_id,
+                            event_type="dead_lettered",
+                            details_json={
+                                "job_id": job_id,
+                                "error_code": error_code,
+                                "model_name": model_name,
+                                "attempts": attempts,
+                            },
+                        )
+                        await self.request_store.mark_failure(
+                            session,
+                            request=request,
+                            error_code=error_code,
+                            error_message=error_message,
+                            processing_time_ms=duration_ms,
+                        )
+                    except Exception:
+                        pass
+
+                try:
+                    await session.commit()
+                except Exception:
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
+        except Exception:
+            # Ignore SQL failures; publishing result/events is the critical path.
+            pass
+
         await self.job_queue.publish_stream_event(
             job_id,
             {
@@ -549,20 +668,23 @@ class WorkerService:
                 "error_message": error_message,
             },
         )
-        await self.job_queue.push_dead_letter(
-            model_name,
-            {
-                "job_id": job_id,
-                "request_id": request.request_id,
-                "error_code": error_code,
-                "error_message": error_message,
-                "attempts": queue_job.attempts,
-            },
-        )
+        try:
+            await self.job_queue.push_dead_letter(
+                model_name,
+                {
+                    "job_id": job_id,
+                    "request_id": request_id,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                    "attempts": attempts,
+                },
+            )
+        except Exception:
+            pass
         logger.error(
             "worker_job_failed",
             extra={
-                "request_id": request.request_id,
+                "request_id": request_id,
                 "job_id": job_id,
                 "error_code": error_code,
             },

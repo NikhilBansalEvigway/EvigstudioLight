@@ -38,7 +38,7 @@ def client():
     return TestClient(app)
 
 
-def test_create_chat_completion_direct_tracks_headers_and_response_metadata(client):
+def test_create_chat_completion_forces_queue_and_tracks_headers(client):
     mock_model = MagicMock()
     mock_model.is_enabled = True
     mock_model.resolved_model = "test-model"
@@ -47,27 +47,31 @@ def test_create_chat_completion_direct_tracks_headers_and_response_metadata(clie
 
     request_store = MagicMock()
     request_store.create_request = AsyncMock()
-    request_store.get_request = AsyncMock(return_value=MagicMock())
-    request_store.mark_success = AsyncMock()
 
     with patch("app.api.routes.chat.ModelRegistryService", MagicMock()) as mock_registry, patch(
-        "app.api.routes.chat.LMStudioClient", MagicMock()
-    ) as mock_lm_client, patch(
+        "app.api.routes.chat.JobQueueService", MagicMock()
+    ) as mock_job_queue, patch(
         "app.api.routes.chat.RequestStore", MagicMock(return_value=request_store)
     ), patch(
         "app.api.routes.chat.get_session_factory", MagicMock(return_value=DummySessionFactory())
     ):
         mock_registry.return_value.resolve = AsyncMock(return_value=mock_model)
-        mock_lm_client.return_value.chat_completion = AsyncMock(
+        mock_job_queue.return_value.enqueue = AsyncMock()
+        mock_job_queue.return_value.wait_for_result = AsyncMock(
             return_value={
-                "id": "chatcmpl-123",
-                "object": "chat.completion",
-                "created": 1677652288,
-                "model": "test-model",
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-                "choices": [
-                    {"message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}
-                ],
+                "status": "completed",
+                "response_payload": {
+                    "id": "chatcmpl-123",
+                    "object": "chat.completion",
+                    "created": 1677652288,
+                    "model": "test-model",
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "Hello!"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
             }
         )
 
@@ -86,12 +90,11 @@ def test_create_chat_completion_direct_tracks_headers_and_response_metadata(clie
     assert response.json()["choices"][0]["message"]["content"] == "Hello!"
     assert response.headers["x-trace-id"] == "trace-direct"
     assert response.headers["x-request-id"]
-    create_kwargs = request_store.create_request.await_args.kwargs
-    assert create_kwargs["trace_id"] == "trace-direct"
-    assert create_kwargs["source_app"] == "Evigstudio"
-    assert create_kwargs["user_id"] == "user-direct"
-    assert create_kwargs["org_id"] == "org-direct"
-    request_store.mark_success.assert_awaited_once()
+    enqueue_kwargs = mock_job_queue.return_value.enqueue.await_args.kwargs
+    assert enqueue_kwargs["payload"]["trace_id"] == "trace-direct"
+    assert enqueue_kwargs["payload"]["source_app"] == "Evigstudio"
+    assert enqueue_kwargs["payload"]["user_id"] == "user-direct"
+    assert enqueue_kwargs["payload"]["org_id"] == "org-direct"
 
 
 def test_create_chat_completion_queued_propagates_headers_into_job_payload(client):
