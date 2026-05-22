@@ -291,13 +291,16 @@ function ChatMessageImpl({
               {displayText}
             </pre>
           ) : (
-            <div
-              className="prose prose-sm max-w-none leading-relaxed dark:prose-invert
-              [&_p]:my-1.5 [&_ul]:my-1 [&_ol]:my-1
+             <div
+               className="prose prose-sm max-w-none leading-relaxed dark:prose-invert
+              [&_p]:my-2 [&_ul]:my-2 [&_ol]:my-2 [&_li]:my-0.5
               [&_a]:text-primary [&_a]:no-underline hover:[&_a]:underline
-              [&_h1]:text-lg [&_h2]:text-base [&_h3]:text-sm
+              [&_h1]:mt-4 [&_h1]:mb-2 [&_h2]:mt-4 [&_h2]:mb-2 [&_h3]:mt-3 [&_h3]:mb-1.5
+              [&_h1]:text-xl sm:[&_h1]:text-2xl [&_h2]:text-lg sm:[&_h2]:text-xl [&_h3]:text-base
               [&_h1]:font-semibold [&_h2]:font-semibold [&_h3]:font-semibold
               [&_h1]:text-foreground [&_h2]:text-foreground [&_h3]:text-foreground
+              [&_h2]:border-b [&_h2]:border-border/60 [&_h2]:pb-1
+              [&_hr]:my-4
               [&_blockquote]:border-l-primary [&_blockquote]:text-muted-foreground
               [&_table]:w-full [&_table]:border-collapse [&_table]:text-sm [&_table]:my-3
               [&_th]:border [&_th]:border-border [&_th]:bg-muted/60 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:text-foreground [&_th]:font-semibold
@@ -305,7 +308,7 @@ function ChatMessageImpl({
               [&_tr:nth-child(even)]:bg-muted/20
               text-sm sm:text-[15px]
             "
-            >
+             >
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 rehypePlugins={[rehypeHighlight]}
