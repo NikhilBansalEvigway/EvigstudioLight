@@ -16,7 +16,6 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from '@/components/ui/dialog';
 import {
   Select,
@@ -25,7 +24,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Download, History, Loader2, FileText } from 'lucide-react';
+import { Download, History, Loader2, FileText, MoreHorizontal, SlidersHorizontal } from 'lucide-react';
 import { toast } from 'sonner';
 import { format } from 'date-fns';
 
@@ -49,6 +48,8 @@ export function ChatToolbar({
   const [threadTitle, setThreadTitle] = useState(chat.threadTitle ?? '');
   const [tagsStr, setTagsStr] = useState((chat.tags ?? []).join(', '));
   const [exporting, setExporting] = useState<'pdf' | 'docx' | null>(null);
+  const [showMeta, setShowMeta] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
 
   const serverMode = getChatPersistenceMode() === 'server' && !!user;
 
@@ -114,8 +115,8 @@ export function ChatToolbar({
   const versions = [...(chat.versionHistory ?? [])].sort((a, b) => b.savedAt - a.savedAt);
 
   return (
-    <div className="flex flex-col gap-1.5 w-full min-w-0">
-      <div className="flex flex-wrap items-center gap-1 justify-end">
+    <div className="flex min-w-0 flex-col gap-1">
+      <div className="flex flex-wrap items-center justify-end gap-1">
         {onSummarize && (
           <Button
             type="button"
@@ -134,41 +135,112 @@ export function ChatToolbar({
           </Button>
         )}
 
+        {serverMode && (
+          <Select
+            value={privacy}
+            disabled={!canWrite}
+            onValueChange={(v) => {
+              const next = v as ChatPrivacy;
+              if (next === 'private') {
+                updateChatFields(chat.id, { privacy: 'private', groupId: null });
+                return;
+              }
+              if (next === 'shared') {
+                updateChatFields(chat.id, { privacy: 'shared', groupId: null });
+                return;
+              }
+              const gid = chat.groupId ?? groups[0]?.id;
+              if (!gid) {
+                toast.error('Join or create a team first');
+                return;
+              }
+              updateChatFields(chat.id, { privacy: 'group', groupId: gid });
+            }}
+          >
+            <SelectTrigger className="h-7 w-[108px] border-border/70 bg-background/60 px-2 text-[11px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="private">Private</SelectItem>
+              <SelectItem value="shared">Shared</SelectItem>
+              <SelectItem value="group">Team</SelectItem>
+            </SelectContent>
+          </Select>
+        )}
+
+        {serverMode && privacy === 'group' && groups.length > 0 && (
+          <Select
+            value={chat.groupId ?? ''}
+            disabled={!canWrite}
+            onValueChange={(gid) => updateChatFields(chat.id, { privacy: 'group', groupId: gid })}
+          >
+            <SelectTrigger className="h-7 w-[108px] border-border/70 bg-background/60 px-2 text-[11px]">
+              <SelectValue placeholder="Team" />
+            </SelectTrigger>
+            <SelectContent>
+              {groups.map((g) => (
+                <SelectItem key={g.id} value={g.id}>
+                  {g.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+
+        {!canWrite && (
+          <span className="rounded-full border border-border/70 bg-muted px-2 py-1 text-[10px] text-muted-foreground">
+            Read only
+          </span>
+        )}
+
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-[11px] gap-1"
+          onClick={() => setShowMeta((value) => !value)}
+        >
+          <SlidersHorizontal className="h-3 w-3" />
+          {showMeta ? 'Hide details' : 'Details'}
+        </Button>
+
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-7 px-2 text-[11px] gap-1"
-              disabled={!!exporting}
-            >
-              {exporting ? (
-                <Loader2 className="w-3 h-3 animate-spin" />
-              ) : (
-                <Download className="w-3 h-3" />
-              )}
-              Export
+            <Button type="button" variant="ghost" size="sm" className="h-7 w-7 px-0" disabled={!!exporting}>
+              {exporting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <MoreHorizontal className="h-3.5 w-3.5" />}
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="text-xs">
-            <DropdownMenuItem onClick={() => void runExport('txt')}>Plain text (.txt)</DropdownMenuItem>
+          <DropdownMenuContent align="end" className="w-48 text-xs">
+            <DropdownMenuItem onClick={() => setShowHistory(true)}>
+              <History className="mr-2 h-3.5 w-3.5" />
+              History ({versions.length})
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => {
+                saveVersionSnapshot(chat.id);
+                toast.success('Snapshot saved');
+              }}
+              disabled={!canWrite}
+            >
+              <History className="mr-2 h-3.5 w-3.5" />
+              Save snapshot
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => void runExport('txt')}>
+              <Download className="mr-2 h-3.5 w-3.5" />
+              Export .txt
+            </DropdownMenuItem>
             <DropdownMenuItem onClick={() => void runExport('pdf')} disabled={exporting === 'pdf'}>
-              PDF (.pdf)
+              <Download className="mr-2 h-3.5 w-3.5" />
+              Export .pdf
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => void runExport('docx')} disabled={exporting === 'docx'}>
-              Word (.docx)
+              <Download className="mr-2 h-3.5 w-3.5" />
+              Export .docx
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <Dialog>
-          <DialogTrigger asChild>
-            <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-[11px] gap-1">
-              <History className="w-3 h-3" />
-              History ({versions.length})
-            </Button>
-          </DialogTrigger>
+        <Dialog open={showHistory} onOpenChange={setShowHistory}>
           <DialogContent className="max-w-md">
             <DialogHeader>
               <DialogTitle className="text-sm">Conversation versions</DialogTitle>
@@ -224,103 +296,34 @@ export function ChatToolbar({
             </div>
           </DialogContent>
         </Dialog>
-
-        {serverMode && (
-          <div className="flex items-center gap-1.5 text-[11px]">
-            <span className="text-muted-foreground hidden sm:inline">Visibility</span>
-            <Select
-              value={privacy}
-              disabled={!canWrite}
-              onValueChange={(v) => {
-                const next = v as ChatPrivacy;
-                if (next === 'private') {
-                  updateChatFields(chat.id, { privacy: 'private', groupId: null });
-                  return;
-                }
-                if (next === 'shared') {
-                  updateChatFields(chat.id, { privacy: 'shared', groupId: null });
-                  return;
-                }
-                const gid = chat.groupId ?? groups[0]?.id;
-                if (!gid) {
-                  toast.error('Join or create a team first');
-                  return;
-                }
-                updateChatFields(chat.id, { privacy: 'group', groupId: gid });
-              }}
-            >
-              <SelectTrigger className="h-7 w-[130px] text-[11px] px-2">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="private">Private (only you)</SelectItem>
-                <SelectItem value="shared">Shared (org)</SelectItem>
-                <SelectItem value="group">Team…</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        )}
       </div>
 
-      {/* Read-only badge and team picker live on their own row so they never push the
-          Visibility selector out of line with the Summarize / Export / History buttons. */}
-      {serverMode && (!canWrite || privacy === 'group') && (
-        <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px]">
-          {!canWrite && (
-            <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
-              Read only{chat.ownerDisplayName ? ` · ${chat.ownerDisplayName}` : ''}
-            </span>
-          )}
-          {privacy === 'group' && (
-            <div className="flex items-center gap-1.5">
-              <span className="text-muted-foreground hidden sm:inline">Team</span>
-              <Select
-                value={chat.groupId ?? ''}
-                disabled={!canWrite}
-                onValueChange={(gid) =>
-                  updateChatFields(chat.id, { privacy: 'group', groupId: gid })
-                }
-              >
-                <SelectTrigger className="h-7 w-[130px] text-[11px] px-2">
-                  <SelectValue placeholder="Choose team" />
-                </SelectTrigger>
-                <SelectContent>
-                  {groups.map((g) => (
-                    <SelectItem key={g.id} value={g.id}>
-                      {g.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
+      {showMeta && (
+        <div className="flex flex-wrap gap-2 rounded-xl border border-border/60 bg-background/45 px-2.5 py-2 text-[11px]">
+          <label className="flex min-w-[180px] flex-1 items-center gap-1.5">
+            <span className="shrink-0 text-muted-foreground">Thread</span>
+            <input
+              value={threadTitle}
+              onChange={(e) => setThreadTitle(e.target.value)}
+              onBlur={onThreadBlur}
+              disabled={!canWrite}
+              placeholder="Topic / session name"
+              className="min-w-0 flex-1 rounded bg-input px-2 py-1 text-[11px] outline-none focus:ring-1 focus:ring-ring"
+            />
+          </label>
+          <label className="flex min-w-[180px] flex-1 items-center gap-1.5">
+            <span className="shrink-0 text-muted-foreground">Tags</span>
+            <input
+              value={tagsStr}
+              onChange={(e) => setTagsStr(e.target.value)}
+              onBlur={onTagsBlur}
+              disabled={!canWrite}
+              placeholder="comma, separated"
+              className="min-w-0 flex-1 rounded bg-input px-2 py-1 text-[11px] outline-none focus:ring-1 focus:ring-ring"
+            />
+          </label>
         </div>
       )}
-
-      <div className="flex flex-wrap gap-2 text-[11px]">
-        <label className="flex items-center gap-1.5 min-w-0 flex-1">
-          <span className="text-muted-foreground shrink-0">Thread</span>
-          <input
-            value={threadTitle}
-            onChange={(e) => setThreadTitle(e.target.value)}
-            onBlur={onThreadBlur}
-            disabled={!canWrite}
-            placeholder="Topic / session name"
-            className="flex-1 min-w-0 bg-input rounded px-2 py-0.5 text-[11px] outline-none focus:ring-1 focus:ring-ring"
-          />
-        </label>
-        <label className="flex items-center gap-1.5 min-w-0 flex-1">
-          <span className="text-muted-foreground shrink-0">Tags</span>
-          <input
-            value={tagsStr}
-            onChange={(e) => setTagsStr(e.target.value)}
-            onBlur={onTagsBlur}
-            disabled={!canWrite}
-            placeholder="comma, separated"
-            className="flex-1 min-w-0 bg-input rounded px-2 py-0.5 text-[11px] outline-none focus:ring-1 focus:ring-ring"
-          />
-        </label>
-      </div>
     </div>
   );
 }

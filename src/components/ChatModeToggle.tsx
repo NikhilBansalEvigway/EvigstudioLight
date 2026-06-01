@@ -13,12 +13,12 @@ export function ChatModeToggle({ chatId, mode, disabled = false }: ChatModeToggl
   const isDisabled = disabled || isStreaming;
 
   return (
-    <div className="inline-flex items-center rounded-full border border-border bg-muted/40 p-0.5 text-[11px]">
+    <div className="inline-flex items-center rounded-full border border-border bg-muted/35 p-0.5 text-[10px] shadow-sm">
       <button
         type="button"
         disabled={isDisabled}
         onClick={() => setChatMode(chatId, 'chat')}
-        className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 font-medium transition-all disabled:cursor-not-allowed ${
+        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 font-medium transition-all disabled:cursor-not-allowed ${
           mode === 'chat'
             ? 'bg-background text-foreground shadow-sm'
             : 'text-muted-foreground hover:text-foreground'
@@ -31,7 +31,7 @@ export function ChatModeToggle({ chatId, mode, disabled = false }: ChatModeToggl
         type="button"
         disabled={isDisabled}
         onClick={() => setChatMode(chatId, 'agent')}
-        className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 font-medium transition-all disabled:cursor-not-allowed ${
+        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 font-medium transition-all disabled:cursor-not-allowed ${
           mode === 'agent'
             ? 'bg-primary/15 text-primary shadow-sm'
             : 'text-muted-foreground hover:text-foreground'

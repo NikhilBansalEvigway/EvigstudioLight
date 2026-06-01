@@ -340,6 +340,7 @@ export function ChatPane() {
   const [isCondensingChat, setIsCondensingChat] = useState(false);
   const [showSummarizeDialog, setShowSummarizeDialog] = useState(false);
   const [summarizePinContext, setSummarizePinContext] = useState(true);
+  const [showAgentTraceDialog, setShowAgentTraceDialog] = useState(false);
   const pendingContextActionInputRef = useRef<{
     input: string;
     images: string[];
@@ -625,6 +626,9 @@ export function ChatPane() {
       : latestAssistantMessageId ? agentActivitiesByMessageId[latestAssistantMessageId] ?? [] : [];
     return groupAgentActivities(items);
   }, [agentActivitiesByMessageId, latestAssistantMessageId, liveAgentActivities, liveAgentMessageId]);
+  const latestAssistantActivityItems = latestAssistantMessageId
+    ? agentActivitiesByMessageId[latestAssistantMessageId] ?? []
+    : [];
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUp = useRef(false);
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
@@ -2594,29 +2598,27 @@ export function ChatPane() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="pane-header flex-col items-stretch gap-2">
-        <div className="flex items-center gap-2 w-full min-w-0">
+      <div className="pane-header items-center gap-2">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
           {isAgent ? (
             <Bot className="w-3.5 h-3.5 text-primary shrink-0" />
           ) : (
             <MessageSquare className="w-3.5 h-3.5 text-primary shrink-0" />
           )}
           <span className="truncate min-w-0">{activeChat?.title || 'New Chat'}</span>
-          <div className="ml-auto shrink-0">
-            {activeChat && (
-              <ChatModeToggle chatId={activeChat.id} mode={chatMode} disabled={isLocked} />
-            )}
-          </div>
         </div>
         {activeChat && (
-          <ChatToolbar
-            chat={activeChat}
-            onSummarize={() => {
-              setSummarizePinContext(true);
-              setShowSummarizeDialog(true);
-            }}
-            summarizing={isCondensingChat}
-          />
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            <ChatModeToggle chatId={activeChat.id} mode={chatMode} disabled={isLocked} />
+            <ChatToolbar
+              chat={activeChat}
+              onSummarize={() => {
+                setSummarizePinContext(true);
+                setShowSummarizeDialog(true);
+              }}
+              summarizing={isCondensingChat}
+            />
+          </div>
         )}
       </div>
       {activeChat && isLocked && (
@@ -2628,16 +2630,6 @@ export function ChatPane() {
               Only the owner can continue or edit it.
             </span>
           </div>
-        </div>
-      )}
-
-      {isAgent && activityItemsToDisplay.length > 0 && (
-        <div className="border-b border-border/60 bg-background/35 px-3 py-2 sm:px-5">
-          <AgentActivityPanel
-            items={activityItemsToDisplay}
-            active={isActiveChatStreaming && liveAgentMessageId !== null}
-            onOpenFile={handleOpenEditorFile}
-          />
         </div>
       )}
 
@@ -2827,6 +2819,23 @@ export function ChatPane() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={showAgentTraceDialog} onOpenChange={setShowAgentTraceDialog}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="text-base">Agent Trace</DialogTitle>
+            <DialogDescription>
+              Detailed reasoning and tool activity for the latest assistant turn.
+            </DialogDescription>
+          </DialogHeader>
+          <AgentActivityPanel
+            items={activityItemsToDisplay.length > 0 ? activityItemsToDisplay : groupAgentActivities(latestAssistantActivityItems)}
+            active={showAgentTraceDialog || (isActiveChatStreaming && liveAgentMessageId !== null)}
+            onOpenFile={handleOpenEditorFile}
+            mode="dialog"
+          />
+        </DialogContent>
+      </Dialog>
+
       {/* Messages */}
       <div className="relative flex-1 min-h-0">
         {selectionPopover && !isLocked && !isStreaming && (
@@ -2936,7 +2945,7 @@ export function ChatPane() {
                   )}
 
                   {visible.map((msg, idx) => {
-                   
+                    
                     const precedingUser =
                       msg.role === 'assistant'
                         ? [...visible.slice(0, idx)].reverse().find((m) => m.role === 'user')
@@ -2944,6 +2953,11 @@ export function ChatPane() {
                     const fallbackThinking = precedingUser
                       ? deriveThinkingFromUserPrompt(getMessageText(precedingUser))
                       : undefined;
+                    const showActivityPill =
+                      isAgent &&
+                      msg.role === 'assistant' &&
+                      msg.id === latestAssistantMessageId &&
+                      activityItemsToDisplay.length > 0;
                     return (
                       <div
                         key={msg.id}
@@ -2951,6 +2965,15 @@ export function ChatPane() {
                         data-evig-message-role={msg.role}
                         data-evig-message-timestamp={msg.timestamp}
                       >
+                        {showActivityPill && (
+                          <div className="sticky top-2 z-10 mb-2 flex justify-center">
+                            <AgentActivityPill
+                              items={activityItemsToDisplay}
+                              active={isActiveChatStreaming && liveAgentMessageId !== null}
+                              onViewDetails={() => setShowAgentTraceDialog(true)}
+                            />
+                          </div>
+                        )}
                         <ChatMessage
                           message={msg}
                           chatMode={chatMode}
@@ -3226,28 +3249,85 @@ const ACTIVITY_ICONS: Record<AgentActivityItem['kind'], ElementType> = {
   rename: FolderTree,
 };
 
+function countActivitySteps(item: AgentActivityItem): number {
+  return item.groupedItems?.length ?? 1;
+}
+
+function summarizeActivityPill(items: AgentActivityItem[]): string[] {
+  const counts = { read: 0, list: 0, edit: 0, write: 0, delete: 0, rename: 0 };
+  for (const item of items) {
+    const sourceItems = item.groupedItems ?? [item];
+    for (const sourceItem of sourceItems) {
+      if (sourceItem.kind === 'thinking') continue;
+      counts[sourceItem.kind] += 1;
+    }
+  }
+
+  const parts: string[] = [];
+  const gathered = counts.read + counts.list;
+  const changed = counts.edit + counts.write + counts.delete + counts.rename;
+  if (gathered > 0) parts.push(`${gathered} ${gathered === 1 ? 'file' : 'files'} scanned`);
+  if (changed > 0) parts.push(`${changed} ${changed === 1 ? 'edit' : 'changes'}`);
+  if (parts.length === 0) parts.push('Thinking');
+  return parts;
+}
+
+function AgentActivityPill({
+  items,
+  active,
+  onViewDetails,
+}: {
+  items: AgentActivityItem[];
+  active: boolean;
+  onViewDetails: () => void;
+}) {
+  const latestItem = items[items.length - 1] ?? null;
+  const summaryParts = summarizeActivityPill(items);
+  const latestLabel = latestItem?.status === 'running'
+    ? latestItem.title
+    : summaryParts.join(' • ');
+
+  return (
+    <button
+      type="button"
+      onClick={onViewDetails}
+      className="inline-flex max-w-full items-center gap-2 rounded-full border border-border/70 bg-background/92 px-3 py-1.5 text-left text-[11px] text-muted-foreground shadow-sm backdrop-blur transition-colors hover:border-primary/25 hover:text-foreground"
+    >
+      <span className={`inline-flex h-2 w-2 shrink-0 rounded-full ${active ? 'bg-primary animate-pulse' : 'bg-primary/70'}`} />
+      <span className="shrink-0 font-medium text-foreground">Agent</span>
+      <span className="truncate">{latestLabel}</span>
+      {!active && summaryParts.length > 1 && (
+        <span className="hidden truncate text-[10px] text-muted-foreground sm:inline">{summaryParts.join(' • ')}</span>
+      )}
+      <span className="shrink-0 text-primary">View details</span>
+    </button>
+  );
+}
+
 function AgentActivityPanel({
   items,
   active,
   onOpenFile,
+  mode = 'inline',
 }: {
   items: AgentActivityItem[];
   active: boolean;
   onOpenFile?: (filePath: string) => void | Promise<void>;
+  mode?: 'inline' | 'dialog';
 }) {
-  const [expanded, setExpanded] = useState(active);
+  const isDialog = mode === 'dialog';
+  const [expanded, setExpanded] = useState(active || isDialog);
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
-    if (active) setExpanded(true);
-  }, [active]);
+    if (active || isDialog) setExpanded(true);
+  }, [active, isDialog]);
 
-  const countSteps = (item: AgentActivityItem) => item.groupedItems?.length ?? 1;
-  const total = items.reduce((sum, item) => sum + countSteps(item), 0);
-  const runningCount = items.reduce((sum, item) => sum + (item.status === 'running' ? countSteps(item) : 0), 0);
-  const errorCount = items.reduce((sum, item) => sum + (item.status === 'error' ? countSteps(item) : 0), 0);
+  const total = items.reduce((sum, item) => sum + countActivitySteps(item), 0);
+  const runningCount = items.reduce((sum, item) => sum + (item.status === 'running' ? countActivitySteps(item) : 0), 0);
+  const errorCount = items.reduce((sum, item) => sum + (item.status === 'error' ? countActivitySteps(item) : 0), 0);
   const latestItem = items[items.length - 1] ?? null;
-  const visibleItems = expanded ? items.slice(-4) : latestItem ? [latestItem] : [];
+  const visibleItems = isDialog ? items : expanded ? items.slice(-4) : latestItem ? [latestItem] : [];
 
   return (
     <div className="rounded-2xl border border-border/70 bg-card/70 px-3 py-2 shadow-[0_10px_24px_hsl(var(--background)/0.1)] backdrop-blur-md">
@@ -3278,14 +3358,16 @@ function AgentActivityPanel({
             </div>
           )}
         </div>
-        <button
-          type="button"
-          onClick={() => setExpanded((value) => !value)}
-          className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/55 px-2 py-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
-        >
-          {expanded ? 'Less' : 'More'}
-          {expanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-        </button>
+        {!isDialog && (
+          <button
+            type="button"
+            onClick={() => setExpanded((value) => !value)}
+            className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/55 px-2 py-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+          >
+            {expanded ? 'Less' : 'More'}
+            {expanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+          </button>
+        )}
       </div>
 
       <div className={`space-y-1.5 ${expanded ? 'mt-2' : 'mt-1'}`}>
@@ -3371,7 +3453,7 @@ function AgentActivityPanel({
           );
         })}
 
-        {expanded && total > visibleItems.length && (
+        {!isDialog && expanded && total > visibleItems.length && (
           <div className="px-1 text-[10px] text-muted-foreground">
             Showing the latest {visibleItems.length} steps.
           </div>
