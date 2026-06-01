@@ -42,7 +42,7 @@ export function WorkspacePane() {
     rightPaneTab, setRightPaneTab,
     workspaceRoots, clearWorkspace, setFileTree,
     openEditorTabs, activeFilePath, activeFileContent, setActiveFileContent, setActiveEditorFile, closeEditorFile, markEditorFileSaved,
-    contextFiles, toggleContextFile, clearContextFiles, settings, fileTree,
+    activeFileRevealRange, contextFiles, toggleContextFile, clearContextFiles, settings, fileTree,
   } = useAppStore();
   const { serverAvailable, user } = useAuth();
 
@@ -570,6 +570,7 @@ export function WorkspacePane() {
                   <CodeMirrorEditor
                     filePath={activeFilePath}
                     value={activeFileContent}
+                    revealRange={activeFileRevealRange?.path === activeFilePath ? activeFileRevealRange : null}
                     onChange={(v) => setActiveFileContent(v)}
                     theme={resolvedTheme === 'dark' ? 'dark' : 'light'}
                     onSave={() => saveActiveRef.current()}

@@ -1,9 +1,10 @@
-import { useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import CodeMirror from '@uiw/react-codemirror';
 import { langs } from '@uiw/codemirror-extensions-langs';
 import { EditorView, keymap } from '@codemirror/view';
-import { Prec, type Extension } from '@codemirror/state';
+import { EditorSelection, Prec, type Extension } from '@codemirror/state';
 import { githubDark, githubLight } from '@uiw/codemirror-theme-github';
+import type { EditorRevealRange } from '@/store/useAppStore';
 
 /**
  * Offline-friendly code editor built on CodeMirror 6 (no web workers, no CDN loader),
@@ -81,6 +82,7 @@ interface CodeMirrorEditorProps {
   readOnly?: boolean;
   onSave?: () => void;
   onSaveAll?: () => void;
+  revealRange?: EditorRevealRange | null;
 }
 
 export function CodeMirrorEditor({
@@ -91,12 +93,33 @@ export function CodeMirrorEditor({
   readOnly = false,
   onSave,
   onSaveAll,
+  revealRange = null,
 }: CodeMirrorEditorProps) {
   // Keep save callbacks in refs so the keymap extension stays stable across renders.
   const onSaveRef = useRef(onSave);
   const onSaveAllRef = useRef(onSaveAll);
+  const editorViewRef = useRef<EditorView | null>(null);
   onSaveRef.current = onSave;
   onSaveAllRef.current = onSaveAll;
+
+  useEffect(() => {
+    const view = editorViewRef.current;
+    if (!view || !revealRange || revealRange.path !== filePath) return;
+
+    try {
+      const startLine = Math.max(1, revealRange.startLine);
+      const endLine = Math.max(startLine, revealRange.endLine ?? revealRange.startLine);
+      const start = view.state.doc.line(startLine);
+      const end = view.state.doc.line(endLine);
+      view.dispatch({
+        selection: EditorSelection.range(start.from, end.to),
+        effects: EditorView.scrollIntoView(start.from, { y: 'start', yMargin: 48 }),
+      });
+      view.focus();
+    } catch {
+      // Ignore invalid line requests if the file changed since the trace was generated.
+    }
+  }, [filePath, revealRange]);
 
   const saveKeymap = useMemo(
     () =>
@@ -132,6 +155,9 @@ export function CodeMirrorEditor({
     <CodeMirror
       value={value}
       onChange={onChange}
+      onCreateEditor={(view) => {
+        editorViewRef.current = view;
+      }}
       height="100%"
       theme={theme === 'dark' ? githubDark : githubLight}
       extensions={extensions}

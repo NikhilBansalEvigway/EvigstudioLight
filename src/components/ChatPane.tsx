@@ -168,6 +168,29 @@ function formatCompactChars(value: number): string {
   return `${Math.round(value)}`;
 }
 
+function parseWorkspacePathTarget(raw: string): { filePath: string; startLine?: number; endLine?: number } {
+  const trimmed = raw.trim();
+  const match = trimmed.match(/^(.*?)(?:#L(\d+)(?:-L?(\d+))?)?$/i);
+  if (!match) return { filePath: trimmed };
+
+  const filePath = (match[1] ?? trimmed).trim();
+  const startLine = match[2] ? Number.parseInt(match[2], 10) : undefined;
+  const endLineRaw = match[3] ? Number.parseInt(match[3], 10) : undefined;
+  return {
+    filePath,
+    startLine: Number.isFinite(startLine) ? startLine : undefined,
+    endLine: Number.isFinite(endLineRaw) ? endLineRaw : startLine,
+  };
+}
+
+function stripWorkspacePathRange(raw: string): string {
+  return parseWorkspacePathTarget(raw).filePath;
+}
+
+function editAttemptSignature(input: { path: string; search: string; replace: string }): string {
+  return [input.path.trim(), input.search.replace(/\r\n/g, '\n'), input.replace.replace(/\r\n/g, '\n')].join('\n---\n');
+}
+
 function getActionFilePath(action: AgentAction): string | null {
   if (action.type === 'rename') {
     const parts = action.path.split(/\s*->\s*/);
@@ -393,7 +416,10 @@ export function ChatPane() {
     const isLinked = activeChat.messages.some((message) => {
       if (message.contextRefs?.some((ref) => ref.path === activeFilePath)) return true;
       const trackedActions = agentActionsByMessageId[message.id] ?? [];
-      if (trackedActions.some((action) => getActionFilePath(action) === activeFilePath)) return true;
+      if (trackedActions.some((action) => {
+        const target = getActionFilePath(action);
+        return target ? stripWorkspacePathRange(target) === activeFilePath : false;
+      })) return true;
 
       const text = getMessageText(message);
       if (text.includes(activeFilePath)) return true;
@@ -1403,13 +1429,20 @@ export function ChatPane() {
       return;
     }
 
+    const target = parseWorkspacePathTarget(filePath);
+
     try {
-      const content = await readWorkspaceFile(state.workspaceRoots, filePath);
+      const content = await readWorkspaceFile(state.workspaceRoots, target.filePath);
       state.setShowRightPane(true);
-      state.setActiveFile(filePath, content);
+      state.setActiveFile(target.filePath, content);
+      state.setActiveFileRevealRange(
+        target.startLine
+          ? { path: target.filePath, startLine: target.startLine, endLine: target.endLine }
+          : null,
+      );
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      toast.error(`Could not open ${filePath}: ${msg}`);
+      toast.error(`Could not open ${target.filePath}: ${msg}`);
     }
   }, []);
 
@@ -1696,6 +1729,7 @@ export function ChatPane() {
     const allActions: AgentAction[] = [];
     const allThoughts: string[] = [];
     let turnActivities: AgentActivityItem[] = [createThinkingActivity()];
+    const failedEditSignatures = new Set<string>();
     // Each tool-using iteration overwrites the visible assistant message; remember the
     // superseded outputs so the UI can still show every earlier attempt.
     const priorAttempts: Array<{ content: string; createdAt: number }> = [];
@@ -1762,7 +1796,14 @@ export function ChatPane() {
 
        
         const normalizedContent = normalizeToolMarkerLineBreaks(streamedContent);
-        const tools = parseToolCalls(stripChannelTokens(normalizedContent));
+        const parsedTools = parseToolCalls(stripChannelTokens(normalizedContent));
+        const repeatedFailedEdits = parsedTools.editFiles.filter((edit) => failedEditSignatures.has(editAttemptSignature(edit)));
+        const tools = repeatedFailedEdits.length === 0
+          ? parsedTools
+          : {
+              ...parsedTools,
+              editFiles: parsedTools.editFiles.filter((edit) => !failedEditSignatures.has(editAttemptSignature(edit))),
+            };
         if (!hasAgentTools(tools)) break;
 
         const strippedForThought = stripToolMarkers(normalizedContent);
@@ -1778,7 +1819,7 @@ export function ChatPane() {
           break;
         }
 
-        const { textFeedback, actions } = await executeAgentTools(roots, tools, {
+        const { textFeedback: rawTextFeedback, actions } = await executeAgentTools(roots, tools, {
           onFileWritten: (path, content) => useAppStore.getState().syncEditorFileContent(path, content),
           onPathDeleted: (path) => useAppStore.getState().removeWorkspacePathReferences(path),
           onPathRenamed: (oldPath, newPath) => useAppStore.getState().renameWorkspacePathReferences(oldPath, newPath),
@@ -1787,7 +1828,21 @@ export function ChatPane() {
             setLiveAgentActivities(turnActivities);
           },
         });
+        const repeatedEditFeedback = repeatedFailedEdits.map((edit) =>
+          `### Edit File: ${edit.path}\n(Skipped: the same exact search/replace block already failed earlier in this turn. Re-read the file and use the exact current text instead of retrying the same block.)`,
+        );
+        const textFeedback = [...repeatedEditFeedback, rawTextFeedback].filter(Boolean).join('\n\n');
         allActions.push(...actions);
+
+        const editActions = actions.filter((action) => action.type === 'edit');
+        editActions.forEach((action, index) => {
+          if (action.type !== 'edit' || action.success) return;
+          const attemptedEdit = tools.editFiles[index];
+          if (!attemptedEdit) return;
+          if (action.error?.includes('Search text was not found') || action.error?.includes('provide a more specific block')) {
+            failedEditSignatures.add(editAttemptSignature(attemptedEdit));
+          }
+        });
 
         const staleWriteFailure = actions.find(
           (action) => !action.success && action.error?.includes(STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE),
@@ -1810,7 +1865,7 @@ export function ChatPane() {
           await refreshFileTree();
         }
 
-        const continueAfterTools = hasGatherTools(tools) || hasMutationTools(tools);
+        const continueAfterTools = hasGatherTools(tools) || hasMutationTools(tools) || repeatedFailedEdits.length > 0;
         if (!continueAfterTools) break;
 
         // This iteration's output is about to be replaced by the next one — preserve it.
@@ -2820,19 +2875,21 @@ export function ChatPane() {
       </Dialog>
 
       <Dialog open={showAgentTraceDialog} onOpenChange={setShowAgentTraceDialog}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent className="flex h-[85vh] max-h-[85vh] max-w-2xl flex-col overflow-hidden">
           <DialogHeader>
             <DialogTitle className="text-base">Agent Trace</DialogTitle>
             <DialogDescription>
               Detailed reasoning and tool activity for the latest assistant turn.
             </DialogDescription>
           </DialogHeader>
-          <AgentActivityPanel
-            items={activityItemsToDisplay.length > 0 ? activityItemsToDisplay : groupAgentActivities(latestAssistantActivityItems)}
-            active={showAgentTraceDialog || (isActiveChatStreaming && liveAgentMessageId !== null)}
-            onOpenFile={handleOpenEditorFile}
-            mode="dialog"
-          />
+          <div className="min-h-0 flex-1 overflow-hidden">
+            <AgentActivityPanel
+              items={activityItemsToDisplay.length > 0 ? activityItemsToDisplay : groupAgentActivities(latestAssistantActivityItems)}
+              active={showAgentTraceDialog || (isActiveChatStreaming && liveAgentMessageId !== null)}
+              onOpenFile={handleOpenEditorFile}
+              mode="dialog"
+            />
+          </div>
         </DialogContent>
       </Dialog>
 
@@ -3318,6 +3375,9 @@ function AgentActivityPanel({
   const isDialog = mode === 'dialog';
   const [expanded, setExpanded] = useState(active || isDialog);
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const scrollAreaRef = useRef<HTMLDivElement | null>(null);
+  const autoFollowRef = useRef(true);
+  const [showScrollHint, setShowScrollHint] = useState(false);
 
   useEffect(() => {
     if (active || isDialog) setExpanded(true);
@@ -3329,9 +3389,39 @@ function AgentActivityPanel({
   const latestItem = items[items.length - 1] ?? null;
   const visibleItems = isDialog ? items : expanded ? items.slice(-4) : latestItem ? [latestItem] : [];
 
+  useEffect(() => {
+    if (!isDialog) return;
+    const scrollEl = scrollAreaRef.current;
+    if (!scrollEl) return;
+
+    const threshold = 32;
+    const updateScrollState = () => {
+      const distanceFromBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+      const nearBottom = distanceFromBottom <= threshold;
+      autoFollowRef.current = nearBottom;
+      setShowScrollHint(!nearBottom);
+    };
+
+    updateScrollState();
+    scrollEl.addEventListener('scroll', updateScrollState, { passive: true });
+    return () => scrollEl.removeEventListener('scroll', updateScrollState);
+  }, [isDialog]);
+
+  useEffect(() => {
+    if (!isDialog) return;
+    const scrollEl = scrollAreaRef.current;
+    if (!scrollEl) return;
+    if (!autoFollowRef.current) return;
+
+    requestAnimationFrame(() => {
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+      setShowScrollHint(false);
+    });
+  }, [isDialog, visibleItems, active]);
+
   return (
-    <div className="rounded-2xl border border-border/70 bg-card/70 px-3 py-2 shadow-[0_10px_24px_hsl(var(--background)/0.1)] backdrop-blur-md">
-      <div className="flex items-center gap-2">
+    <div className={`rounded-2xl border border-border/70 bg-card/70 px-3 py-2 shadow-[0_10px_24px_hsl(var(--background)/0.1)] backdrop-blur-md ${isDialog ? 'flex h-full min-h-0 flex-col' : ''}`}>
+      <div className={`${isDialog ? 'sticky top-0 z-10 -mx-3 -mt-2 border-b border-border/60 bg-card/92 px-3 py-2 backdrop-blur-md' : ''} flex items-center gap-2`}>
         <div className="rounded-full bg-primary/10 p-1 text-primary">
           <Brain className="h-3.5 w-3.5" />
         </div>
@@ -3370,7 +3460,11 @@ function AgentActivityPanel({
         )}
       </div>
 
-      <div className={`space-y-1.5 ${expanded ? 'mt-2' : 'mt-1'}`}>
+      <div
+        ref={scrollAreaRef}
+        className={`${expanded ? 'mt-2' : 'mt-1'} ${isDialog ? 'relative min-h-0 flex-1 overflow-y-scroll pr-1' : ''}`}
+      >
+        <div className="space-y-1.5">
         {visibleItems.map((item) => {
           const Icon = ACTIVITY_ICONS[item.kind] ?? FileCode;
           const groupedItems = item.groupedItems ?? [];
@@ -3456,6 +3550,27 @@ function AgentActivityPanel({
         {!isDialog && expanded && total > visibleItems.length && (
           <div className="px-1 text-[10px] text-muted-foreground">
             Showing the latest {visibleItems.length} steps.
+          </div>
+        )}
+        </div>
+        {isDialog && showScrollHint && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-card/95 to-transparent">
+            <div className="pointer-events-auto absolute bottom-2 left-1/2 -translate-x-1/2">
+              <button
+                type="button"
+                onClick={() => {
+                  const scrollEl = scrollAreaRef.current;
+                  if (!scrollEl) return;
+                  autoFollowRef.current = true;
+                  scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: 'smooth' });
+                  setShowScrollHint(false);
+                }}
+                className="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-background/95 px-3 py-1 text-[10px] text-primary shadow-sm backdrop-blur"
+              >
+                <ChevronDown className="h-3 w-3" />
+                Jump to latest
+              </button>
+            </div>
           </div>
         )}
       </div>

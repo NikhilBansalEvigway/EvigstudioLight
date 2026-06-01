@@ -37,6 +37,13 @@ export interface EditorTab {
   savedContent: string;
 }
 
+export interface EditorRevealRange {
+  path: string;
+  startLine: number;
+  endLine?: number;
+  requestKey: number;
+}
+
 interface AppState {
   // Settings
   settings: AppSettings;
@@ -89,9 +96,11 @@ interface AppState {
   openEditorTabs: EditorTab[];
   activeFilePath: string | null;
   activeFileContent: string;
+  activeFileRevealRange: EditorRevealRange | null;
   /** Bumps whenever editor/workspace session changes (used for autosave). */
   workspaceSessionRevision: number;
   setActiveFile: (path: string | null, content: string) => void;
+  setActiveFileRevealRange: (range: Omit<EditorRevealRange, 'requestKey'> | null) => void;
   setActiveEditorFile: (path: string) => void;
   setActiveFileContent: (content: string) => void;
   markEditorFileSaved: (path: string, content: string) => void;
@@ -204,6 +213,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       openEditorTabs: [],
       activeFilePath: null,
       activeFileContent: '',
+      activeFileRevealRange: null,
     }),
   createChat: async () => {
     const prevActive = get().activeChatId;
@@ -294,6 +304,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             openEditorTabs: [],
             activeFilePath: null,
             activeFileContent: '',
+            activeFileRevealRange: null,
           });
         }
       }
@@ -516,6 +527,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   openEditorTabs: [],
   activeFilePath: null,
   activeFileContent: '',
+  activeFileRevealRange: null,
   workspaceSessionRevision: 0,
   setActiveFile: (path, content) =>
     set((s) => {
@@ -523,6 +535,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         return {
           activeFilePath: null,
           activeFileContent: '',
+          activeFileRevealRange: null,
           rightPaneTab: 'editor',
           workspaceSessionRevision: s.workspaceSessionRevision + 1,
         };
@@ -537,6 +550,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         workspaceSessionRevision: s.workspaceSessionRevision + 1,
       };
     }),
+  setActiveFileRevealRange: (range) =>
+    set(() => ({
+      activeFileRevealRange: range ? { ...range, requestKey: Date.now() } : null,
+    })),
   setActiveEditorFile: (path) =>
     set((s) => {
       const tab = s.openEditorTabs.find((item) => item.path === path);
@@ -544,6 +561,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       return {
         activeFilePath: tab.path,
         activeFileContent: tab.content,
+        activeFileRevealRange: null,
         rightPaneTab: 'editor',
       };
     }),
@@ -589,6 +607,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         openEditorTabs: nextTabs,
         activeFilePath: nextActive?.path ?? null,
         activeFileContent: nextActive?.content ?? '',
+        activeFileRevealRange: null,
       };
     }),
   renameEditorFile: (oldPath, newPath, content) =>
@@ -611,6 +630,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           ? {
               activeFilePath: newPath,
               activeFileContent: renamedTab?.content ?? content ?? s.activeFileContent,
+              activeFileRevealRange:
+                s.activeFileRevealRange && s.activeFileRevealRange.path === oldPath
+                  ? { ...s.activeFileRevealRange, path: newPath }
+                  : s.activeFileRevealRange,
             }
           : {}),
       };
@@ -658,6 +681,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           openEditorTabs: [],
           activeFilePath: null,
           activeFileContent: '',
+          activeFileRevealRange: null,
         });
         return;
       }
@@ -686,6 +710,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             ? (session.openEditorTabs ?? []).find((t) => t.path === session.activeFilePath)?.content
             : (session.openEditorTabs ?? [])[0]?.content) ??
           '',
+        activeFileRevealRange: null,
       });
 
       // Try to rebuild file tree; if permission is revoked, keep tree empty.

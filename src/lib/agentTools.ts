@@ -339,10 +339,10 @@ export async function executeAgentTools(
 
       const matches = countOccurrences(current, normalizedSearch);
       if (matches === 0) {
-        throw new Error('Search text was not found in the current file');
+        throw new Error('Search text was not found in the current file. Re-read the file and copy the exact current block before retrying.');
       }
       if (matches > 1) {
-        throw new Error(`Search text matched ${matches} times; provide a more specific block`);
+        throw new Error(`Search text matched ${matches} times; provide a more specific block copied from the current file`);
       }
 
       const next = current.replace(normalizedSearch, normalizedReplace);
