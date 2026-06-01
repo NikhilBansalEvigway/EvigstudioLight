@@ -109,6 +109,8 @@ interface AppState {
   setShowSidebar: (v: boolean) => void;
   showRightPane: boolean;
   setShowRightPane: (v: boolean) => void;
+  linkedWorkspacePaths: string[];
+  setLinkedWorkspacePaths: (paths: string[]) => void;
 
   // Streaming
   isStreaming: boolean;
@@ -769,6 +771,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   setShowSidebar: (v) => set({ showSidebar: v }),
   showRightPane: true,
   setShowRightPane: (v) => set({ showRightPane: v }),
+  linkedWorkspacePaths: [],
+  setLinkedWorkspacePaths: (paths) => set({ linkedWorkspacePaths: [...new Set(paths)] }),
 
   isStreaming: false,
   streamingChatId: null,

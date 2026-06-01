@@ -209,6 +209,7 @@ export function FileTree() {
       chats,
       contextFiles,
       fileTree,
+      linkedWorkspacePaths,
       openEditorTabs,
       removeWorkspacePathReferences,
       removeWorkspaceRoot,
@@ -601,6 +602,7 @@ export function FileTree() {
                 searchQuery={deferredQuery}
                 forceExpanded={searching}
                 activeFilePath={activeFilePath}
+                linkedWorkspacePaths={linkedWorkspacePaths}
                 onFileClick={handleFileClick}
                 contextFiles={contextFiles}
                 onToggleContext={handleToggleContext}
@@ -734,6 +736,7 @@ function TreeNode({
   searchQuery,
   forceExpanded,
   activeFilePath,
+  linkedWorkspacePaths,
   onFileClick,
   contextFiles,
   onToggleContext,
@@ -746,6 +749,7 @@ function TreeNode({
   searchQuery: string;
   forceExpanded: boolean;
   activeFilePath: string | null;
+  linkedWorkspacePaths: string[];
   onFileClick: (n: FileNode) => void;
   contextFiles: string[];
   onToggleContext: (path: string) => void;
@@ -756,6 +760,7 @@ function TreeNode({
   const [expanded, setExpanded] = useState(depth < 1);
   const isContext = contextFiles.includes(node.path);
   const isActive = activeFilePath === node.path;
+  const isLinked = linkedWorkspacePaths.includes(node.path);
   const isSearchMode = searchQuery.trim().length > 0;
   const isExpanded = forceExpanded || expanded;
   const isWorkspaceRoot = node.isWorkspaceRoot === true;
@@ -843,10 +848,11 @@ function TreeNode({
               depth={depth + 1}
               searchQuery={searchQuery}
               forceExpanded={forceExpanded}
-              activeFilePath={activeFilePath}
-              onFileClick={onFileClick}
-              contextFiles={contextFiles}
-              onToggleContext={onToggleContext}
+                activeFilePath={activeFilePath}
+                linkedWorkspacePaths={linkedWorkspacePaths}
+                onFileClick={onFileClick}
+                contextFiles={contextFiles}
+                onToggleContext={onToggleContext}
               onDelete={onDelete}
               onRename={onRename}
               onCreate={onCreate}
@@ -864,7 +870,9 @@ function TreeNode({
       <div
         className={`flex items-center gap-2 rounded-xl border px-2 py-1.5 transition-all ${isActive
           ? `bg-gradient-to-r ${visual.accentClassName} shadow-sm`
-          : 'border-transparent hover:border-border/70 hover:bg-secondary/50'} ${isSearchMode ? 'animate-fade-in' : ''}`}
+          : isLinked
+            ? 'border-primary/25 bg-primary/7 shadow-[0_0_0_1px_hsl(var(--primary)/0.12),0_0_24px_hsl(var(--primary)/0.08)]'
+            : 'border-transparent hover:border-border/70 hover:bg-secondary/50'} ${isSearchMode ? 'animate-fade-in' : ''}`}
       >
         <button
           type="button"
@@ -880,6 +888,9 @@ function TreeNode({
             </div>
             {isSearchMode && (
               <div className="truncate text-[10px] text-muted-foreground">{highlightLabel(node.path, searchQuery)}</div>
+            )}
+            {isLinked && !isSearchMode && (
+              <div className="truncate text-[10px] text-primary">Mentioned in the active conversation</div>
             )}
           </div>
         </button>

@@ -261,10 +261,16 @@ export interface AgentToolResult {
   actions: AgentAction[];
 }
 
+export interface AgentToolEvent {
+  phase: 'start' | 'finish';
+  action: AgentAction;
+}
+
 export interface ExecuteAgentToolsOptions {
   onFileWritten?: (path: string, content: string) => void;
   onPathDeleted?: (path: string) => void;
   onPathRenamed?: (oldPath: string, newPath: string) => void;
+  onAction?: (event: AgentToolEvent) => void;
 }
 
 export async function executeAgentTools(
@@ -277,32 +283,54 @@ export async function executeAgentTools(
 
   for (const target of tools.readFiles) {
     const label = formatReadLabel(target);
+    options.onAction?.({
+      phase: 'start',
+      action: { type: 'read', path: label, success: true },
+    });
     try {
       const content = await readWorkspaceFile(workspaceRoots, target.path);
       parts.push(`### Read File: ${label}\n${formatReadChunk(target, content)}`);
-      actions.push({ type: 'read', path: label, success: true });
+      const action = { type: 'read', path: label, success: true } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       parts.push(`### Read File: ${label}\n(Error: could not read — ${msg})`);
-      actions.push({ type: 'read', path: label, success: false, error: msg });
+      const action = { type: 'read', path: label, success: false, error: msg } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     }
   }
 
   for (const dir of tools.listDirs) {
+    const label = dir || '.';
+    options.onAction?.({
+      phase: 'start',
+      action: { type: 'list', path: label, success: true },
+    });
     try {
       const entries = await listWorkspaceDirectoryContents(workspaceRoots, dir);
       parts.push(
         `### List Directory: ${dir || '(workspace root)'}\n${entries.length ? entries.join('\n') : '(empty)'}`,
       );
-      actions.push({ type: 'list', path: dir || '.', success: true });
+      const action = { type: 'list', path: label, success: true } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       parts.push(`### List Directory: ${dir}\n(Error: ${msg})`);
-      actions.push({ type: 'list', path: dir || '.', success: false, error: msg });
+      const action = { type: 'list', path: label, success: false, error: msg } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     }
   }
 
   for (const { path, search, replace } of tools.editFiles) {
+    const normalizedPath = normalizeWorkspacePath(workspaceRoots, path);
+    options.onAction?.({
+      phase: 'start',
+      action: { type: 'edit', path: normalizedPath, success: true },
+    });
     try {
       const raw = await readWorkspaceFile(workspaceRoots, path);
       const current = raw.replace(/\r\n/g, '\n');
@@ -321,56 +349,85 @@ export async function executeAgentTools(
       await writeWorkspaceFile(workspaceRoots, path, next);
       options.onFileWritten?.(path, next);
       parts.push(`### Edit File: ${path}\n(Edited successfully, replaced ${search.length} chars with ${replace.length} chars)`);
-      actions.push({ type: 'edit', path: normalizeWorkspacePath(workspaceRoots, path), success: true });
+      const action = { type: 'edit', path: normalizedPath, success: true } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       parts.push(`### Edit File: ${path}\n(Error: ${msg})`);
-      actions.push({ type: 'edit', path, success: false, error: msg });
+      const action = { type: 'edit', path: normalizedPath, success: false, error: msg } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     }
   }
 
   for (const { path, content } of tools.writeFiles) {
+    const normalizedPath = normalizeWorkspacePath(workspaceRoots, path);
+    options.onAction?.({
+      phase: 'start',
+      action: { type: 'write', path: normalizedPath, success: true },
+    });
     try {
       const sanitizedContent = sanitizeWrittenFileContent(content);
       const existedBefore = await workspaceFileExists(workspaceRoots, path);
       await writeWorkspaceFileVerified(workspaceRoots, path, sanitizedContent, { expectCreate: !existedBefore });
       options.onFileWritten?.(path, sanitizedContent);
       parts.push(`### Write File: ${path}\n(Written successfully, ${sanitizedContent.length} chars)`);
-      actions.push({ type: 'write', path: normalizeWorkspacePath(workspaceRoots, path), success: true });
+      const action = { type: 'write', path: normalizedPath, success: true } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       parts.push(`### Write File: ${path}\n(Error: ${msg})`);
-      actions.push({ type: 'write', path, success: false, error: msg });
+      const action = { type: 'write', path: normalizedPath, success: false, error: msg } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     }
   }
 
   for (const path of tools.deletePaths) {
+    const normalizedPath = normalizeWorkspacePath(workspaceRoots, path);
+    options.onAction?.({
+      phase: 'start',
+      action: { type: 'delete', path: normalizedPath, success: true },
+    });
     try {
       await deleteWorkspacePath(workspaceRoots, path);
       options.onPathDeleted?.(path);
       parts.push(`### Delete Path: ${path}\n(Deleted successfully)`);
-      actions.push({ type: 'delete', path: normalizeWorkspacePath(workspaceRoots, path), success: true });
+      const action = { type: 'delete', path: normalizedPath, success: true } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       parts.push(`### Delete Path: ${path}\n(Error: ${msg})`);
-      actions.push({ type: 'delete', path, success: false, error: msg });
+      const action = { type: 'delete', path: normalizedPath, success: false, error: msg } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     }
   }
 
   for (const { oldPath, newPath } of tools.renamePaths) {
+    const normalizedOldPath = normalizeWorkspacePath(workspaceRoots, oldPath);
+    const normalizedNewPath = normalizeWorkspacePath(workspaceRoots, newPath);
+    const normalizedPath = `${normalizedOldPath} -> ${normalizedNewPath}`;
+    options.onAction?.({
+      phase: 'start',
+      action: { type: 'rename', path: normalizedPath, success: true },
+    });
     try {
       await renameWorkspacePath(workspaceRoots, oldPath, newPath);
       options.onPathRenamed?.(oldPath, newPath);
       parts.push(`### Rename File: ${oldPath} -> ${newPath}\n(Renamed successfully)`);
-      actions.push({
-        type: 'rename',
-        path: `${normalizeWorkspacePath(workspaceRoots, oldPath)} -> ${normalizeWorkspacePath(workspaceRoots, newPath)}`,
-        success: true,
-      });
+      const action = { type: 'rename', path: normalizedPath, success: true } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       parts.push(`### Rename File: ${oldPath} -> ${newPath}\n(Error: ${msg})`);
-      actions.push({ type: 'rename', path: `${oldPath} -> ${newPath}`, success: false, error: msg });
+      const action = { type: 'rename', path: normalizedPath, success: false, error: msg } satisfies AgentAction;
+      actions.push(action);
+      options.onAction?.({ phase: 'finish', action });
     }
   }
 

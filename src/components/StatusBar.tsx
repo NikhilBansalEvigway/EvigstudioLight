@@ -108,25 +108,25 @@ export function StatusBar() {
   const ctxPct = safeBudget > 0 ? Math.min(100, Math.max(0, Math.round((safeUsed / safeBudget) * 100))) : 0;
 
   return (
-    <header className={`flex h-10 min-h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-2 sm:px-3 ${hasBackground ? 'bg-card/82 backdrop-blur-md' : 'bg-card'}`}>
+    <header className={`flex h-10 min-h-10 shrink-0 items-center justify-between gap-2 border-b border-border/80 px-2 shadow-[0_10px_30px_hsl(var(--background)/0.12)] sm:px-3 ${hasBackground ? 'bg-card/72 backdrop-blur-xl' : 'bg-card/96 backdrop-blur-md'}`}>
       <div className="flex min-w-0 items-center gap-2 sm:gap-3">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               type="button"
               aria-pressed={showSidebar}
-              aria-label={showSidebar ? 'Hide chat list' : 'Show chat list'}
-              onClick={() => setShowSidebar(!showSidebar)}
-              className="flex shrink-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            >
-              <PanelLeft className="h-4 w-4" />
-              <span className="hidden text-xs font-medium sm:inline">Chats</span>
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" className="max-w-[220px]">
-            {showSidebar ? 'Hide the chat list (history)' : 'Show the chat list (history)'}
-          </TooltipContent>
-        </Tooltip>
+               aria-label={showSidebar ? 'Collapse chat navigation' : 'Expand chat navigation'}
+               onClick={() => setShowSidebar(!showSidebar)}
+               className="flex shrink-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+             >
+               <PanelLeft className="h-4 w-4" />
+               <span className="hidden text-xs font-medium sm:inline">Navigation</span>
+             </button>
+           </TooltipTrigger>
+           <TooltipContent side="bottom" className="max-w-[220px]">
+             {showSidebar ? 'Collapse the chat list into the quick icon rail.' : 'Expand the full chat list and filters.'}
+           </TooltipContent>
+         </Tooltip>
         <div className="flex min-w-0 items-center gap-2">
           {logo ? (
             <img src={logo} alt="" className="h-7 w-7 shrink-0 rounded object-contain" />

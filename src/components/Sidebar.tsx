@@ -219,7 +219,7 @@ export function Sidebar() {
   }, [editingId]);
 
   return (
-    <div className={`flex flex-col h-full ${hasBackground ? 'bg-sidebar/78 backdrop-blur-md' : 'bg-sidebar'}`}>
+    <div className={`flex flex-col h-full ${hasBackground ? 'bg-sidebar/76 backdrop-blur-xl shadow-[0_18px_50px_hsl(var(--background)/0.16)]' : 'bg-sidebar'}`}>
       <div className="pane-header justify-between">
         <span>Chats</span>
         <button

@@ -362,6 +362,29 @@ function ChatMessageImpl({
     !!onSubmitEdit &&
     rawText.trim().length > 0;
   const canRegenerateMessage = !busy && message.role === 'assistant' && !!onRegenerate;
+  const successfulMutationActions = (agentActions ?? []).filter(
+    (action) => action.success && (action.type === 'edit' || action.type === 'write' || action.type === 'delete' || action.type === 'rename'),
+  );
+  const executionBadge = (() => {
+    if (successfulMutationActions.length > 0) {
+      const first = successfulMutationActions[0];
+      if (successfulMutationActions.length === 1) {
+        if (first.type === 'delete') return { label: 'File removed', tone: 'warning' as const };
+        if (first.type === 'rename') return { label: 'File renamed', tone: 'accent' as const };
+        return { label: 'File updated', tone: 'accent' as const };
+      }
+      return { label: `${successfulMutationActions.length} workspace changes`, tone: 'accent' as const };
+    }
+
+    if (showAutoAppliedBadges && (autoAppliedPaths?.length ?? 0) > 0) {
+      return {
+        label: autoAppliedPaths!.length === 1 ? 'Patch applied' : `${autoAppliedPaths!.length} patches applied`,
+        tone: 'accent' as const,
+      };
+    }
+
+    return null;
+  })();
 
   const priorAttempts =
     message.role === 'assistant' ? (message.meta?.attempts ?? []) : [];
@@ -462,16 +485,16 @@ function ChatMessageImpl({
   return (
     <div className={`group flex gap-3 animate-fade-in ${message.role === 'user' ? 'justify-end' : ''}`}>
       {message.role === 'assistant' && (
-        <div className="w-6 h-6 rounded bg-primary/20 flex items-center justify-center shrink-0 mt-1">
+        <div className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 shadow-sm">
           <Bot className="w-3.5 h-3.5 text-primary" />
         </div>
       )}
 
       <div
-        className={`max-w-[min(92%,56rem)] sm:max-w-[85%] ${
+        className={`max-w-[min(94%,58rem)] sm:max-w-[88%] ${
           message.role === 'user'
-            ? 'rounded-lg bg-secondary px-3 py-2'
-            : 'min-w-0 flex-1'
+            ? 'rounded-2xl border border-primary/15 bg-primary/[0.07] px-4 py-3 shadow-[0_10px_24px_hsl(var(--background)/0.12)]'
+            : 'min-w-0 flex-1 rounded-2xl border border-border/70 bg-card/65 px-4 py-3 shadow-[0_12px_28px_hsl(var(--background)/0.12)] backdrop-blur-sm'
         }`}
       >
         {hasImages(message) && (
@@ -482,12 +505,23 @@ function ChatMessageImpl({
           </div>
         )}
 
+        {executionBadge && message.role === 'assistant' && (
+          <div className="mb-2 flex items-center gap-2 text-[11px]">
+            <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 ${executionBadge.tone === 'warning'
+              ? 'border-warning/25 bg-warning/10 text-warning'
+              : 'border-accent/20 bg-accent/10 text-accent'}`}>
+              <Check className="h-3 w-3" />
+              {executionBadge.label}
+            </span>
+          </div>
+        )}
+
         {effectiveThinkingContent && message.role === 'assistant' && (
-          <div className="mb-3 overflow-hidden rounded-md border border-border/50 bg-muted/20">
+          <div className="mb-3 overflow-hidden rounded-xl border border-border/60 bg-muted/45 shadow-[inset_0_1px_0_hsl(var(--background)/0.6)]">
             <button
               type="button"
               onClick={() => setShowThinking(!showThinking)}
-              className="flex w-full items-center gap-1.5 px-3 py-1.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+              className="flex w-full items-center gap-1.5 px-3 py-2 text-[11px] text-muted-foreground transition-colors hover:bg-background/30 hover:text-foreground"
             >
               <Brain className="h-3.5 w-3.5 shrink-0" />
               <span className="font-medium">
@@ -506,7 +540,7 @@ function ChatMessageImpl({
               )}
             </button>
             {showThinking && (
-              <div className="border-t border-border/50 px-3 py-2.5 text-[12px] leading-relaxed text-muted-foreground prose prose-sm max-w-none dark:prose-invert">
+              <div className="border-t border-border/50 bg-background/20 px-3 py-2.5 text-[12px] leading-relaxed text-muted-foreground prose prose-sm max-w-none dark:prose-invert">
                 <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}>
                   {processMarkdown(stripToolMarkers(effectiveThinkingContent))}
                 </ReactMarkdown>
@@ -571,7 +605,7 @@ function ChatMessageImpl({
           </div>
         ) : displayText.trim().length > 0 && (
           message.role === 'user' ? (
-            <pre className="whitespace-pre-wrap break-words text-sm sm:text-[15px] leading-relaxed font-mono">
+            <pre className="whitespace-pre-wrap break-words text-sm sm:text-[15px] leading-relaxed font-sans text-foreground">
               {displayText}
             </pre>
           ) : (
@@ -767,7 +801,7 @@ function ChatMessageImpl({
       </div>
 
       {message.role === 'user' && (
-        <div className="w-6 h-6 rounded bg-secondary flex items-center justify-center shrink-0 mt-1">
+        <div className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-xl border border-primary/10 bg-background shadow-sm">
           <User className="w-3.5 h-3.5 text-muted-foreground" />
         </div>
       )}

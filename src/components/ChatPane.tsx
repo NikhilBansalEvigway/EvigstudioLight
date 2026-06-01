@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, useMemo, useLayoutEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo, useLayoutEffect, type ElementType } from 'react';
 import { useAppStore } from '@/store/useAppStore';
 import { chatCompletion, type ChatMessage as LLMMessage } from '@/lib/llmClient';
 import {
@@ -65,16 +65,20 @@ import {
 import { useSpeechDictation } from '@/hooks/useSpeechDictation';
 import {
   Send,
+  Search,
   ImagePlus,
   Loader2,
   StopCircle,
   FileCode,
+  FileText,
   X,
   Mic,
   Bot,
+  Brain,
   MessageSquare,
   Lock,
   FolderOpen,
+  FolderTree,
   ChevronDown,
   ChevronUp,
 } from 'lucide-react';
@@ -127,13 +131,131 @@ const SUMMARY_TIMEOUT_MS = 3 * 60_000;
 const INPUT_MIN_HEIGHT_PX = 56;
 const INPUT_MAX_HEIGHT_PX = 220;
 
+type AgentActivityItem = {
+  key: string;
+  kind: AgentAction['type'] | 'thinking';
+  title: string;
+  detail: string;
+  status: 'running' | 'success' | 'error';
+  note?: string;
+  filePath?: string;
+  updatedAt: number;
+};
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getActionFilePath(action: AgentAction): string | null {
+  if (action.type === 'rename') {
+    const parts = action.path.split(/\s*->\s*/);
+    return parts[1] ?? null;
+  }
+  if (action.type === 'delete' || action.type === 'list') return null;
+  return action.path;
+}
+
+function createThinkingActivity(): AgentActivityItem {
+  return {
+    key: 'thinking',
+    kind: 'thinking',
+    title: 'Thinking through the request',
+    detail: 'Reviewing the current conversation and workspace context.',
+    status: 'running',
+    note: 'In progress',
+    updatedAt: Date.now(),
+  };
+}
+
+function finalizeThinkingActivity(items: AgentActivityItem[], status: 'success' | 'error', note: string): AgentActivityItem[] {
+  return items.map((item) =>
+    item.key === 'thinking' && item.status === 'running'
+      ? { ...item, status, note, updatedAt: Date.now() }
+      : item,
+  );
+}
+
+function buildActivityItem(action: AgentAction, phase: 'start' | 'finish'): AgentActivityItem {
+  const shortPath = action.path.split(/\s*->\s*/).pop()?.split('/').pop() ?? action.path;
+  const base = {
+    key: `${action.type}:${action.path}`,
+    kind: action.type,
+    filePath: getActionFilePath(action) ?? undefined,
+    updatedAt: Date.now(),
+  } satisfies Pick<AgentActivityItem, 'key' | 'kind' | 'filePath' | 'updatedAt'>;
+
+  if (phase === 'start') {
+    const startText: Record<AgentAction['type'], { title: string; detail: string }> = {
+      list: { title: 'Searching workspace', detail: action.path === '.' ? 'Scanning the workspace root.' : action.path },
+      read: { title: `Reading ${shortPath}`, detail: action.path },
+      edit: { title: `Updating ${shortPath}`, detail: action.path },
+      write: { title: `Writing ${shortPath}`, detail: action.path },
+      delete: { title: `Removing ${shortPath}`, detail: action.path },
+      rename: { title: `Renaming ${shortPath}`, detail: action.path },
+    };
+    const copy = startText[action.type];
+    return { ...base, title: copy.title, detail: copy.detail, status: 'running', note: 'Running' };
+  }
+
+  const successText: Record<AgentAction['type'], { title: string; note: string }> = {
+    list: { title: 'Workspace scanned', note: 'Directory listed' },
+    read: { title: `Read ${shortPath}`, note: 'File loaded' },
+    edit: { title: `Updated ${shortPath}`, note: 'File updated' },
+    write: { title: `Wrote ${shortPath}`, note: 'File updated' },
+    delete: { title: `Removed ${shortPath}`, note: 'Path deleted' },
+    rename: { title: `Renamed ${shortPath}`, note: 'Path renamed' },
+  };
+
+  const copy = successText[action.type];
+  return {
+    ...base,
+    title: copy.title,
+    detail: action.path,
+    status: action.success ? 'success' : 'error',
+    note: action.success ? copy.note : action.error ?? 'Tool failed',
+  };
+}
+
+function upsertAgentActivity(items: AgentActivityItem[], action: AgentAction, phase: 'start' | 'finish'): AgentActivityItem[] {
+  const key = `${action.type}:${action.path}`;
+  if (phase === 'start') {
+    return [...items, buildActivityItem(action, phase)];
+  }
+
+  const next = [...items];
+  for (let index = next.length - 1; index >= 0; index -= 1) {
+    if (next[index].key === key && next[index].status === 'running') {
+      next[index] = buildActivityItem(action, phase);
+      return next;
+    }
+  }
+  next.push(buildActivityItem(action, phase));
+  return next;
+}
+
+function summarizeMutationToast(actions: AgentAction[]): string | null {
+  const successful = actions.filter(
+    (action) => action.success && (action.type === 'edit' || action.type === 'write' || action.type === 'delete' || action.type === 'rename'),
+  );
+  if (successful.length === 0) return null;
+  if (successful.length === 1) {
+    const action = successful[0];
+    const target = action.path.split(/\s*->\s*/).pop() ?? action.path;
+    if (action.type === 'delete') return `Removed ${target}`;
+    if (action.type === 'rename') return `Renamed ${target}`;
+    return `File updated: ${target}`;
+  }
+  return `Workspace updated in ${successful.length} places`;
+}
+
 export function ChatPane() {
   const {
     chats, activeChatId, createChat, addMessage, updateLastAssistantMessage, updateChatFields, saveVersionSnapshot,
     settings, contextFiles, fileTree, isStreaming, streamingChatId, setIsStreaming, workspaceRoots,
-    workspaceContextUsedChars, contextBudgetChars,
+    workspaceContextUsedChars, contextBudgetChars, contextUsedChars, activeFilePath,
     serverContextRules,
     setHistoryContextUsage,
+    setLinkedWorkspacePaths,
   } = useAppStore();
 
   const isActiveChatStreaming = isStreaming && streamingChatId === activeChatId;
@@ -141,6 +263,9 @@ export function ChatPane() {
   const [autoAppliedPathsByMessageId, setAutoAppliedPathsByMessageId] = useState<Record<string, string[]>>({});
   const [agentActionsByMessageId, setAgentActionsByMessageId] = useState<Record<string, AgentAction[]>>({});
   const [agentThoughtsByMessageId, setAgentThoughtsByMessageId] = useState<Record<string, string[]>>({});
+  const [agentActivitiesByMessageId, setAgentActivitiesByMessageId] = useState<Record<string, AgentActivityItem[]>>({});
+  const [liveAgentActivities, setLiveAgentActivities] = useState<AgentActivityItem[]>([]);
+  const [liveAgentMessageId, setLiveAgentMessageId] = useState<string | null>(null);
   const patchedPathsRef = useRef<Set<string>>(new Set());
   const [agentGatherStep, setAgentGatherStep] = useState<number | null>(null);
   const [showContextActionsDialog, setShowContextActionsDialog] = useState(false);
@@ -166,6 +291,8 @@ export function ChatPane() {
 
   useEffect(() => {
     patchedPathsRef.current = new Set();
+    setLiveAgentActivities([]);
+    setLiveAgentMessageId(null);
   }, [activeChatId]);
 
   
@@ -185,6 +312,27 @@ export function ChatPane() {
   const isLocked = activeChat ? !canWriteChat(activeChat) : false;
   const chatMode = activeChat?.mode ?? 'agent';
   const isAgent = chatMode === 'agent';
+
+  useEffect(() => {
+    if (!activeFilePath || !activeChat) {
+      setLinkedWorkspacePaths([]);
+      return;
+    }
+
+    const basename = activeFilePath.split('/').pop() ?? activeFilePath;
+    const basenamePattern = new RegExp(`(^|[\s\`])${escapeRegExp(basename)}([\s\`.,:;!?)]|$)`);
+    const isLinked = activeChat.messages.some((message) => {
+      if (message.contextRefs?.some((ref) => ref.path === activeFilePath)) return true;
+      const trackedActions = agentActionsByMessageId[message.id] ?? [];
+      if (trackedActions.some((action) => getActionFilePath(action) === activeFilePath)) return true;
+
+      const text = getMessageText(message);
+      if (text.includes(activeFilePath)) return true;
+      return basenamePattern.test(text);
+    });
+
+    setLinkedWorkspacePaths(isLinked ? [activeFilePath] : []);
+  }, [activeChat, activeFilePath, agentActionsByMessageId, setLinkedWorkspacePaths]);
 
   // Keep the context usage indicator tied to the active chat.
   useEffect(() => {
@@ -392,6 +540,24 @@ export function ChatPane() {
     }
     return { files, folders, stale, folderFiles };
   }, [fileTree, mentionedFiles]);
+  const activeContextRefs = useMemo(
+    () => [...new Set([...contextFiles, ...mentionedFiles])],
+    [contextFiles, mentionedFiles],
+  );
+  const contextUsagePct = contextBudgetChars > 0
+    ? Math.min(100, Math.max(0, Math.round((contextUsedChars / contextBudgetChars) * 100)))
+    : 0;
+  const latestAssistantMessageId = useMemo(() => {
+    if (!activeChat) return null;
+    for (let index = activeChat.messages.length - 1; index >= 0; index -= 1) {
+      if (activeChat.messages[index].role === 'assistant') return activeChat.messages[index].id;
+    }
+    return null;
+  }, [activeChat]);
+  const activityItemsToDisplay = useMemo(() => {
+    if (liveAgentMessageId && liveAgentActivities.length > 0) return liveAgentActivities;
+    return latestAssistantMessageId ? agentActivitiesByMessageId[latestAssistantMessageId] ?? [] : [];
+  }, [agentActivitiesByMessageId, latestAssistantMessageId, liveAgentActivities, liveAgentMessageId]);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUp = useRef(false);
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
@@ -527,6 +693,9 @@ export function ChatPane() {
       Object.fromEntries(Object.entries(prev).filter(([messageId]) => keepIds.has(messageId))),
     );
     setAgentThoughtsByMessageId((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([messageId]) => keepIds.has(messageId))),
+    );
+    setAgentActivitiesByMessageId((prev) =>
       Object.fromEntries(Object.entries(prev).filter(([messageId]) => keepIds.has(messageId))),
     );
   }, []);
@@ -1323,6 +1492,8 @@ export function ChatPane() {
       timestamp: Date.now(),
     };
     addMessage(chatId, assistantMsg);
+    setLiveAgentMessageId(assistantMsg.id);
+    setLiveAgentActivities([createThinkingActivity()]);
 
     setIsStreaming(true, chatId);
     abortReasonRef.current = null;
@@ -1348,6 +1519,7 @@ export function ChatPane() {
     let lastCompleteStreamedContent = '';
     const allActions: AgentAction[] = [];
     const allThoughts: string[] = [];
+    let turnActivities: AgentActivityItem[] = [createThinkingActivity()];
     // Each tool-using iteration overwrites the visible assistant message; remember the
     // superseded outputs so the UI can still show every earlier attempt.
     const priorAttempts: Array<{ content: string; createdAt: number }> = [];
@@ -1406,6 +1578,8 @@ export function ChatPane() {
 
 
         lastCompleteStreamedContent = streamedContent;
+        turnActivities = finalizeThinkingActivity(turnActivities, 'success', 'Response drafted');
+        setLiveAgentActivities(turnActivities);
 
         if (!isAgentMode) break;
         if (iter >= maxIter) break;
@@ -1432,6 +1606,10 @@ export function ChatPane() {
           onFileWritten: (path, content) => useAppStore.getState().syncEditorFileContent(path, content),
           onPathDeleted: (path) => useAppStore.getState().removeWorkspacePathReferences(path),
           onPathRenamed: (oldPath, newPath) => useAppStore.getState().renameWorkspacePathReferences(oldPath, newPath),
+          onAction: ({ phase, action }) => {
+            turnActivities = upsertAgentActivity(turnActivities, action, phase);
+            setLiveAgentActivities(turnActivities);
+          },
         });
         allActions.push(...actions);
 
@@ -1443,6 +1621,8 @@ export function ChatPane() {
         }
 
         if (actions.some((action) => action.type === 'edit' || action.type === 'write' || action.type === 'delete' || action.type === 'rename')) {
+          const mutationToast = summarizeMutationToast(actions);
+          if (mutationToast) toast.success(mutationToast);
           addPatchedPaths(
             actions.flatMap((action) => {
               if (!action.success) return [];
@@ -1472,9 +1652,11 @@ export function ChatPane() {
              content:
               'Tool results (inspect these results, then continue. If changes succeeded, summarize them briefly. If a tool failed, retry with corrected tool calls or explain the blocker. Do not output patch text for changes already applied by tools.):\n\n' +
               textFeedback,
-          },
-          { role: 'assistant', content: '' },
-        ];
+           },
+           { role: 'assistant', content: '' },
+         ];
+         turnActivities = [...turnActivities, createThinkingActivity()];
+         setLiveAgentActivities(turnActivities);
       }
 
       const finalChat = useAppStore.getState().chats.find((chat) => chat.id === chatId);
@@ -1498,6 +1680,12 @@ export function ChatPane() {
         }
       }
     } catch (err: unknown) {
+      turnActivities = finalizeThinkingActivity(
+        turnActivities,
+        'error',
+        abortReasonRef.current === 'user' ? 'Stopped by user' : 'Generation interrupted',
+      );
+      setLiveAgentActivities(turnActivities);
       const name = err instanceof Error ? err.name : '';
       if (name === 'AbortError') {
         // On manual stop, keep partial output silently. On stalled streams, auto-retry up to 2 times.
@@ -1557,6 +1745,12 @@ export function ChatPane() {
         toast.error('Local AI request failed');
       }
     } finally {
+      if (turnActivities.length > 0) {
+        setAgentActivitiesByMessageId((prev) => ({
+          ...prev,
+          [assistantMsg.id]: turnActivities,
+        }));
+      }
       
       if (allActions.length > 0) {
         setAgentActionsByMessageId((prev) => ({
@@ -1586,6 +1780,8 @@ export function ChatPane() {
       setAgentGatherStep(null);
       setIsStreaming(false);
       useAppStore.getState().setAgentStepProgress(0, 0);
+      setLiveAgentMessageId(null);
+      setLiveAgentActivities([]);
       abortRef.current = null;
       abortReasonRef.current = null;
     }
@@ -2252,6 +2448,17 @@ export function ChatPane() {
         )}
       </div>
 
+      <div className="border-b border-border/60 bg-background/40 px-3 py-2 backdrop-blur-sm sm:px-5">
+        <ContextBudgetCard
+          usedChars={contextUsedChars}
+          budgetChars={contextBudgetChars}
+          percent={contextUsagePct}
+          contextRefCount={activeContextRefs.length}
+          pendingMentionCount={mentionedFiles.length}
+          pendingImageCount={images.length}
+        />
+      </div>
+
       {activeChat && isLocked && (
         <div className="border-b border-border bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground sm:px-5">
           <div className="flex items-center gap-2">
@@ -2261,6 +2468,15 @@ export function ChatPane() {
               Only the owner can continue or edit it.
             </span>
           </div>
+        </div>
+      )}
+
+      {isAgent && activityItemsToDisplay.length > 0 && (
+        <div className="border-b border-border/60 bg-background/35 px-3 py-2 sm:px-5">
+          <AgentActivityPanel
+            items={activityItemsToDisplay}
+            active={isActiveChatStreaming && liveAgentMessageId !== null}
+          />
         </div>
       )}
 
@@ -2630,160 +2846,351 @@ export function ChatPane() {
         )}
       </div>
 
-      {/* Image previews */}
-      {images.length > 0 && (
-        <div className="flex gap-2 px-4 py-2 border-t border-border">
-          {images.map((img, i) => (
-            <div key={i} className="relative group">
-              <img src={img} alt="" className="h-16 rounded border border-border" />
-              <button
-                onClick={() => setImages(prev => prev.filter((_, j) => j !== i))}
-                className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center text-[10px] opacity-0 group-hover:opacity-100 transition-opacity"
-              >×</button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Mentioned files pills */}
-      {mentionedFiles.length > 0 && (
-        <div className="space-y-1 border-t border-border px-4 py-2">
-          <div className="text-[10px] text-muted-foreground">
-            Context ready: {mentionStats.files} file{mentionStats.files === 1 ? '' : 's'}
-            {mentionStats.folders > 0 ? `, ${mentionStats.folders} folder${mentionStats.folders === 1 ? '' : 's'} (${mentionStats.folderFiles} files)` : ''}
-            {mentionStats.stale > 0 ? `, ${mentionStats.stale} stale reference${mentionStats.stale === 1 ? '' : 's'} will be skipped` : ''}
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {mentionedFiles.map(filePath => {
-              const node = findMentionNode(fileTree, filePath);
-              const isFolder = node?.type === 'directory';
-              const label = node?.name ?? filePath.split('/').pop() ?? filePath;
-              return (
-                <span
-                  key={filePath}
-                  className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] animate-fade-in ${node
-                    ? 'border-primary/20 bg-primary/10 text-primary'
-                    : 'border-warning/30 bg-warning/10 text-warning'}`}
-                  title={node ? filePath : `${filePath} was not found in the current workspace tree`}
-                >
-                  {isFolder ? <FolderOpen className="w-3 h-3" /> : <FileCode className="w-3 h-3" />}
-                  <span className="max-w-[220px] truncate">{label}{isFolder ? '/' : ''}</span>
-                  <span className="hidden max-w-[280px] truncate text-[10px] opacity-70 sm:inline">{filePath}</span>
-                  <button
-                    onClick={() => removeMentionedFile(filePath)}
-                    className="ml-0.5 hover:text-destructive transition-colors"
-                    title={`Remove ${filePath}`}
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                </span>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
       {/* Input area */}
       <div
         data-evig-composer
         className="border-t border-border bg-card/90 p-3 shadow-[0_-8px_32px_hsl(var(--background)/0.45)] backdrop-blur-md sm:p-4"
       >
-        <p className="mb-2 hidden text-[11px] text-muted-foreground sm:block">
-          {isAgent
-            ? 'Describe what to build or fix : the agent will read and edit files directly.'
-            : 'Type a question or start a conversation.'}
-        </p>
-        <div className="relative flex items-end gap-2">
-          <button
-            type="button"
-            onClick={() => toggleDictation()}
-            disabled={!sttSupported || isStreaming || isLocked}
-            className={`shrink-0 rounded p-2 transition-colors hover:bg-secondary ${
-              dictating
-                ? 'bg-primary/15 text-primary ring-2 ring-primary/40'
-                : 'text-muted-foreground hover:text-foreground'
-            } disabled:cursor-not-allowed disabled:opacity-40`}
-            title={sttSupported ? (dictating ? 'Stop dictation' : 'Dictate (speech-to-text)') : 'Speech input not supported'}
-          >
-            <Mic className={`h-5 w-5 sm:h-4 sm:w-4 ${dictating ? 'animate-pulse' : ''}`} />
-          </button>
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isLocked}
-            className="shrink-0 rounded p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-            title="Attach image for vision"
-          >
-            <ImagePlus className="h-5 w-5 sm:h-4 sm:w-4" />
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/png,image/jpeg,image/webp"
-            multiple
-            className="hidden"
-            onChange={handleImageAttach}
-          />
-          <div className="relative min-w-0 flex-1">
-            <FileMentionPopover
-              fileTree={fileTree}
-              query={mentionQuery}
-              onSelect={handleMentionSelect}
-              onClose={() => { setShowMention(false); setMentionQuery(''); setMentionStartIdx(-1); }}
-              visible={showMention}
-            />
-            {selectionAttachment && (
-              <div className="mb-2 flex items-start gap-2 rounded-md border border-border/70 bg-muted/20 px-2.5 py-2 text-xs">
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                      Selection
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setSelectionAttachment(null)}
-                      className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-                      title="Remove selection"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
+        <div className="rounded-2xl border border-border/70 bg-background/75 shadow-[0_16px_50px_hsl(var(--background)/0.2)] backdrop-blur-xl">
+          {(selectionAttachment || images.length > 0 || mentionedFiles.length > 0) && (
+            <div className="space-y-3 border-b border-border/60 px-3 py-3">
+              {selectionAttachment && (
+                <div className="flex items-start gap-2 rounded-xl border border-border/70 bg-muted/25 px-3 py-2 text-xs">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                        Selection Reference
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setSelectionAttachment(null)}
+                        className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                        title="Remove selection"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                    <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-background/70 px-2 py-1.5 text-[12px] leading-relaxed text-muted-foreground">
+                      {selectionAttachment.text}
+                    </pre>
                   </div>
-                  <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-words rounded bg-background/60 px-2 py-1.5 text-[12px] leading-relaxed text-muted-foreground">
-                    {selectionAttachment.text}
-                  </pre>
                 </div>
-              </div>
-            )}
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={handleInputChange}
-              onKeyDown={handleKeyDown}
-              disabled={isLocked || isCondensingChat}
-              placeholder={isCondensingChat ? 'Summarizing… please wait' : isAgent ? 'Describe what to build, fix, or change… (@ file)' : 'Ask anything…'}
-              rows={2}
-              className="min-h-[56px] w-full resize-none rounded-lg border border-border/80 bg-input px-3 py-3 text-base leading-snug outline-none ring-2 ring-transparent transition-shadow placeholder:text-muted-foreground focus:border-primary/40 focus:ring-primary/30 sm:min-h-[48px] sm:py-2.5 sm:text-sm"
+              )}
+
+              {images.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    Attachments ({images.length})
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {images.map((img, i) => (
+                      <div key={i} className="group relative overflow-hidden rounded-xl border border-border/70 bg-card/70">
+                        <img src={img} alt="attachment preview" className="h-16 w-24 object-cover" />
+                        <button
+                          type="button"
+                          onClick={() => setImages((prev) => prev.filter((_, j) => j !== i))}
+                          className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-background/90 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:text-destructive"
+                          title="Remove attachment"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {mentionedFiles.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-[10px] text-muted-foreground">
+                    Context ready: {mentionStats.files} file{mentionStats.files === 1 ? '' : 's'}
+                    {mentionStats.folders > 0 ? `, ${mentionStats.folders} folder${mentionStats.folders === 1 ? '' : 's'} (${mentionStats.folderFiles} files)` : ''}
+                    {mentionStats.stale > 0 ? `, ${mentionStats.stale} stale reference${mentionStats.stale === 1 ? '' : 's'} will be skipped` : ''}
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {mentionedFiles.map((filePath) => {
+                      const node = findMentionNode(fileTree, filePath);
+                      const isFolder = node?.type === 'directory';
+                      const label = node?.name ?? filePath.split('/').pop() ?? filePath;
+                      return (
+                        <span
+                          key={filePath}
+                          className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] ${node
+                            ? 'border-primary/20 bg-primary/10 text-primary'
+                            : 'border-warning/30 bg-warning/10 text-warning'}`}
+                          title={node ? filePath : `${filePath} was not found in the current workspace tree`}
+                        >
+                          {isFolder ? <FolderOpen className="h-3 w-3" /> : <FileCode className="h-3 w-3" />}
+                          <span className="max-w-[180px] truncate">{label}{isFolder ? '/' : ''}</span>
+                          <button
+                            type="button"
+                            onClick={() => removeMentionedFile(filePath)}
+                            className="rounded-full text-current/70 transition-colors hover:text-destructive"
+                            title={`Remove ${filePath}`}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="relative flex items-end gap-2 p-2.5">
+            <button
+              type="button"
+              onClick={() => toggleDictation()}
+              disabled={!sttSupported || isStreaming || isLocked}
+              className={`shrink-0 rounded-xl p-2 transition-colors hover:bg-secondary ${
+                dictating
+                  ? 'bg-primary/15 text-primary ring-2 ring-primary/40'
+                  : 'text-muted-foreground hover:text-foreground'
+              } disabled:cursor-not-allowed disabled:opacity-40`}
+              title={sttSupported ? (dictating ? 'Stop dictation' : 'Dictate (speech-to-text)') : 'Speech input not supported'}
+            >
+              <Mic className={`h-5 w-5 sm:h-4 sm:w-4 ${dictating ? 'animate-pulse' : ''}`} />
+            </button>
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isLocked}
+              className="shrink-0 rounded-xl p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+              title="Attach image for vision"
+            >
+              <ImagePlus className="h-5 w-5 sm:h-4 sm:w-4" />
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              multiple
+              className="hidden"
+              onChange={handleImageAttach}
             />
+            <div className="relative min-w-0 flex-1">
+              <FileMentionPopover
+                fileTree={fileTree}
+                query={mentionQuery}
+                onSelect={handleMentionSelect}
+                onClose={() => { setShowMention(false); setMentionQuery(''); setMentionStartIdx(-1); }}
+                visible={showMention}
+              />
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={handleInputChange}
+                onKeyDown={handleKeyDown}
+                disabled={isLocked || isCondensingChat}
+                placeholder={isCondensingChat ? 'Summarizing… please wait' : isAgent ? 'Describe what to build, fix, or change… use @ to add files' : 'Ask anything…'}
+                rows={2}
+                className="min-h-[56px] w-full resize-none rounded-xl border border-transparent bg-transparent px-3 py-3 text-base leading-snug outline-none ring-2 ring-transparent transition-shadow placeholder:text-muted-foreground focus:border-primary/30 focus:bg-input/40 focus:ring-primary/20 sm:min-h-[48px] sm:py-2.5 sm:text-sm"
+              />
+            </div>
+            {isActiveChatStreaming ? (
+              <button
+                type="button"
+                onClick={handleStop}
+                className="shrink-0 rounded-xl bg-destructive/15 p-2.5 text-destructive transition-colors hover:bg-destructive/25 sm:p-2"
+              >
+                <StopCircle className="h-5 w-5 sm:h-4 sm:w-4" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleSend}
+                disabled={isLocked || isCondensingChat || (!input.trim() && images.length === 0 && !selectionAttachment)}
+                className="glow-primary shrink-0 rounded-xl bg-primary p-2.5 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30 sm:p-2"
+              >
+                <Send className="h-5 w-5 sm:h-4 sm:w-4" />
+              </button>
+            )}
           </div>
-          {isActiveChatStreaming ? (
-            <button
-              type="button"
-              onClick={handleStop}
-              className="shrink-0 rounded bg-destructive/20 p-2.5 text-destructive hover:bg-destructive/30 sm:p-2"
-            >
-              <StopCircle className="h-5 w-5 sm:h-4 sm:w-4" />
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={handleSend}
-              disabled={isLocked || isCondensingChat || (!input.trim() && images.length === 0 && mentionedFiles.length === 0 && !selectionAttachment)}
-              className="glow-primary shrink-0 rounded bg-primary p-2.5 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30 sm:p-2"
-            >
-              <Send className="h-5 w-5 sm:h-4 sm:w-4" />
-            </button>
+
+          <div className="flex items-center justify-between gap-2 border-t border-border/60 px-3 py-2 text-[11px] text-muted-foreground">
+            <span>
+              {isAgent
+                ? 'Agent mode can read and edit the active workspace directly.'
+                : 'Chat mode stays conversational until a workspace edit needs the agent.'}
+            </span>
+            <span className="shrink-0 rounded-full border border-border/60 bg-muted/25 px-2 py-0.5 text-[10px] uppercase tracking-wide">
+              {activeContextRefs.length} active ref{activeContextRefs.length === 1 ? '' : 's'}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const ACTIVITY_ICONS: Record<AgentActivityItem['kind'], ElementType> = {
+  thinking: Brain,
+  list: Search,
+  read: FileText,
+  edit: FileCode,
+  write: FileCode,
+  delete: X,
+  rename: FolderTree,
+};
+
+function AgentActivityPanel({
+  items,
+  active,
+}: {
+  items: AgentActivityItem[];
+  active: boolean;
+}) {
+  const [expanded, setExpanded] = useState(active);
+
+  useEffect(() => {
+    if (active) setExpanded(true);
+  }, [active]);
+
+  const total = items.length;
+  const runningCount = items.filter((item) => item.status === 'running').length;
+  const errorCount = items.filter((item) => item.status === 'error').length;
+  const latestItem = items[items.length - 1] ?? null;
+  const visibleItems = expanded ? items.slice(-4) : latestItem ? [latestItem] : [];
+
+  return (
+    <div className="rounded-2xl border border-border/70 bg-card/70 px-3 py-2 shadow-[0_10px_24px_hsl(var(--background)/0.1)] backdrop-blur-md">
+      <div className="flex items-center gap-2">
+        <div className="rounded-full bg-primary/10 p-1 text-primary">
+          <Brain className="h-3.5 w-3.5" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-semibold text-foreground">Agent Activity</span>
+            <span className="rounded-full border border-border/60 bg-background/60 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              {total} step{total === 1 ? '' : 's'}
+            </span>
+            {runningCount > 0 && (
+              <span className="rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">
+                {runningCount} running
+              </span>
+            )}
+            {errorCount > 0 && (
+              <span className="rounded-full border border-destructive/20 bg-destructive/10 px-1.5 py-0.5 text-[10px] text-destructive">
+                {errorCount} issue{errorCount === 1 ? '' : 's'}
+              </span>
+            )}
+          </div>
+          {!expanded && latestItem && (
+            <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+              {latestItem.title} · {latestItem.note ?? latestItem.detail}
+            </div>
           )}
         </div>
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/55 px-2 py-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+        >
+          {expanded ? 'Less' : 'More'}
+          {expanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+        </button>
+      </div>
+
+      <div className={`space-y-1.5 ${expanded ? 'mt-2' : 'mt-1'}`}>
+        {visibleItems.map((item) => {
+          const Icon = ACTIVITY_ICONS[item.kind] ?? FileCode;
+          const statusClass =
+            item.status === 'error'
+              ? 'border-destructive/20 bg-destructive/8 text-destructive'
+              : item.status === 'success'
+                ? 'border-primary/15 bg-primary/8 text-primary'
+                : 'border-border/70 bg-background/50 text-foreground';
+
+          return (
+            <div key={`${item.key}:${item.updatedAt}`} className={`flex items-start gap-2 rounded-xl border px-2.5 py-1.5 ${statusClass}`}>
+              <div className={`mt-0.5 rounded-full p-1 ${item.status === 'running' ? 'bg-primary/10 text-primary' : 'bg-background/70'}`}>
+                <Icon className={`h-3.5 w-3.5 ${item.status === 'running' ? 'animate-pulse' : ''}`} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[11px] font-medium text-foreground">{item.title}</span>
+                  <span className={`rounded-full px-1.5 py-0.5 text-[10px] uppercase tracking-wide ${
+                    item.status === 'error'
+                      ? 'bg-destructive/12 text-destructive'
+                      : item.status === 'success'
+                        ? 'bg-primary/12 text-primary'
+                        : 'bg-muted text-muted-foreground'
+                  }`}>
+                    {item.status}
+                  </span>
+                </div>
+                <div className="mt-0.5 truncate text-[10px] text-muted-foreground">{item.detail}</div>
+                {item.note && expanded && <div className="mt-1 text-[10px]">{item.note}</div>}
+              </div>
+            </div>
+          );
+        })}
+
+        {expanded && total > visibleItems.length && (
+          <div className="px-1 text-[10px] text-muted-foreground">
+            Showing the latest {visibleItems.length} steps.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ContextBudgetCard({
+  usedChars,
+  budgetChars,
+  percent,
+  contextRefCount,
+  pendingMentionCount,
+  pendingImageCount,
+}: {
+  usedChars: number;
+  budgetChars: number;
+  percent: number;
+  contextRefCount: number;
+  pendingMentionCount: number;
+  pendingImageCount: number;
+}) {
+  const tone =
+    percent >= 86
+      ? 'bg-destructive/70'
+      : percent >= 65
+        ? 'bg-amber-500/80'
+        : 'bg-primary/70';
+
+  const formatCompact = (value: number) => {
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+    if (value >= 1_000) return `${Math.round(value / 1_000)}k`;
+    return `${Math.round(value)}`;
+  };
+
+  return (
+    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0">
+        <div className="text-[11px] font-medium text-foreground">Active Context Budget</div>
+        <div className="text-[11px] text-muted-foreground">
+          {formatCompact(usedChars)} / {formatCompact(budgetChars)} chars in play with {contextRefCount} file reference{contextRefCount === 1 ? '' : 's'}.
+        </div>
+      </div>
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <div className="flex min-w-[180px] items-center gap-2 rounded-full border border-border/70 bg-background/55 px-2.5 py-1.5">
+          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+            <div className={`h-full ${tone}`} style={{ width: `${percent}%` }} />
+          </div>
+          <span className="text-[10px] font-semibold text-foreground">{percent}%</span>
+        </div>
+        {pendingMentionCount > 0 && (
+          <span className="rounded-full border border-primary/20 bg-primary/10 px-2 py-1 text-[10px] text-primary">
+            +{pendingMentionCount} pending mention{pendingMentionCount === 1 ? '' : 's'}
+          </span>
+        )}
+        {pendingImageCount > 0 && (
+          <span className="rounded-full border border-border/70 bg-background/55 px-2 py-1 text-[10px] text-muted-foreground">
+            {pendingImageCount} image{pendingImageCount === 1 ? '' : 's'} attached
+          </span>
+        )}
       </div>
     </div>
   );
