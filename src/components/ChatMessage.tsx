@@ -23,6 +23,7 @@ import {
   FolderOpen,
   FileSearch,
   Brain,
+  Eye,
   ChevronDown,
   ChevronUp,
 } from 'lucide-react';
