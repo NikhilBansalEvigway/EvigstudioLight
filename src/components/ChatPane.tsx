@@ -126,6 +126,13 @@ const AUTO_SUMMARY_HEADER = 'Conversation summary (auto-generated):';
 const AUTO_SUMMARY_FOOTER = 'Continue chatting with this summary as context.';
 const SUMMARY_TEMP = 0.1;
 const SUMMARY_MAX_TOKENS = 2048;
+const CONTEXT_MESSAGE_OVERHEAD_CHARS = 48;
+const CONTEXT_PENDING_IMAGE_CHARS = 8_000;
+const CONTEXT_PENDING_INPUT_OVERHEAD_CHARS = 512;
+const CONTEXT_FILE_EXPLICIT_MAX_CHARS = 60_000;
+const CONTEXT_FILE_FOLDER_MAX_CHARS = 20_000;
+const CONTEXT_FOLDER_SCAN_MAX_FILES = 300;
+const CONTEXT_FOLDER_LISTING_MAX_ENTRIES = 400;
 // Hard ceiling so a stalled local model can never leave the UI stuck on "Summarizing…".
 const SUMMARY_TIMEOUT_MS = 3 * 60_000;
 const INPUT_MIN_HEIGHT_PX = 56;
@@ -140,10 +147,25 @@ type AgentActivityItem = {
   note?: string;
   filePath?: string;
   updatedAt: number;
+  groupedItems?: AgentActivityItem[];
+};
+
+type ContextCleanupCandidate = {
+  key: string;
+  label: string;
+  detail: string;
+  chars: number;
+  remove: () => void;
 };
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function formatCompactChars(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}k`;
+  return `${Math.round(value)}`;
 }
 
 function getActionFilePath(action: AgentAction): string | null {
@@ -216,6 +238,52 @@ function buildActivityItem(action: AgentAction, phase: 'start' | 'finish'): Agen
   };
 }
 
+function isGroupableActivity(item: AgentActivityItem): boolean {
+  return item.kind === 'read' || item.kind === 'list';
+}
+
+function summarizeGroupedActivity(items: AgentActivityItem[]): AgentActivityItem {
+  const first = items[0];
+  const latest = items[items.length - 1];
+  const paths = items.map((item) => item.detail).filter(Boolean);
+  const sample = paths.slice(-2).join(', ');
+  const remaining = paths.length - Math.min(paths.length, 2);
+  const noun = first.kind === 'read' ? 'read' : 'listing';
+  const target = first.kind === 'read' ? 'file' : 'folder';
+  return {
+    ...latest,
+    key: `${first.key}:group:${items.length}`,
+    title: `${latest.status === 'running' ? 'Reading' : first.kind === 'read' ? 'Read' : 'Listed'} ${items.length} ${target}${items.length === 1 ? '' : 's'}`,
+    detail: remaining > 0 ? `${sample} +${remaining} more` : sample,
+    note: `${items.length} ${noun} step${items.length === 1 ? '' : 's'}`,
+    groupedItems: items,
+    filePath: undefined,
+    updatedAt: latest.updatedAt,
+  };
+}
+
+function groupAgentActivities(items: AgentActivityItem[]): AgentActivityItem[] {
+  const grouped: AgentActivityItem[] = [];
+  for (const item of items) {
+    const previous = grouped[grouped.length - 1];
+    const previousItems = previous?.groupedItems ?? [previous].filter(Boolean) as AgentActivityItem[];
+    const canMerge =
+      previous &&
+      isGroupableActivity(item) &&
+      isGroupableActivity(previous) &&
+      previous.kind === item.kind &&
+      previous.status === item.status;
+
+    if (canMerge) {
+      grouped[grouped.length - 1] = summarizeGroupedActivity([...previousItems, item]);
+      continue;
+    }
+
+    grouped.push(item);
+  }
+  return grouped;
+}
+
 function upsertAgentActivity(items: AgentActivityItem[], action: AgentAction, phase: 'start' | 'finish'): AgentActivityItem[] {
   const key = `${action.type}:${action.path}`;
   if (phase === 'start') {
@@ -252,7 +320,7 @@ export function ChatPane() {
   const {
     chats, activeChatId, createChat, addMessage, updateLastAssistantMessage, updateChatFields, saveVersionSnapshot,
     settings, contextFiles, fileTree, isStreaming, streamingChatId, setIsStreaming, workspaceRoots,
-    workspaceContextUsedChars, contextBudgetChars, contextUsedChars, activeFilePath,
+    workspaceContextUsedChars, contextBudgetChars, activeFilePath,
     serverContextRules,
     setHistoryContextUsage,
     setLinkedWorkspacePaths,
@@ -544,9 +612,6 @@ export function ChatPane() {
     () => [...new Set([...contextFiles, ...mentionedFiles])],
     [contextFiles, mentionedFiles],
   );
-  const contextUsagePct = contextBudgetChars > 0
-    ? Math.min(100, Math.max(0, Math.round((contextUsedChars / contextBudgetChars) * 100)))
-    : 0;
   const latestAssistantMessageId = useMemo(() => {
     if (!activeChat) return null;
     for (let index = activeChat.messages.length - 1; index >= 0; index -= 1) {
@@ -555,8 +620,10 @@ export function ChatPane() {
     return null;
   }, [activeChat]);
   const activityItemsToDisplay = useMemo(() => {
-    if (liveAgentMessageId && liveAgentActivities.length > 0) return liveAgentActivities;
-    return latestAssistantMessageId ? agentActivitiesByMessageId[latestAssistantMessageId] ?? [] : [];
+    const items = liveAgentMessageId && liveAgentActivities.length > 0
+      ? liveAgentActivities
+      : latestAssistantMessageId ? agentActivitiesByMessageId[latestAssistantMessageId] ?? [] : [];
+    return groupAgentActivities(items);
   }, [agentActivitiesByMessageId, latestAssistantMessageId, liveAgentActivities, liveAgentMessageId]);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUp = useRef(false);
@@ -708,16 +775,15 @@ export function ChatPane() {
 
   const formatCharCount = useCallback((value: number) => {
     const abs = Math.abs(value);
-    if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-    if (abs >= 1_000) return `${Math.round(value / 1_000)}k`;
-    return `${Math.round(value)}`;
+    const compact = formatCompactChars(abs);
+    return value < 0 ? `-${compact}` : compact;
   }, []);
 
   const estimateContextPressure = useCallback((messages: Message[], pendingText: string, pendingImageCount: number) => {
     const historyChars = messages
       .filter((m) => !m.excludedFromContext)
-      .reduce((sum, message) => sum + getMessageText(message).length + 48, 0);
-    const pendingChars = Math.max(0, pendingText.length) + Math.max(0, pendingImageCount) * 8_000 + 512;
+      .reduce((sum, message) => sum + getMessageText(message).length + CONTEXT_MESSAGE_OVERHEAD_CHARS, 0);
+    const pendingChars = Math.max(0, pendingText.length) + Math.max(0, pendingImageCount) * CONTEXT_PENDING_IMAGE_CHARS + CONTEXT_PENDING_INPUT_OVERHEAD_CHARS;
     const workspaceChars = Math.max(0, workspaceContextUsedChars || 0);
     const budgetChars = Math.max(10_000, contextBudgetChars || 200_000);
     const usedChars = historyChars + workspaceChars + pendingChars;
@@ -742,7 +808,7 @@ export function ChatPane() {
         : message.content
             .map((p) => (p.type === 'text' ? p.text : '[image]'))
             .join(' ');
-      return sum + content.length + 48;
+      return sum + content.length + CONTEXT_MESSAGE_OVERHEAD_CHARS;
     }, 0);
     const budgetChars = Math.max(10_000, contextBudgetChars || 200_000);
     const ratio = budgetChars > 0 ? usedChars / budgetChars : 0;
@@ -753,6 +819,112 @@ export function ChatPane() {
       shouldPrompt: ratio >= CONTEXT_WARNING_RATIO,
     };
   }, [contextBudgetChars]);
+
+  const estimateContextPathCost = useCallback(async (path: string) => {
+    const node = findMentionNode(fileTree, path);
+    if (node?.type === 'directory') {
+      const listingChars = Math.min(12_000, summarizeDirectory(node, CONTEXT_FOLDER_LISTING_MAX_ENTRIES).length + 96);
+      const fileCount = collectDirectoryFilePaths(node, CONTEXT_FOLDER_SCAN_MAX_FILES).length;
+      return listingChars + Math.min(CONTEXT_FILE_EXPLICIT_MAX_CHARS, fileCount * 3_500);
+    }
+
+    try {
+      const content = await readWorkspaceFile(workspaceRoots, path);
+      return Math.min(CONTEXT_FILE_EXPLICIT_MAX_CHARS, content.length) + 96;
+    } catch {
+      if (node?.type === 'file') return Math.min(CONTEXT_FILE_EXPLICIT_MAX_CHARS, 12_000);
+      try {
+        const listing = await listWorkspaceDirectoryContents(workspaceRoots, path);
+        return Math.min(12_000, listing.join('\n').length + 96) + Math.min(CONTEXT_FILE_EXPLICIT_MAX_CHARS, listing.length * 3_500);
+      } catch {
+        return 1_200;
+      }
+    }
+  }, [fileTree, workspaceRoots]);
+
+  const [contextPathCostEstimates, setContextPathCostEstimates] = useState<Record<string, number>>({});
+  const trackedContextPaths = useMemo(() => [...new Set([...contextFiles, ...mentionedFiles])], [contextFiles, mentionedFiles]);
+
+  useEffect(() => {
+    if (trackedContextPaths.length === 0) {
+      setContextPathCostEstimates({});
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const entries = await Promise.all(
+        trackedContextPaths.map(async (path) => [path, await estimateContextPathCost(path)] as const),
+      );
+      if (cancelled) return;
+      setContextPathCostEstimates(Object.fromEntries(entries));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [estimateContextPathCost, trackedContextPaths]);
+
+  const getApproxContextPathCost = useCallback((path: string, isDirectory = false) => {
+    const estimated = contextPathCostEstimates[path];
+    if (typeof estimated === 'number' && estimated > 0) return estimated;
+    return isDirectory ? 18_000 : 12_000;
+  }, [contextPathCostEstimates]);
+
+  const contextCleanupSuggestions = useMemo<ContextCleanupCandidate[]>(() => {
+    const suggestions: ContextCleanupCandidate[] = [];
+
+    mentionedFiles.forEach((path) => {
+      const node = findMentionNode(fileTree, path);
+      const label = node?.name ?? path.split('/').pop() ?? path;
+      suggestions.push({
+        key: `mention:${path}`,
+        label: `${label}${node?.type === 'directory' ? '/' : ''}`,
+        detail: contextFiles.includes(path) ? 'Remove from current turn and injected context' : 'Remove from current turn',
+        chars: getApproxContextPathCost(path, node?.type === 'directory'),
+        remove: () => {
+          setMentionedFiles((prev) => prev.filter((entry) => entry !== path));
+          if (useAppStore.getState().contextFiles.includes(path)) {
+            useAppStore.getState().toggleContextFile(path);
+          }
+        },
+      });
+    });
+
+    contextFiles
+      .filter((path) => !mentionedFiles.includes(path))
+      .forEach((path) => {
+        const node = findMentionNode(fileTree, path);
+        const label = node?.name ?? path.split('/').pop() ?? path;
+        suggestions.push({
+          key: `context:${path}`,
+          label: `${label}${node?.type === 'directory' ? '/' : ''}`,
+          detail: 'Remove from injected context',
+          chars: getApproxContextPathCost(path, node?.type === 'directory'),
+          remove: () => useAppStore.getState().toggleContextFile(path),
+        });
+      });
+
+    images.forEach((_, index) => {
+      suggestions.push({
+        key: `image:${index}`,
+        label: `Image ${index + 1}`,
+        detail: 'Remove attachment',
+        chars: CONTEXT_PENDING_IMAGE_CHARS,
+        remove: () => setImages((prev) => prev.filter((__, i) => i !== index)),
+      });
+    });
+
+    if (selectionAttachment?.text?.trim()) {
+      suggestions.push({
+        key: 'selection',
+        label: 'Selection reference',
+        detail: 'Remove quoted message selection',
+        chars: selectionAttachment.text.length + 96,
+        remove: () => setSelectionAttachment(null),
+      });
+    }
+
+    return suggestions.sort((a, b) => b.chars - a.chars).slice(0, 4);
+  }, [contextFiles, fileTree, getApproxContextPathCost, images, mentionedFiles, selectionAttachment]);
 
   const isContextLengthError = useCallback((msg: string) => {
     const t = msg.toLowerCase();
@@ -930,11 +1102,11 @@ export function ChatPane() {
     );
     const MAX_TREE_CHARS = Math.min(16_000, Math.floor(WORKSPACE_CONTEXT_LIMIT * 0.4));
     const MAX_FILE_CHARS_AUTO = 2_000;
-    const MAX_FILE_CHARS_EXPLICIT = 60_000;
+    const MAX_FILE_CHARS_EXPLICIT = CONTEXT_FILE_EXPLICIT_MAX_CHARS;
    
-    const MAX_FILE_CHARS_FOLDER = 20_000;
-    const MAX_FOLDER_FILES_SCAN = 300;
-    const MAX_FOLDER_LISTING_ENTRIES = 400;
+    const MAX_FILE_CHARS_FOLDER = CONTEXT_FILE_FOLDER_MAX_CHARS;
+    const MAX_FOLDER_FILES_SCAN = CONTEXT_FOLDER_SCAN_MAX_FILES;
+    const MAX_FOLDER_LISTING_ENTRIES = CONTEXT_FOLDER_LISTING_MAX_ENTRIES;
 
     const truncate = (content: string, maxChars: number) => ({
       text: content.length > maxChars ? `${content.slice(0, maxChars)}\n\n... [truncated]` : content,
@@ -2447,18 +2619,6 @@ export function ChatPane() {
           />
         )}
       </div>
-
-      <div className="border-b border-border/60 bg-background/40 px-3 py-2 backdrop-blur-sm sm:px-5">
-        <ContextBudgetCard
-          usedChars={contextUsedChars}
-          budgetChars={contextBudgetChars}
-          percent={contextUsagePct}
-          contextRefCount={activeContextRefs.length}
-          pendingMentionCount={mentionedFiles.length}
-          pendingImageCount={images.length}
-        />
-      </div>
-
       {activeChat && isLocked && (
         <div className="border-b border-border bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground sm:px-5">
           <div className="flex items-center gap-2">
@@ -2476,6 +2636,7 @@ export function ChatPane() {
           <AgentActivityPanel
             items={activityItemsToDisplay}
             active={isActiveChatStreaming && liveAgentMessageId !== null}
+            onOpenFile={handleOpenEditorFile}
           />
         </div>
       )}
@@ -2519,6 +2680,30 @@ export function ChatPane() {
               </div>
               <div className="mt-1 text-[11px]">
                 Usage: {Math.round(contextPressure.ratio * 100)}%
+              </div>
+            </div>
+          )}
+
+          {contextCleanupSuggestions.length > 0 && (
+            <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2">
+              <div className="text-xs font-medium text-foreground">Suggested cleanup</div>
+              <div className="mt-2 space-y-2">
+                {contextCleanupSuggestions.map((suggestion) => (
+                  <div key={suggestion.key} className="flex items-center justify-between gap-2 rounded-md border border-border/60 bg-muted/20 px-2.5 py-2 text-xs">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="truncate font-medium text-foreground">{suggestion.label}</span>
+                        <span className="shrink-0 rounded-full border border-border/60 bg-background/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                          ~{formatCompactChars(suggestion.chars)}
+                        </span>
+                      </div>
+                      <div className="truncate text-[11px] text-muted-foreground">{suggestion.detail}</div>
+                    </div>
+                    <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-[11px]" onClick={suggestion.remove}>
+                      Remove
+                    </Button>
+                  </div>
+                ))}
               </div>
             </div>
           )}
@@ -2886,6 +3071,9 @@ export function ChatPane() {
                     {images.map((img, i) => (
                       <div key={i} className="group relative overflow-hidden rounded-xl border border-border/70 bg-card/70">
                         <img src={img} alt="attachment preview" className="h-16 w-24 object-cover" />
+                        <div className="pointer-events-none absolute bottom-1 left-1 rounded-full border border-border/60 bg-background/90 px-1.5 py-0.5 text-[10px] text-muted-foreground shadow-sm">
+                          ~{formatCompactChars(CONTEXT_PENDING_IMAGE_CHARS)}
+                        </div>
                         <button
                           type="button"
                           onClick={() => setImages((prev) => prev.filter((_, j) => j !== i))}
@@ -2922,6 +3110,9 @@ export function ChatPane() {
                         >
                           {isFolder ? <FolderOpen className="h-3 w-3" /> : <FileCode className="h-3 w-3" />}
                           <span className="max-w-[180px] truncate">{label}{isFolder ? '/' : ''}</span>
+                          <span className="rounded-full border border-current/15 bg-background/55 px-1.5 py-0.5 text-[10px] text-current/80">
+                            ~{formatCompactChars(getApproxContextPathCost(filePath, isFolder))}
+                          </span>
                           <button
                             type="button"
                             onClick={() => removeMentionedFile(filePath)}
@@ -3038,19 +3229,23 @@ const ACTIVITY_ICONS: Record<AgentActivityItem['kind'], ElementType> = {
 function AgentActivityPanel({
   items,
   active,
+  onOpenFile,
 }: {
   items: AgentActivityItem[];
   active: boolean;
+  onOpenFile?: (filePath: string) => void | Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(active);
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     if (active) setExpanded(true);
   }, [active]);
 
-  const total = items.length;
-  const runningCount = items.filter((item) => item.status === 'running').length;
-  const errorCount = items.filter((item) => item.status === 'error').length;
+  const countSteps = (item: AgentActivityItem) => item.groupedItems?.length ?? 1;
+  const total = items.reduce((sum, item) => sum + countSteps(item), 0);
+  const runningCount = items.reduce((sum, item) => sum + (item.status === 'running' ? countSteps(item) : 0), 0);
+  const errorCount = items.reduce((sum, item) => sum + (item.status === 'error' ? countSteps(item) : 0), 0);
   const latestItem = items[items.length - 1] ?? null;
   const visibleItems = expanded ? items.slice(-4) : latestItem ? [latestItem] : [];
 
@@ -3096,6 +3291,10 @@ function AgentActivityPanel({
       <div className={`space-y-1.5 ${expanded ? 'mt-2' : 'mt-1'}`}>
         {visibleItems.map((item) => {
           const Icon = ACTIVITY_ICONS[item.kind] ?? FileCode;
+          const groupedItems = item.groupedItems ?? [];
+          const hasGroupedItems = groupedItems.length > 1;
+          const groupExpanded = expandedGroups[item.key] ?? false;
+          const canOpen = Boolean(item.filePath && onOpenFile);
           const statusClass =
             item.status === 'error'
               ? 'border-destructive/20 bg-destructive/8 text-destructive'
@@ -3110,7 +3309,18 @@ function AgentActivityPanel({
               </div>
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-[11px] font-medium text-foreground">{item.title}</span>
+                  {canOpen ? (
+                    <button
+                      type="button"
+                      onClick={() => { void onOpenFile?.(item.filePath!); }}
+                      className="truncate text-left text-[11px] font-medium text-foreground underline-offset-2 hover:underline"
+                      title={`Open ${item.filePath}`}
+                    >
+                      {item.title}
+                    </button>
+                  ) : (
+                    <span className="text-[11px] font-medium text-foreground">{item.title}</span>
+                  )}
                   <span className={`rounded-full px-1.5 py-0.5 text-[10px] uppercase tracking-wide ${
                     item.status === 'error'
                       ? 'bg-destructive/12 text-destructive'
@@ -3120,9 +3330,42 @@ function AgentActivityPanel({
                   }`}>
                     {item.status}
                   </span>
+                  {hasGroupedItems && (
+                    <button
+                      type="button"
+                      onClick={() => setExpandedGroups((prev) => ({ ...prev, [item.key]: !groupExpanded }))}
+                      className="rounded-full border border-border/60 bg-background/55 px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      {groupExpanded ? 'Hide details' : 'Show details'}
+                    </button>
+                  )}
                 </div>
                 <div className="mt-0.5 truncate text-[10px] text-muted-foreground">{item.detail}</div>
                 {item.note && expanded && <div className="mt-1 text-[10px]">{item.note}</div>}
+                {expanded && hasGroupedItems && groupExpanded && (
+                  <div className="mt-2 space-y-1 rounded-lg border border-border/50 bg-background/45 p-2">
+                    {groupedItems.map((groupedItem) => {
+                      const childCanOpen = Boolean(groupedItem.filePath && onOpenFile);
+                      return (
+                        <div key={`${groupedItem.key}:${groupedItem.updatedAt}`} className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                          {childCanOpen ? (
+                            <button
+                              type="button"
+                              onClick={() => { void onOpenFile?.(groupedItem.filePath!); }}
+                              className="truncate text-left underline-offset-2 hover:text-foreground hover:underline"
+                              title={`Open ${groupedItem.filePath}`}
+                            >
+                              {groupedItem.detail}
+                            </button>
+                          ) : (
+                            <span className="truncate">{groupedItem.detail}</span>
+                          )}
+                          <span className="shrink-0">{groupedItem.note}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             </div>
           );
@@ -3132,64 +3375,6 @@ function AgentActivityPanel({
           <div className="px-1 text-[10px] text-muted-foreground">
             Showing the latest {visibleItems.length} steps.
           </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ContextBudgetCard({
-  usedChars,
-  budgetChars,
-  percent,
-  contextRefCount,
-  pendingMentionCount,
-  pendingImageCount,
-}: {
-  usedChars: number;
-  budgetChars: number;
-  percent: number;
-  contextRefCount: number;
-  pendingMentionCount: number;
-  pendingImageCount: number;
-}) {
-  const tone =
-    percent >= 86
-      ? 'bg-destructive/70'
-      : percent >= 65
-        ? 'bg-amber-500/80'
-        : 'bg-primary/70';
-
-  const formatCompact = (value: number) => {
-    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-    if (value >= 1_000) return `${Math.round(value / 1_000)}k`;
-    return `${Math.round(value)}`;
-  };
-
-  return (
-    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-      <div className="min-w-0">
-        <div className="text-[11px] font-medium text-foreground">Active Context Budget</div>
-        <div className="text-[11px] text-muted-foreground">
-          {formatCompact(usedChars)} / {formatCompact(budgetChars)} chars in play with {contextRefCount} file reference{contextRefCount === 1 ? '' : 's'}.
-        </div>
-      </div>
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <div className="flex min-w-[180px] items-center gap-2 rounded-full border border-border/70 bg-background/55 px-2.5 py-1.5">
-          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
-            <div className={`h-full ${tone}`} style={{ width: `${percent}%` }} />
-          </div>
-          <span className="text-[10px] font-semibold text-foreground">{percent}%</span>
-        </div>
-        {pendingMentionCount > 0 && (
-          <span className="rounded-full border border-primary/20 bg-primary/10 px-2 py-1 text-[10px] text-primary">
-            +{pendingMentionCount} pending mention{pendingMentionCount === 1 ? '' : 's'}
-          </span>
-        )}
-        {pendingImageCount > 0 && (
-          <span className="rounded-full border border-border/70 bg-background/55 px-2 py-1 text-[10px] text-muted-foreground">
-            {pendingImageCount} image{pendingImageCount === 1 ? '' : 's'} attached
-          </span>
         )}
       </div>
     </div>

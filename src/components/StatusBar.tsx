@@ -106,6 +106,7 @@ export function StatusBar() {
   const safeUsed = Math.max(0, contextUsedChars || 0);
   const remaining = Math.max(0, safeBudget - safeUsed);
   const ctxPct = safeBudget > 0 ? Math.min(100, Math.max(0, Math.round((safeUsed / safeBudget) * 100))) : 0;
+  const ctxTone = ctxPct >= 86 ? 'bg-destructive/80' : ctxPct >= 65 ? 'bg-amber-500/80' : 'bg-primary/70';
 
   return (
     <header className={`flex h-10 min-h-10 shrink-0 items-center justify-between gap-2 border-b border-border/80 px-2 shadow-[0_10px_30px_hsl(var(--background)/0.12)] sm:px-3 ${hasBackground ? 'bg-card/72 backdrop-blur-xl' : 'bg-card/96 backdrop-blur-md'}`}>
@@ -143,13 +144,18 @@ export function StatusBar() {
             <div className="flex items-center gap-2 rounded-full border border-border/70 bg-muted/20 px-2 py-1">
               <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Ctx</span>
               <div className="h-1 w-12 sm:w-16 overflow-hidden rounded-full bg-muted">
-                <div className="h-full bg-primary/70" style={{ width: `${ctxPct}%` }} />
+                <div className={`h-full ${ctxTone}`} style={{ width: `${ctxPct}%` }} />
               </div>
-              <span className="hidden md:inline text-[10px] font-medium text-muted-foreground">{formatChars(remaining)} left</span>
+              <span className="hidden md:inline text-[10px] font-medium text-muted-foreground">
+                {ctxPct}% used
+              </span>
+              <span className="hidden lg:inline text-[10px] text-muted-foreground">
+                {formatChars(remaining)} left
+              </span>
             </div>
           </TooltipTrigger>
           <TooltipContent side="bottom" className="max-w-[260px]">
-            Context budget (chars): {formatChars(safeUsed)} used / {formatChars(safeBudget)} total.
+            Context budget: {formatChars(safeUsed)} used / {formatChars(safeBudget)} total ({ctxPct}% used, {formatChars(remaining)} left).
           </TooltipContent>
         </Tooltip>
 

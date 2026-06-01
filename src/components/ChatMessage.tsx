@@ -30,6 +30,10 @@ import {
 import { useState, useCallback, useEffect, useLayoutEffect, useRef, memo } from 'react';
 import { MessageTtsBar } from '@/components/MessageTtsBar';
 
+const WORKSPACE_FILE_SCHEME = 'evig-workspace-file://';
+const PROTECTED_MARKDOWN_SEGMENTS_RE = /(```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$[^$\n]+\$|!\[[^\]]*\]\([^\n)]+\)|\[[^\]]+\]\([^\n)]+\)|<https?:\/\/[^>\s]+>|https?:\/\/[^\s<]+|www\.[^\s<]+)/g;
+const WORKSPACE_PATH_RE = /(^|[^\w/@.-])((?:\.{1,2}\/)?(?:[A-Za-z0-9_@-]+\/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)(?=$|[\s),.:;!?\]])/g;
+
 function preprocessLatex(text: string): string {
 
   const protectedRe = /(```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$[^$\n]+\$)/g;
@@ -226,6 +230,19 @@ function normalizeHtmlCodeBlocks(text: string): string {
   return result;
 }
 
+function linkWorkspacePaths(text: string): string {
+  const parts = text.split(PROTECTED_MARKDOWN_SEGMENTS_RE);
+  return parts
+    .map((part, idx) => {
+      if (idx % 2 === 1) return part;
+      return part.replace(WORKSPACE_PATH_RE, (_match, prefix: string, filePath: string) => {
+        const encodedPath = encodeURIComponent(filePath);
+        return `${prefix}[${filePath}](${WORKSPACE_FILE_SCHEME}${encodedPath})`;
+      });
+    })
+    .join('');
+}
+
 function stripResidualThinkTags(text: string): string {
   const TAG = 'think(?:ing)?|reasoning|thought|reflection|internal_thought';
   return text
@@ -236,13 +253,15 @@ function stripResidualThinkTags(text: string): string {
 
 
 export function processMarkdown(text: string): string {
-  return normalizeHtmlCodeBlocks(
-    normalizeLatexSymbols(
-      preprocessLatex(
-        // Strip leaked channel/harmony tokens, repair malformed/stray code fences, then
-        // recover any remaining unfenced code into proper code blocks.
-        wrapLooseCodeBlocks(
-          repairCodeFences(stripResidualThinkTags(stripChannelTokens(text))),
+  return linkWorkspacePaths(
+    normalizeHtmlCodeBlocks(
+      normalizeLatexSymbols(
+        preprocessLatex(
+          // Strip leaked channel/harmony tokens, repair malformed/stray code fences, then
+          // recover any remaining unfenced code into proper code blocks.
+          wrapLooseCodeBlocks(
+            repairCodeFences(stripResidualThinkTags(stripChannelTokens(text))),
+          ),
         ),
       ),
     ),
@@ -254,6 +273,14 @@ function cleanAssistantText(raw: string): string {
   const normalized = normalizeToolMarkerLineBreaks(raw);
   const { rest } = extractThinkingBlocks(normalized);
   return stripToolMarkers(rest);
+}
+
+function isWorkspaceFileHref(href?: string): href is `${typeof WORKSPACE_FILE_SCHEME}${string}` {
+  return typeof href === 'string' && href.startsWith(WORKSPACE_FILE_SCHEME);
+}
+
+function decodeWorkspaceFileHref(href: `${typeof WORKSPACE_FILE_SCHEME}${string}`): string {
+  return decodeURIComponent(href.slice(WORKSPACE_FILE_SCHEME.length));
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +509,31 @@ function ChatMessageImpl({
     }
   }, [message.id, onRegenerate]);
 
+  const renderMarkdownLink = useCallback((href: string | undefined, children: React.ReactNode) => {
+    if (isWorkspaceFileHref(href)) {
+      const filePath = decodeWorkspaceFileHref(href);
+      const isOpenable = !!onOpenFile;
+      return (
+        <button
+          type="button"
+          onClick={() => onOpenFile?.(filePath)}
+          disabled={!isOpenable}
+          title={isOpenable ? `Open ${filePath}` : filePath}
+          className="mx-0.5 inline-flex max-w-full translate-y-[-0.02em] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-2 py-0.5 align-baseline text-[0.8em] font-medium text-primary no-underline transition-colors hover:bg-primary/15 disabled:cursor-default disabled:hover:bg-primary/10"
+        >
+          <FileCode className="h-3 w-3 shrink-0" />
+          <span className="truncate">{children}</span>
+        </button>
+      );
+    }
+
+    return (
+      <a href={href} target="_blank" rel="noreferrer">
+        {children}
+      </a>
+    );
+  }, [onOpenFile]);
+
   return (
     <div className={`group flex gap-3 animate-fade-in ${message.role === 'user' ? 'justify-end' : ''}`}>
       {message.role === 'assistant' && (
@@ -541,7 +593,13 @@ function ChatMessageImpl({
             </button>
             {showThinking && (
               <div className="border-t border-border/50 bg-background/20 px-3 py-2.5 text-[12px] leading-relaxed text-muted-foreground prose prose-sm max-w-none dark:prose-invert">
-                <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}>
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm, remarkMath]}
+                  rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
+                  components={{
+                    a: ({ href, children }) => renderMarkdownLink(href, children),
+                  }}
+                >
                   {processMarkdown(stripToolMarkers(effectiveThinkingContent))}
                 </ReactMarkdown>
               </div>
@@ -550,7 +608,7 @@ function ChatMessageImpl({
         )}
 
         {hasPriorAttempts && message.role === 'assistant' && (
-          <PreviousAttempts attempts={priorAttempts} />
+          <PreviousAttempts attempts={priorAttempts} renderMarkdownLink={renderMarkdownLink} />
         )}
 
         {hasPriorAttempts && message.role === 'assistant' && !isEditing && displayText.trim().length > 0 && (
@@ -655,6 +713,7 @@ function ChatMessageImpl({
                     }
                     return <code className={className}>{children}</code>;
                   },
+                  a: ({ href, children }) => renderMarkdownLink(href, children),
                 }}
               >
                 {summaryBody ?? markdownToRender}
@@ -894,8 +953,10 @@ function AgentActionBadge({ action, onOpenFile }: { action: AgentAction; onOpenF
 
 function PreviousAttempts({
   attempts,
+  renderMarkdownLink,
 }: {
   attempts: NonNullable<Message['meta']>['attempts'];
+  renderMarkdownLink: (href: string | undefined, children: React.ReactNode) => React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const items = attempts ?? [];
@@ -932,6 +993,9 @@ function PreviousAttempts({
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm, remarkMath]}
                       rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
+                      components={{
+                        a: ({ href, children }) => renderMarkdownLink(href, children),
+                      }}
                     >
                       {body}
                     </ReactMarkdown>
