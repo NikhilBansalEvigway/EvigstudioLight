@@ -52,8 +52,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       }
     } catch {
-      // Network/server error: treat as server down, but don't force a relogin.
-      setServerAvailable(false);
+      // Network/server error: don't change serverAvailable here — the health poller
+     
     }
   }, []);
 
@@ -79,6 +79,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!ready) return;
     let cancelled = false;
     let delay = 8_000;
+    let pendingTimer: number | null = null;
 
     const tick = async () => {
       if (cancelled) return;
@@ -92,12 +93,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setServerAvailable(false);
         delay = Math.min(60_000, Math.round(delay * 1.6));
       }
-      window.setTimeout(tick, delay);
+      if (!cancelled) {
+        pendingTimer = window.setTimeout(tick, delay);
+      }
     };
 
-    window.setTimeout(tick, delay);
+   
+    const onReconnect = () => {
+      if (cancelled) return;
+      if (pendingTimer != null) {
+        window.clearTimeout(pendingTimer);
+        pendingTimer = null;
+      }
+      delay = 8_000;
+      void tick();
+    };
+
+    window.addEventListener('online', onReconnect);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') onReconnect();
+    });
+
+    pendingTimer = window.setTimeout(tick, delay);
     return () => {
       cancelled = true;
+      if (pendingTimer != null) window.clearTimeout(pendingTimer);
+      window.removeEventListener('online', onReconnect);
     };
   }, [ready]);
 

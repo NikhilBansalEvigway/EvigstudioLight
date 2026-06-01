@@ -1,10 +1,12 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
 import rehypeHighlight from 'rehype-highlight';
+import rehypeKatex from 'rehype-katex';
 import type { Message, ParsedPatch, ChatMode } from '@/types';
 import { getMessageText, getImages, hasImages } from '@/types';
-import { applyPatch, containsPatches, parsePatches } from '@/lib/patchApply';
-import { stripThinkingBlocks, stripToolMarkers, type AgentAction } from '@/lib/agentTools';
+import { containsPatches, parsePatches } from '@/lib/patchApply';
+import { extractThinkingBlocks, stripToolMarkers, stripChannelTokens, wrapLooseCodeBlocks, repairCodeFences, normalizeToolMarkerLineBreaks, type AgentAction } from '@/lib/agentTools';
 import {
   Copy,
   Check,
@@ -15,17 +17,245 @@ import {
   Loader2,
   FileCode,
   Play,
-  Eye,
-  FilePlus,
   FileEdit,
   Trash2,
   ArrowRightLeft,
   FolderOpen,
   FileSearch,
+  Brain,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { useState, useCallback, useEffect, useLayoutEffect, useRef, memo } from 'react';
-import { DiffViewer } from '@/components/DiffViewer';
 import { MessageTtsBar } from '@/components/MessageTtsBar';
+
+function preprocessLatex(text: string): string {
+
+  const protectedRe = /(```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$[^$\n]+\$)/g;
+  const parts = text.split(protectedRe);
+  return parts
+    .map((part, idx) => {
+      if (idx % 2 === 1) return part;
+    
+      let result = part.replace(/\\\[([\s\S]*?)\\\]/g, (_m, inner) => `$$${inner}$$`);
+
+      result = result.replace(/\\\(([\s\S]*?)\\\)/g, (_m, inner) => `$${inner}$`);
+      return result;
+    })
+    .join('');
+}
+
+
+// LaTeX command -> Unicode fallback. Used both for non-math prose and as a
+// best-effort renderer inside inline-code chips (where KaTeX cannot run).
+// Word boundaries (\b) keep longer commands from being clobbered by shorter
+// prefixes (e.g. \leftrightarrow is never partially matched by \le).
+const LATEX_SYMBOL_MAP: Array<[RegExp, string]> = [
+  // Arrows
+  [/\\rightarrow\b/g, '→'],
+  [/\\longrightarrow\b/g, '⟶'],
+  [/\\to\b/g, '→'],
+  [/\\Rightarrow\b/g, '⇒'],
+  [/\\implies\b/g, '⇒'],
+  [/\\Longrightarrow\b/g, '⟹'],
+  [/\\leftarrow\b/g, '←'],
+  [/\\longleftarrow\b/g, '⟵'],
+  [/\\Leftarrow\b/g, '⇐'],
+  [/\\gets\b/g, '←'],
+  [/\\leftrightarrow\b/g, '↔'],
+  [/\\Leftrightarrow\b/g, '⇔'],
+  [/\\iff\b/g, '⇔'],
+  [/\\uparrow\b/g, '↑'],
+  [/\\downarrow\b/g, '↓'],
+  [/\\updownarrow\b/g, '↕'],
+  [/\\mapsto\b/g, '↦'],
+  [/\\hookrightarrow\b/g, '↪'],
+  // Relations
+  [/\\leq\b/g, '≤'],
+  [/\\le\b/g, '≤'],
+  [/\\geq\b/g, '≥'],
+  [/\\ge\b/g, '≥'],
+  [/\\neq\b/g, '≠'],
+  [/\\ne\b/g, '≠'],
+  [/\\approx\b/g, '≈'],
+  [/\\equiv\b/g, '≡'],
+  [/\\sim\b/g, '∼'],
+  [/\\cong\b/g, '≅'],
+  [/\\propto\b/g, '∝'],
+  [/\\subseteq\b/g, '⊆'],
+  [/\\subset\b/g, '⊂'],
+  [/\\supseteq\b/g, '⊇'],
+  [/\\supset\b/g, '⊃'],
+  [/\\in\b/g, '∈'],
+  [/\\notin\b/g, '∉'],
+  [/\\ni\b/g, '∋'],
+  // Operators & symbols
+  [/\\times\b/g, '×'],
+  [/\\div\b/g, '÷'],
+  [/\\cdot\b/g, '·'],
+  [/\\ast\b/g, '∗'],
+  [/\\pm\b/g, '±'],
+  [/\\mp\b/g, '∓'],
+  [/\\cup\b/g, '∪'],
+  [/\\cap\b/g, '∩'],
+  [/\\setminus\b/g, '∖'],
+  [/\\emptyset\b/g, '∅'],
+  [/\\varnothing\b/g, '∅'],
+  [/\\infty\b/g, '∞'],
+  [/\\partial\b/g, '∂'],
+  [/\\nabla\b/g, '∇'],
+  [/\\sum\b/g, '∑'],
+  [/\\prod\b/g, '∏'],
+  [/\\int\b/g, '∫'],
+  [/\\sqrt\b/g, '√'],
+  [/\\forall\b/g, '∀'],
+  [/\\exists\b/g, '∃'],
+  [/\\neg\b/g, '¬'],
+  [/\\land\b/g, '∧'],
+  [/\\wedge\b/g, '∧'],
+  [/\\lor\b/g, '∨'],
+  [/\\vee\b/g, '∨'],
+  [/\\oplus\b/g, '⊕'],
+  [/\\otimes\b/g, '⊗'],
+  [/\\circ\b/g, '∘'],
+  [/\\bullet\b/g, '•'],
+  [/\\angle\b/g, '∠'],
+  [/\\degree\b/g, '°'],
+  [/\\prime\b/g, '′'],
+  [/\\dots\b/g, '…'],
+  [/\\ldots\b/g, '…'],
+  [/\\cdots\b/g, '⋯'],
+  // Greek (lowercase)
+  [/\\alpha\b/g, 'α'],
+  [/\\beta\b/g, 'β'],
+  [/\\gamma\b/g, 'γ'],
+  [/\\delta\b/g, 'δ'],
+  [/\\epsilon\b/g, 'ε'],
+  [/\\varepsilon\b/g, 'ε'],
+  [/\\zeta\b/g, 'ζ'],
+  [/\\eta\b/g, 'η'],
+  [/\\theta\b/g, 'θ'],
+  [/\\iota\b/g, 'ι'],
+  [/\\kappa\b/g, 'κ'],
+  [/\\lambda\b/g, 'λ'],
+  [/\\mu\b/g, 'μ'],
+  [/\\nu\b/g, 'ν'],
+  [/\\xi\b/g, 'ξ'],
+  [/\\pi\b/g, 'π'],
+  [/\\rho\b/g, 'ρ'],
+  [/\\sigma\b/g, 'σ'],
+  [/\\tau\b/g, 'τ'],
+  [/\\upsilon\b/g, 'υ'],
+  [/\\phi\b/g, 'φ'],
+  [/\\varphi\b/g, 'φ'],
+  [/\\chi\b/g, 'χ'],
+  [/\\psi\b/g, 'ψ'],
+  [/\\omega\b/g, 'ω'],
+  // Greek (uppercase)
+  [/\\Gamma\b/g, 'Γ'],
+  [/\\Delta\b/g, 'Δ'],
+  [/\\Theta\b/g, 'Θ'],
+  [/\\Lambda\b/g, 'Λ'],
+  [/\\Xi\b/g, 'Ξ'],
+  [/\\Pi\b/g, 'Π'],
+  [/\\Sigma\b/g, 'Σ'],
+  [/\\Phi\b/g, 'Φ'],
+  [/\\Psi\b/g, 'Ψ'],
+  [/\\Omega\b/g, 'Ω'],
+];
+
+function applyLatexSymbolMap(text: string): string {
+  let chunk = text;
+  for (const [re, value] of LATEX_SYMBOL_MAP) chunk = chunk.replace(re, value);
+  return chunk;
+}
+
+// Best-effort rendering of LaTeX that the model wrapped inside an inline-code
+// chip (e.g. `... $\rightarrow$ ...`). KaTeX never runs inside <code>, so we
+// unwrap $...$ / $$...$$ spans that contain a backslash command, then apply the
+// symbol map. Shell-style single `$VAR` or `$a $b` (no backslash) is left alone.
+function normalizeInlineCodeLatex(codeChunk: string): string {
+  if (!codeChunk.startsWith('`') || codeChunk.startsWith('```')) return codeChunk;
+  // Only touch chips that actually look like they contain LaTeX intent.
+  if (!/\\[A-Za-z]/.test(codeChunk)) return codeChunk;
+  let inner = codeChunk.slice(1, -1);
+  inner = inner.replace(/\$\$?([^$\n]*\\[^$\n]*?)\$\$?/g, (_m, body) => body);
+  inner = applyLatexSymbolMap(inner);
+  return `\`${inner}\``;
+}
+
+function normalizeLatexSymbols(text: string): string {
+  const protectedRe = /(```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$[^$\n]+\$)/g;
+  const parts = text.split(protectedRe);
+  return parts
+    .map((part, idx) => {
+      if (idx % 2 === 1) {
+        // Protected: math spans and fenced blocks stay untouched (KaTeX / code).
+        // Inline-code chips get a best-effort symbol pass since KaTeX can't reach them.
+        return normalizeInlineCodeLatex(part);
+      }
+      return applyLatexSymbolMap(part);
+    })
+    .join('');
+}
+
+function normalizeHtmlCodeBlocks(text: string): string {
+  const unescapeHtml = (s: string) =>
+    s
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
+
+  const toCodeBlock = (content: string) =>
+    content.includes('\n') ? `\`\`\`\n${content}\n\`\`\`` : `\`${content.replace(/`/g, "'")}\``;
+
+  let result = text;
+  
+  result = result.replace(/<div\s[^>]*data-bbox[^>]*>([\s\S]*?)<\/div>/gi, '$1');
+
+  result = result.replace(/<pre>([\s\S]*?)<\/pre>/gi, (_m, content: string) =>
+    toCodeBlock(unescapeHtml(content.trim())),
+  );
+
+  result = result.replace(/<code>([\s\S]*?)<\/code>/gi, (_m, content: string) =>
+    toCodeBlock(content),
+  );
+  return result;
+}
+
+function stripResidualThinkTags(text: string): string {
+  const TAG = 'think(?:ing)?|reasoning|thought|reflection|internal_thought';
+  return text
+    .replace(new RegExp(`<(?:${TAG})>[\\s\\S]*?<\\/(?:${TAG})>`, 'gi'), '')
+    .replace(new RegExp(`<(?:${TAG})>[\\s\\S]*$`, 'i'), '')
+    .trim();
+}
+
+
+export function processMarkdown(text: string): string {
+  return normalizeHtmlCodeBlocks(
+    normalizeLatexSymbols(
+      preprocessLatex(
+        // Strip leaked channel/harmony tokens, repair malformed/stray code fences, then
+        // recover any remaining unfenced code into proper code blocks.
+        wrapLooseCodeBlocks(
+          repairCodeFences(stripResidualThinkTags(stripChannelTokens(text))),
+        ),
+      ),
+    ),
+  );
+}
+
+/** Strip thinking blocks and agent tool markers from a raw assistant output for display. */
+function cleanAssistantText(raw: string): string {
+  const normalized = normalizeToolMarkerLineBreaks(raw);
+  const { rest } = extractThinkingBlocks(normalized);
+  return stripToolMarkers(rest);
+}
+
+// ---------------------------------------------------------------------------
 
 interface ChatMessageProps {
   message: Message;
@@ -34,6 +264,9 @@ interface ChatMessageProps {
   onGetOriginal?: (filePath: string) => Promise<string>;
   autoAppliedPaths?: string[];
   agentActions?: AgentAction[];
+  agentThoughts?: string[];
+ 
+  fallbackThinking?: string;
   onOpenFile?: (filePath: string) => void;
   onSubmitEdit?: (messageId: string, text: string) => Promise<void>;
   onRegenerate?: (messageId: string) => Promise<void>;
@@ -47,6 +280,8 @@ function ChatMessageImpl({
   onGetOriginal,
   autoAppliedPaths,
   agentActions,
+  agentThoughts,
+  fallbackThinking,
   onOpenFile,
   onSubmitEdit,
   onRegenerate,
@@ -57,67 +292,55 @@ function ChatMessageImpl({
   const [draftText, setDraftText] = useState('');
   const [isSavingEdit, setIsSavingEdit] = useState(false);
   const [isRegenerating, setIsRegenerating] = useState(false);
-  const rawText = getMessageText(message);
+  const [showThinking, setShowThinking] = useState(true);
+  
+  const rawText = message.role === 'assistant'
+    ? normalizeToolMarkerLineBreaks(getMessageText(message))
+    : getMessageText(message);
   const images = getImages(message);
   const isAgent = chatMode === 'agent';
 
+ 
+  const { thinking: thinkingContent, rest: rawTextWithoutThinking } =
+    message.role === 'assistant'
+      ? extractThinkingBlocks(rawText)
+      : { thinking: '', rest: rawText };
+
   const displayText =
-    isAgent && message.role === 'assistant'
-      ? stripToolMarkers(stripThinkingBlocks(rawText))
+    message.role === 'assistant'
+      // Strip leaked channel/harmony tokens first so tool-marker stripping sees clean boundaries.
+      ? stripToolMarkers(stripChannelTokens(rawTextWithoutThinking))
       : rawText;
 
-  const normalizeLatexSymbols = (text: string) => {
-    // We don't render LaTeX in chat; convert common tokens to their Unicode equivalents.
-    // This prevents raw strings like `$\\rightarrow$` from showing up in normal prose.
-    const map: Array<[RegExp, string]> = [
-      [/\$\s*\\rightarrow\s*\$/g, '→'],
-      [/\$\s*\\to\s*\$/g, '→'],
-      [/\\rightarrow\b/g, '→'],
-      [/\\to\b/g, '→'],
-      [/\$\s*\\Rightarrow\s*\$/g, '⇒'],
-      [/\\Rightarrow\b/g, '⇒'],
-      [/\\implies\b/g, '⇒'],
-      [/\$\s*\\leftarrow\s*\$/g, '←'],
-      [/\\leftarrow\b/g, '←'],
-      [/\\gets\b/g, '←'],
-      [/\\leftrightarrow\b/g, '↔'],
-      [/\\mapsto\b/g, '↦'],
-      [/\$\s*\\leq?\s*\$/g, '≤'],
-      [/\\leq?\b/g, '≤'],
-      [/\$\s*\\geq?\s*\$/g, '≥'],
-      [/\\geq?\b/g, '≥'],
-      [/\$\s*\\neq\s*\$/g, '≠'],
-      [/\\neq\b/g, '≠'],
-      [/\$\s*\\approx\s*\$/g, '≈'],
-      [/\\approx\b/g, '≈'],
-      [/\$\s*\\infty\s*\$/g, '∞'],
-      [/\\infty\b/g, '∞'],
-      [/\$\s*\\times\s*\$/g, '×'],
-      [/\\times\b/g, '×'],
-      [/\$\s*\\cdot\s*\$/g, '·'],
-      [/\\cdot\b/g, '·'],
-      [/\$\s*\\pm\s*\$/g, '±'],
-      [/\\pm\b/g, '±'],
-      [/\\ldots\b/g, '…'],
-    ];
-
-    // Avoid rewriting inside fenced code blocks.
-    const parts = text.split(/(```[\s\S]*?```)/g);
-    let out = '';
-    for (const part of parts) {
-      if (part.startsWith('```')) {
-        out += part;
-        continue;
-      }
-      let chunk = part;
-      for (const [re, value] of map) chunk = chunk.replace(re, value);
-      out += chunk;
+  const effectiveThinkingContent = (() => {
+    
+    if (!isAgent || message.role !== 'assistant') return '';
+  
+    if (agentThoughts?.length) return agentThoughts.join('\n\n---\n\n');
+    
+    if (thinkingContent) return thinkingContent;
+    
+    if (agentActions?.length) {
+      const labelMap: Record<string, string> = {
+        read: 'Read', edit: 'Edited', write: 'Wrote',
+        delete: 'Deleted', rename: 'Renamed', list: 'Listed',
+      };
+      const lines = agentActions.map(action => {
+        const label = labelMap[action.type] ?? action.type;
+        const status = action.success ? '' : ` *(failed${action.error ? `: ${action.error}` : ''})*`;
+        return `- **${label}** \`${action.path}\`${status}`;
+      });
+      return `**Agent actions:**\n\n${lines.join('\n')}`;
     }
-    return out;
-  };
+  
+    if (fallbackThinking) return fallbackThinking;
+    return '';
+  })();
 
   const markdownToRender =
-    message.role === 'assistant' ? normalizeLatexSymbols(displayText) : displayText;
+    message.role === 'assistant'
+      ? processMarkdown(displayText)
+      : displayText;
 
   const hasPatch = message.role === 'assistant' && containsPatches(rawText);
   const patches = hasPatch ? parsePatches(rawText) : [];
@@ -139,12 +362,28 @@ function ChatMessageImpl({
     rawText.trim().length > 0;
   const canRegenerateMessage = !busy && message.role === 'assistant' && !!onRegenerate;
 
+  const priorAttempts =
+    message.role === 'assistant' ? (message.meta?.attempts ?? []) : [];
+  const hasPriorAttempts = priorAttempts.length > 0;
+
   const isAutoSummary = message.meta?.kind === 'auto_summary' && message.role === 'assistant';
   const compactedCount = message.meta?.compactedMessageCount ?? null;
   const compactedChars = message.meta?.compactedCharCount ?? null;
   const compactionDepth = message.meta?.compactionDepth ?? null;
 
-  // Persist code block expand/collapse across streaming re-renders.
+  
+  const summaryBody = isAutoSummary
+    ? (() => {
+        const HEADER = 'Conversation summary (auto-generated):';
+        const FOOTER = 'Continue chatting with this summary as context.';
+        let t = markdownToRender.trim();
+        if (t.startsWith(HEADER)) t = t.slice(HEADER.length).trim();
+        if (t.endsWith(FOOTER)) t = t.slice(0, -FOOTER.length).trim();
+        return t;
+      })()
+    : null;
+
+  
   const [expandedCodeBlocks, setExpandedCodeBlocks] = useState<Record<string, boolean>>({});
 
   const getCodeBlockKey = useCallback(
@@ -242,6 +481,50 @@ function ChatMessageImpl({
           </div>
         )}
 
+        {effectiveThinkingContent && message.role === 'assistant' && (
+          <div className="mb-3 overflow-hidden rounded-md border border-border/50 bg-muted/20">
+            <button
+              type="button"
+              onClick={() => setShowThinking(!showThinking)}
+              className="flex w-full items-center gap-1.5 px-3 py-1.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <Brain className="h-3.5 w-3.5 shrink-0" />
+              <span className="font-medium">
+                {agentThoughts?.length
+                  ? 'Reasoning'
+                  : thinkingContent
+                    ? 'Thinking'
+                    : agentActions?.length
+                      ? 'Agent Actions'
+                      : 'Thinking'}
+              </span>
+              {showThinking ? (
+                <ChevronUp className="ml-auto h-3 w-3 shrink-0" />
+              ) : (
+                <ChevronDown className="ml-auto h-3 w-3 shrink-0" />
+              )}
+            </button>
+            {showThinking && (
+              <div className="border-t border-border/50 px-3 py-2.5 text-[12px] leading-relaxed text-muted-foreground prose prose-sm max-w-none dark:prose-invert">
+                <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}>
+                  {processMarkdown(stripToolMarkers(effectiveThinkingContent))}
+                </ReactMarkdown>
+              </div>
+            )}
+          </div>
+        )}
+
+        {hasPriorAttempts && message.role === 'assistant' && (
+          <PreviousAttempts attempts={priorAttempts} />
+        )}
+
+        {hasPriorAttempts && message.role === 'assistant' && !isEditing && displayText.trim().length > 0 && (
+          <div className="mb-1 flex items-center gap-1.5 text-[11px] font-medium text-primary">
+            <Check className="h-3 w-3 shrink-0" />
+            <span>Final response</span>
+          </div>
+        )}
+
         {isEditing ? (
           <div className="space-y-2">
             <textarea
@@ -310,8 +593,8 @@ function ChatMessageImpl({
             "
              >
               <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                rehypePlugins={[rehypeHighlight]}
+                remarkPlugins={[remarkGfm, remarkMath]}
+                rehypePlugins={[rehypeHighlight, [rehypeKatex, { throwOnError: false }]]}
                 components={{
                   pre: ({ node, children }) => {
                     const key = getCodeBlockKey(node);
@@ -339,7 +622,7 @@ function ChatMessageImpl({
                   },
                 }}
               >
-                {markdownToRender}
+                {summaryBody ?? markdownToRender}
               </ReactMarkdown>
             </div>
           )
@@ -434,7 +717,7 @@ function ChatMessageImpl({
           </div>
         )}
 
-        {/* Chat mode: full patch actions with preview / apply */}
+        {/* Chat mode: patch apply actions (no diff preview) */}
         {showPatchActions && (
           <div className="mt-3 space-y-2">
             {patches.map((patch, i) => (
@@ -443,7 +726,6 @@ function ChatMessageImpl({
                 patch={patch}
                 autoApplied={autoAppliedPaths?.includes(patch.filePath)}
                 onApply={() => onApplyPatch?.(patch)}
-                onGetOriginal={onGetOriginal}
               />
             ))}
           </div>
@@ -575,6 +857,64 @@ function AgentActionBadge({ action, onOpenFile }: { action: AgentAction; onOpenF
   );
 }
 
+function PreviousAttempts({
+  attempts,
+}: {
+  attempts: NonNullable<Message['meta']>['attempts'];
+}) {
+  const [open, setOpen] = useState(false);
+  const items = attempts ?? [];
+  if (items.length === 0) return null;
+
+  return (
+    <div className="mb-3 overflow-hidden rounded-md border border-border/50 bg-muted/10">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-3 py-1.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <RotateCcw className="h-3.5 w-3.5 shrink-0" />
+        <span className="font-medium">
+          Previous {items.length === 1 ? 'attempt' : 'attempts'} ({items.length})
+        </span>
+        {open ? (
+          <ChevronUp className="ml-auto h-3 w-3 shrink-0" />
+        ) : (
+          <ChevronDown className="ml-auto h-3 w-3 shrink-0" />
+        )}
+      </button>
+      {open && (
+        <div className="space-y-3 border-t border-border/50 px-3 py-2.5">
+          {items.map((attempt, idx) => {
+            const body = processMarkdown(cleanAssistantText(attempt.content));
+            return (
+              <div key={`${attempt.createdAt}-${idx}`} className="space-y-1">
+                <div className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/80">
+                  <span>Attempt {idx + 1}</span>
+                </div>
+                {body.trim().length > 0 ? (
+                  <div className="prose prose-sm max-w-none text-[12px] leading-relaxed text-muted-foreground opacity-80 dark:prose-invert">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm, remarkMath]}
+                      rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
+                    >
+                      {body}
+                    </ReactMarkdown>
+                  </div>
+                ) : (
+                  <p className="text-[11px] italic text-muted-foreground/70">
+                    (No text — this step ran tools and continued.)
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MessageActionButton({
   label,
   title,
@@ -634,7 +974,27 @@ function ExpandablePre({
 
   const handleCopy = useCallback(() => {
     const t = preRef.current?.textContent || '';
-    void navigator.clipboard.writeText(t);
+    if (!t) return;
+    const fallback = () => {
+      const el = document.createElement('textarea');
+      el.value = t;
+      el.setAttribute('readonly', '');
+      el.style.position = 'fixed';
+      el.style.opacity = '0';
+      document.body.appendChild(el);
+      el.select();
+      try { document.execCommand('copy'); } catch { /* ignore */ }
+      document.body.removeChild(el);
+    };
+    try {
+      if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(t).catch(fallback);
+      } else {
+        fallback();
+      }
+    } catch {
+      fallback();
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }, []);
@@ -643,8 +1003,8 @@ function ExpandablePre({
     '!mb-0 !mt-0 overflow-x-auto p-3 text-xs leading-relaxed select-text [&_code]:bg-transparent [&_code]:text-[13px]';
 
   return (
-    <div data-evig-codeblock className="my-2 overflow-hidden rounded-md border border-border/60 bg-secondary/50">
-      <div className="flex items-center justify-between gap-2 border-b border-border/50 bg-muted/30 px-2 py-1">
+    <div data-evig-codeblock className="my-2 overflow-hidden rounded-md border border-border/60 bg-secondary/50 select-text">
+      <div className="flex items-center justify-between gap-2 border-b border-border/50 bg-muted/30 px-2 py-1 select-none">
         <span className="text-[10px] font-medium text-muted-foreground">Code</span>
         <div className="flex items-center gap-2">
           <button
@@ -661,7 +1021,7 @@ function ExpandablePre({
       </div>
       <div
         ref={scrollRef}
-        className={expanded ? 'max-h-[min(70vh,560px)] overflow-y-auto' : 'max-h-[5.5rem] overflow-y-auto'}
+        className={expanded ? 'max-h-[min(70vh,560px)] overflow-y-auto select-text' : 'max-h-[5.5rem] overflow-y-auto select-text'}
       >
         <pre ref={preRef} className={preClass}>
           {children}
@@ -674,96 +1034,39 @@ function ExpandablePre({
 function PatchAction({
   patch,
   onApply,
-  onGetOriginal,
   autoApplied,
 }: {
   patch: ParsedPatch;
   onApply: () => void;
-  onGetOriginal?: (filePath: string) => Promise<string>;
   autoApplied?: boolean;
 }) {
-  const { filePath, content, operation = 'update' } = patch;
+  const { filePath, operation = 'update' } = patch;
   const [userApplied, setUserApplied] = useState(false);
-  const [showDiff, setShowDiff] = useState(false);
-  const [original, setOriginal] = useState('');
-  const [modified, setModified] = useState('');
-
   const done = userApplied || autoApplied;
-
-  const handlePreview = async () => {
-    if (operation === 'delete') {
-      if (onGetOriginal) {
-        try {
-          setOriginal(await onGetOriginal(filePath));
-        } catch {
-          setOriginal('');
-        }
-      } else {
-        setOriginal('');
-      }
-      setModified('');
-      setShowDiff(true);
-      return;
-    }
-    if (onGetOriginal) {
-      try {
-        const orig = await onGetOriginal(filePath);
-        setOriginal(orig);
-        setModified(applyPatch(orig, { filePath, content, operation }));
-      } catch {
-        setOriginal('');
-        setModified(content.split('\n').map((l) => (l.startsWith('+') ? l.slice(1) : l)).join('\n'));
-      }
-    } else {
-      setOriginal('');
-      setModified(content);
-    }
-    setShowDiff(true);
-  };
-
   const applyLabel = operation === 'delete' ? 'Remove' : 'Apply';
 
   return (
-    <>
-      <div className="flex items-center gap-2 px-3 py-2 rounded bg-secondary/80 border border-border text-xs">
-        <FileCode className="w-3.5 h-3.5 text-primary shrink-0" />
-        <span className="flex-1 truncate text-foreground">{filePath}</span>
-        {operation === 'delete' && (
-          <span className="text-[10px] text-destructive shrink-0">delete</span>
-        )}
-        <button onClick={handlePreview} className="flex items-center gap-1 px-2 py-0.5 rounded bg-muted hover:bg-muted/80 transition-colors">
-          <Eye className="w-3 h-3" /> Preview
-        </button>
-        {!done ? (
-          <button
-            onClick={() => {
-              onApply();
-              setUserApplied(true);
-            }}
-            className="flex items-center gap-1 px-2 py-0.5 rounded bg-accent/20 text-accent hover:bg-accent/30 transition-colors"
-          >
-            <Play className="w-3 h-3" /> {applyLabel}
-          </button>
-        ) : (
-          <span className="flex items-center gap-1 text-accent">
-            <Check className="w-3 h-3" /> Applied
-          </span>
-        )}
-      </div>
-
-      {showDiff && (
-        <DiffViewer
-          filePath={filePath}
-          original={original}
-          modified={modified}
-          onClose={() => setShowDiff(false)}
-          onApply={() => {
+    <div className="flex items-center gap-2 px-3 py-2 rounded bg-secondary/80 border border-border text-xs">
+      <FileCode className="w-3.5 h-3.5 text-primary shrink-0" />
+      <span className="flex-1 truncate text-foreground">{filePath}</span>
+      {operation === 'delete' && (
+        <span className="text-[10px] text-destructive shrink-0">delete</span>
+      )}
+      {!done ? (
+        <button
+          onClick={() => {
             onApply();
             setUserApplied(true);
-            setShowDiff(false);
           }}
-        />
+          className="flex items-center gap-1 px-2 py-0.5 rounded bg-accent/20 text-accent hover:bg-accent/30 transition-colors"
+        >
+          <Play className="w-3 h-3" /> {applyLabel}
+        </button>
+      ) : (
+        <span className="flex items-center gap-1 text-accent">
+          <Check className="w-3 h-3" /> Applied
+        </span>
       )}
-    </>
+    </div>
   );
 }

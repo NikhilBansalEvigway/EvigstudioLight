@@ -20,6 +20,27 @@ const messageSchema = z.object({
   content: z.union([z.string(), z.array(z.unknown())]),
   timestamp: z.number(),
   patches: z.array(z.unknown()).optional(),
+  
+  excludedFromContext: z.boolean().optional(),
+  
+  meta: z
+    .object({
+      kind: z.literal('auto_summary').optional(),
+      compactedMessageCount: z.number().optional(),
+      compactedCharCount: z.number().optional(),
+      compactionDepth: z.number().optional(),
+    })
+    .optional(),
+  
+  contextRefs: z
+    .array(
+      z.object({
+        path: z.string(),
+        type: z.enum(['file', 'directory', 'missing']),
+        label: z.string().optional(),
+      }),
+    )
+    .optional(),
   selectionRef: z
     .object({
       text: z.string(),

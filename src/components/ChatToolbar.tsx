@@ -226,12 +226,7 @@ export function ChatToolbar({
         </Dialog>
 
         {serverMode && (
-          <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-            {!canWrite && (
-              <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
-                Read only{chat.ownerDisplayName ? ` · ${chat.ownerDisplayName}` : ''}
-              </span>
-            )}
+          <div className="flex items-center gap-1.5 text-[11px]">
             <span className="text-muted-foreground hidden sm:inline">Visibility</span>
             <Select
               value={privacy}
@@ -263,7 +258,22 @@ export function ChatToolbar({
                 <SelectItem value="group">Team…</SelectItem>
               </SelectContent>
             </Select>
-            {privacy === 'group' && (
+          </div>
+        )}
+      </div>
+
+      {/* Read-only badge and team picker live on their own row so they never push the
+          Visibility selector out of line with the Summarize / Export / History buttons. */}
+      {serverMode && (!canWrite || privacy === 'group') && (
+        <div className="flex flex-wrap items-center justify-end gap-1.5 text-[11px]">
+          {!canWrite && (
+            <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
+              Read only{chat.ownerDisplayName ? ` · ${chat.ownerDisplayName}` : ''}
+            </span>
+          )}
+          {privacy === 'group' && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-muted-foreground hidden sm:inline">Team</span>
               <Select
                 value={chat.groupId ?? ''}
                 disabled={!canWrite}
@@ -271,7 +281,7 @@ export function ChatToolbar({
                   updateChatFields(chat.id, { privacy: 'group', groupId: gid })
                 }
               >
-                <SelectTrigger className="h-7 min-w-[140px] max-w-[180px] text-[11px] px-2">
+                <SelectTrigger className="h-7 w-[130px] text-[11px] px-2">
                   <SelectValue placeholder="Choose team" />
                 </SelectTrigger>
                 <SelectContent>
@@ -282,10 +292,10 @@ export function ChatToolbar({
                   ))}
                 </SelectContent>
               </Select>
-            )}
-          </div>
-        )}
-      </div>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="flex flex-wrap gap-2 text-[11px]">
         <label className="flex items-center gap-1.5 min-w-0 flex-1">

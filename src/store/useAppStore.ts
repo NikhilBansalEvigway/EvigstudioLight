@@ -112,18 +112,26 @@ interface AppState {
 
   // Streaming
   isStreaming: boolean;
-  setIsStreaming: (v: boolean) => void;
+  /** Which chatId is currently streaming; null when idle. */
+  streamingChatId: string | null;
+  setIsStreaming: (v: boolean, chatId?: string | null) => void;
 
   // Budgets / telemetry (UI-only)
   contextBudgetChars: number;
-  /** Workspace context chars (pinned/@mentioned files) for the active chat. */
+  /** Workspace context chars (pinned/@mentioned files) — latest measurement for the active chat. */
   workspaceContextUsedChars: number;
   /** Active chat history chars (user+assistant messages), excluding compacted messages. */
   historyContextUsedChars: number;
-  /** Convenience: history + workspace for active chat. */
+ 
   contextUsedChars: number;
-  setContextUsage: (usedChars: number, budgetChars: number) => void;
+  /** Which chat the high-water mark was last measured against. Mismatch => re-derive (no carry-over). */
+  contextUsageChatId: string | null;
+ 
+  setContextUsage: (workspaceChars: number, budgetChars: number, historyChars?: number) => void;
+  /** Update history-context chars only (workspace chars unchanged). */
   setHistoryContextUsage: (usedChars: number) => void;
+  /** Clear the workspace-usage high-water mark after an explicit context reclaim (summarize/clear). */
+  resetContextUsageMeter: () => void;
   agentStep: number;
   agentStepTotal: number;
   setAgentStepProgress: (step: number, total: number) => void;
@@ -629,12 +637,15 @@ export const useAppStore = create<AppState>((set, get) => ({
   hydrateWorkspaceSession: async (chatId) => {
     try {
       const session = await loadWorkspaceSession(chatId);
-      // Reset context usage on chat switch. It is computed lazily when we build the next turn's
-      // workspace context, and should not carry over between chats.
-      set((s) => ({
-        workspaceContextUsedChars: 0,
-        contextUsedChars: Math.max(0, (s.historyContextUsedChars || 0) + 0),
-      }));
+     
+      const isSameChatRehydrate = get().contextUsageChatId === chatId;
+      if (!isSameChatRehydrate) {
+        set(() => ({
+          workspaceContextUsedChars: 0,
+          contextUsedChars: 0,
+          contextUsageChatId: null,
+        }));
+      }
       if (!session) {
         // No session for this chat: start clean.
         set({
@@ -653,15 +664,19 @@ export const useAppStore = create<AppState>((set, get) => ({
       const hydratedRoots = (session.workspaceRoots ?? [])
         .filter((root) => !!root.handle)
         .map((root) => ({ id: root.id, label: root.label, handle: root.handle! }));
+      const restoredWorkspaceChars = Math.max(0, Number(session.workspaceContextUsedChars ?? 0) || 0);
       set({
         workspaceRoots: hydratedRoots,
         workspaceHandle: hydratedRoots[0]?.handle ?? null,
         contextFiles: session.contextFiles ?? [],
-        workspaceContextUsedChars: Math.max(0, Number(session.workspaceContextUsedChars ?? 0) || 0),
-        contextUsedChars: Math.max(
-          0,
-          (get().historyContextUsedChars || 0) + Math.max(0, Number(session.workspaceContextUsedChars ?? 0) || 0),
-        ),
+        
+        ...(isSameChatRehydrate
+          ? {}
+          : {
+              workspaceContextUsedChars: restoredWorkspaceChars,
+              contextUsedChars: restoredWorkspaceChars,
+              contextUsageChatId: null,
+            }),
         openEditorTabs: session.openEditorTabs ?? [],
         activeFilePath: session.activeFilePath ?? null,
         activeFileContent:
@@ -741,32 +756,59 @@ export const useAppStore = create<AppState>((set, get) => ({
   showSettings: false,
   setShowSettings: (v) => set({ showSettings: v }),
   rightPaneTab: 'files',
-  setRightPaneTab: (t) => set({ rightPaneTab: t }),
+  setRightPaneTab: (t) => {
+    const valid = new Set(['files', 'editor', 'context', 'users', 'prompt']);
+    // Legacy tab id from removed Changes review UI — fall back to Files.
+    if (!valid.has(t) || (t as string) === 'changes') {
+      set({ rightPaneTab: 'files' });
+      return;
+    }
+    set({ rightPaneTab: t });
+  },
   showSidebar: true,
   setShowSidebar: (v) => set({ showSidebar: v }),
   showRightPane: true,
   setShowRightPane: (v) => set({ showRightPane: v }),
 
   isStreaming: false,
-  setIsStreaming: (v) => set({ isStreaming: v }),
+  streamingChatId: null,
+  setIsStreaming: (v, chatId) => set({ isStreaming: v, streamingChatId: v ? (chatId ?? null) : null }),
 
   contextBudgetChars: 200_000,
   workspaceContextUsedChars: 0,
   historyContextUsedChars: 0,
   contextUsedChars: 0,
-  setContextUsage: (usedChars, budgetChars) =>
+  contextUsageChatId: null,
+  setContextUsage: (workspaceChars, budgetChars, historyChars?) =>
     set((s) => {
-      const workspaceContextUsedChars = Math.max(0, usedChars);
+     
+      const sameChat = s.contextUsageChatId === s.activeChatId;
+      const workspaceContextUsedChars = Math.max(0, workspaceChars);
       const contextBudgetChars = Math.max(0, budgetChars);
-      const contextUsedChars = Math.max(0, (s.historyContextUsedChars || 0) + workspaceContextUsedChars);
-      return { workspaceContextUsedChars, contextBudgetChars, contextUsedChars };
+      // Use the freshly-supplied historyChars if provided; fall back to the already-stored value.
+      const historyContextUsedChars = historyChars !== undefined
+        ? Math.max(0, historyChars)
+        : (s.historyContextUsedChars || 0);
+      const live = historyContextUsedChars + workspaceContextUsedChars;
+      const contextUsedChars = sameChat ? Math.max(s.contextUsedChars || 0, live) : live;
+      return { workspaceContextUsedChars, historyContextUsedChars, contextBudgetChars, contextUsedChars, contextUsageChatId: s.activeChatId };
     }),
   setHistoryContextUsage: (usedChars) =>
     set((s) => {
+     
+      const sameChat = s.contextUsageChatId === s.activeChatId;
       const historyContextUsedChars = Math.max(0, usedChars);
-      const contextUsedChars = Math.max(0, historyContextUsedChars + (s.workspaceContextUsedChars || 0));
-      return { historyContextUsedChars, contextUsedChars };
+      const live = historyContextUsedChars + (s.workspaceContextUsedChars || 0);
+      const contextUsedChars = sameChat ? Math.max(s.contextUsedChars || 0, live) : live;
+      return { historyContextUsedChars, contextUsedChars, contextUsageChatId: s.activeChatId };
     }),
+  resetContextUsageMeter: () =>
+    set(() => ({
+      
+      workspaceContextUsedChars: 0,
+      contextUsedChars: 0,
+      contextUsageChatId: null,
+    })),
   agentStep: 0,
   agentStepTotal: 0,
   setAgentStepProgress: (step, total) => set({ agentStep: Math.max(0, step), agentStepTotal: Math.max(0, total) }),
@@ -825,8 +867,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       set((s) => ({
         serverChatLimits: { contextBudgetChars },
         contextBudgetChars,
-        // Preserve current usage parts; only update the shared budget.
-        contextUsedChars: Math.max(0, (s.historyContextUsedChars || 0) + (s.workspaceContextUsedChars || 0)),
+       
+        contextUsedChars: Math.max(
+          0,
+          s.contextUsedChars || 0,
+          (s.historyContextUsedChars || 0) + (s.workspaceContextUsedChars || 0),
+        ),
       }));
     } catch {
       set({ serverChatLimits: null });

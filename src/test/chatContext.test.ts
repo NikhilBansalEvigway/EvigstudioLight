@@ -55,6 +55,16 @@ describe('chat context helpers', () => {
       contextUsedChars: 0,
     } as any);
 
+    
+    const switchChat = (chatId: string) => {
+      useAppStore.setState({
+        activeChatId: chatId,
+        workspaceContextUsedChars: 0,
+        contextUsedChars: 0,
+        contextUsageChatId: null,
+      } as any);
+    };
+
     const computeHistory = (chatId: string) => {
       const st = useAppStore.getState();
       const chat = st.chats.find((c) => c.id === chatId);
@@ -65,14 +75,41 @@ describe('chat context helpers', () => {
       st.setHistoryContextUsage(historyChars);
     };
 
+    switchChat('a');
     computeHistory('a');
     const aUsed = useAppStore.getState().contextUsedChars;
+    switchChat('b');
     computeHistory('b');
     const bUsed = useAppStore.getState().contextUsedChars;
+    switchChat('a');
     computeHistory('a');
     const aUsedAgain = useAppStore.getState().contextUsedChars;
 
     expect(aUsed).toBeGreaterThan(bUsed);
     expect(aUsedAgain).toBe(aUsed);
+  });
+
+  it('does not let the context meter bounce up when content shrinks mid-turn', () => {
+    
+    useAppStore.setState({
+      chats: [{ id: 'c', title: 'C', mode: 'agent', createdAt: 1, updatedAt: 1, messages: [] }],
+      activeChatId: 'c',
+      workspaceContextUsedChars: 0,
+      historyContextUsedChars: 0,
+      contextUsedChars: 0,
+      contextUsageChatId: null,
+    } as any);
+
+    const st = useAppStore.getState();
+    st.setHistoryContextUsage(20_000); // user prompt + short stub
+    const afterPrompt = useAppStore.getState().contextUsedChars;
+    st.setHistoryContextUsage(38_000); // long intermediate agent reply (with think/tool markers)
+    const afterIntermediate = useAppStore.getState().contextUsedChars;
+    st.setHistoryContextUsage(22_000); // shorter final reply replaces the intermediate one
+    const afterFinal = useAppStore.getState().contextUsedChars;
+
+    expect(afterIntermediate).toBeGreaterThan(afterPrompt);
+    // The transient peak is held; the meter does not move backwards.
+    expect(afterFinal).toBe(afterIntermediate);
   });
 });

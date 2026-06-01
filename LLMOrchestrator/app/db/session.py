@@ -324,13 +324,47 @@ async def initialize_database() -> None:
     await seed_defaults()
 
 
+def _is_legacy_lm_studio_url(url: str, current_url: str) -> bool:
+    """Return True if `url` is a known stale/dev-machine URL that should be replaced by `current_url` on startup.
+
+    Any URL that:
+    - is an exact match of a known dev-machine IP we shipped, OR
+    - is a different private IP:port than the one currently configured in the env file
+      (i.e. it was written by a previous bootstrap and is now stale)
+    qualifies as legacy. We never override explicit admin changes to localhost or host.docker.internal.
+    """
+    import re
+    stripped = (url or "").strip()
+    if not stripped or stripped == current_url:
+        return False
+    # Never auto-migrate these — they are valid production choices that an admin may set.
+    safe_hosts = {"localhost", "127.0.0.1", "host.docker.internal", "::1"}
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(stripped).hostname or ""
+        if host in safe_hosts:
+            return False
+    except Exception:
+        pass
+    # Known stale dev-machine IPs that have appeared in past deployments.
+    known_stale = {
+        "http://172.16.16.21", "http://172.16.16.21:1234",
+        "http://172.16.16.26:1234",
+        "http://172.16.16.50:1234",
+        "http://172.16.16.56:1234",
+        "http://10.20.20.25:1234",
+    }
+    if stripped in known_stale:
+        return True
+    # Also treat any private-IP URL that differs from the current env value as stale
+    # ONLY if it was last written by the bootstrap (not an explicit admin choice).
+    # (Callers check updated_by separately for the "admin" case.)
+    return False
+
+
 async def seed_defaults() -> None:
     settings = get_settings()
     session_factory = get_session_factory()
-    legacy_lm_studio_urls = {
-        "http://172.16.16.21",
-        "http://172.16.16.21:1234",
-    }
     editable_defaults = {
         "lm_studio_base_url": settings.lm_studio_base_url,
         "default_model": settings.default_model,
@@ -369,15 +403,14 @@ async def seed_defaults() -> None:
                 )
                 continue
 
-            if (
-                key == "lm_studio_base_url"
-                and isinstance(entry.value_json, str)
-                and entry.value_json.strip() in legacy_lm_studio_urls
-            ):
-                entry.value_json = settings.lm_studio_base_url
-                entry.editable_from_ui = True
-                entry.updated_by = "system_bootstrap"
-                continue
+            if key == "lm_studio_base_url" and isinstance(entry.value_json, str):
+                current = settings.lm_studio_base_url
+                # Always migrate known stale dev-machine URLs regardless of who last wrote them.
+                if _is_legacy_lm_studio_url(entry.value_json, current):
+                    entry.value_json = current
+                    entry.editable_from_ui = True
+                    entry.updated_by = "system_bootstrap"
+                    continue
 
             # Keep admin UI overrides, but migrate legacy bootstrap defaults.
             if entry.updated_by in (None, "", "system_bootstrap"):
@@ -385,6 +418,7 @@ async def seed_defaults() -> None:
                 entry.editable_from_ui = True
                 entry.updated_by = "system_bootstrap"
 
+        # Ensure the default model_config exists.
         result = await session.execute(
             select(ModelConfig).where(ModelConfig.name == settings.default_model)
         )
@@ -401,6 +435,14 @@ async def seed_defaults() -> None:
                     is_enabled=True,
                 )
             )
+
+        # Migrate model_configs that still point to stale dev-machine URLs.
+        # This runs on every startup so moving to a new machine just requires updating the env file.
+        current_url = settings.lm_studio_base_url
+        all_models_result = await session.execute(select(ModelConfig))
+        for mc in all_models_result.scalars().all():
+            if mc.backend_url and _is_legacy_lm_studio_url(mc.backend_url, current_url):
+                mc.backend_url = current_url
 
         try:
             await session.commit()

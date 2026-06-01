@@ -11,19 +11,26 @@ export interface MentionEntry {
 }
 
 export function flattenMentionEntries(nodes: FileNode[], result: MentionEntry[] = []): MentionEntry[] {
-  for (const node of nodes) {
+ 
+  const visit = (node: FileNode): number => {
     const parentPath = node.path.includes('/') ? node.path.slice(0, node.path.lastIndexOf('/')) : '';
     if (node.type === 'file') {
       result.push({ name: node.name, path: node.path, type: 'file', parentPath, fileCount: 1 });
-      continue;
+      return 1;
     }
 
-    const fileCount = countFiles(node);
-    result.push({ name: node.name, path: node.path, type: 'directory', parentPath, fileCount });
-    if (node.children?.length) {
-      flattenMentionEntries(node.children, result);
+   
+    const entry: MentionEntry = { name: node.name, path: node.path, type: 'directory', parentPath, fileCount: 0 };
+    result.push(entry);
+    let fileCount = 0;
+    for (const child of node.children ?? []) {
+      fileCount += visit(child);
     }
-  }
+    entry.fileCount = fileCount;
+    return fileCount;
+  };
+
+  for (const node of nodes) visit(node);
   return result;
 }
 
@@ -85,11 +92,6 @@ export function summarizeDirectory(node: FileNode, limit = 120): string {
   walk(node.children ?? []);
   const suffix = lines.length >= limit ? '\n... [truncated]' : '';
   return `${lines.join('\n')}${suffix}`;
-}
-
-function countFiles(node: FileNode): number {
-  if (node.type === 'file') return 1;
-  return (node.children ?? []).reduce((sum, child) => sum + countFiles(child), 0);
 }
 
 function scoreMentionEntry(entry: MentionEntry, tokens: string[], normalizedQuery: string): number {

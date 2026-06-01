@@ -1,12 +1,4 @@
-## Default (server/offline) compose
-## - Runs ONLY from already-available images (no builds)
-## - Persists data in named volumes
-## - Containers auto-start on reboot via `restart: unless-stopped`
-##
-## Initial server setup (one-time):
-## 1) Load images (offline): `docker load -i <images>.tar`
-## 2) Start stack:           `docker compose up -d`
-## 3) Ensure Docker starts:  `sudo systemctl enable --now docker`
+
 
 services:
   db:
@@ -19,7 +11,7 @@ services:
       POSTGRES_PASSWORD: evigstudio
       POSTGRES_DB: evigstudio
     volumes:
-      - evigstudio_pgdata:/var/lib/postgresql/data
+      - patched_pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U evigstudio"]
       interval: 5s
@@ -27,12 +19,12 @@ services:
       retries: 10
 
   api:
-    image: evigstudiolight-api:latest
+    image: evigstudio-patched-api:latest
+    build:
+      context: ./server
     restart: unless-stopped
-    # Keep env_file so deployers can provide secrets/config without rebuilding.
-    env_file: ./server/.env
+    env_file: ./server/.env.offline
     environment:
-      # IMPORTANT: inside Docker, 127.0.0.1 is the container itself.
       DATABASE_URL: postgresql://evigstudio:evigstudio@db:5432/evigstudio
     depends_on:
       db:
@@ -52,19 +44,20 @@ services:
       retries: 5
 
   llm-orch:
-    image: evigstudiolight-llm-orch:latest
+    image: evigstudio-patched-llm-orch:latest
+    build:
+      context: ./LLMOrchestrator
     restart: unless-stopped
     ports:
       - "3013:3013"
     env_file:
       - ./LLMOrchestrator/.env.offline
     environment:
-      # Ensure in-compose service DNS is used even if the env file is edited.
       REDIS_URL: redis://redis:6379
       DATABASE_URL: sqlite+aiosqlite:////data/llm_orchestrator.db
       PYTHONPATH: /app
     volumes:
-      - llm-db-data:/data
+      - patched_llm_db:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -76,7 +69,9 @@ services:
           - llm-orch
 
   llm-orch-worker:
-    image: evigstudiolight-llm-orch-worker:latest
+    image: evigstudio-patched-llm-orch-worker:latest
+    build:
+      context: ./LLMOrchestrator
     restart: unless-stopped
     env_file:
       - ./LLMOrchestrator/.env.offline
@@ -85,7 +80,7 @@ services:
       DATABASE_URL: sqlite+aiosqlite:////data/llm_orchestrator.db
       PYTHONPATH: /app
     volumes:
-      - llm-db-data:/data
+      - patched_llm_db:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command: python app/worker.py
@@ -96,7 +91,10 @@ services:
         condition: service_started
 
   frontend:
-    image: evigstudiolight-frontend:latest
+    image: evigstudio-patched-frontend:latest
+    build:
+      context: .
+      dockerfile: ./src/Dockerfile
     restart: unless-stopped
     ports:
       - "80:80"
@@ -106,12 +104,10 @@ services:
 
 networks:
   default:
-    name: evigstudio-net
+    name: evigstudio-patched-net
 
 volumes:
-  # Pin volume names so running compose from different folders
-  # does not create a new empty DB volume (which can look like "lost data").
-  llm-db-data:
-    name: evigstudiolight_llm-db-data
-  evigstudio_pgdata:
-    name: evigstudiolight_evigstudio_pgdata
+  patched_pgdata:
+    name: evigstudio_patched_pgdata
+  patched_llm_db:
+    name: evigstudio_patched_llm_db

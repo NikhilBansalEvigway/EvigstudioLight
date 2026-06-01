@@ -6,25 +6,57 @@ import { testConnection } from '@/lib/llmClient';
 export function SettingsBootstrap() {
   const initSettings = useAppStore((s) => s.initSettings);
   const setLMConnected = useAppStore((s) => s.setLMConnected);
+  const setRightPaneTab = useAppStore((s) => s.setRightPaneTab);
+
+  useEffect(() => {
+    const tab = useAppStore.getState().rightPaneTab as string;
+    if (tab === 'changes' || !['files', 'editor', 'context', 'users', 'prompt'].includes(tab)) {
+      setRightPaneTab('files');
+    }
+  }, [setRightPaneTab]);
 
   useEffect(() => {
     let cancelled = false;
+    let pendingTimer: number | null = null;
+
     void (async () => {
       await initSettings();
       if (cancelled) return;
       let delay = 3_000;
+
       const tick = async () => {
         if (cancelled) return;
         const result = await testConnection(useAppStore.getState().settings, { quiet: true });
         if (cancelled) return;
         setLMConnected(result.ok);
         delay = result.ok ? 15_000 : Math.min(60_000, Math.round(delay * 1.6));
-        window.setTimeout(tick, delay);
+        if (!cancelled) {
+          pendingTimer = window.setTimeout(tick, delay);
+        }
       };
+
+     
+      const onReconnect = () => {
+        if (cancelled) return;
+        if (pendingTimer != null) {
+          window.clearTimeout(pendingTimer);
+          pendingTimer = null;
+        }
+        delay = 3_000;
+        void tick();
+      };
+
+      window.addEventListener('online', onReconnect);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') onReconnect();
+      });
+
       void tick();
     })();
+
     return () => {
       cancelled = true;
+      if (pendingTimer != null) window.clearTimeout(pendingTimer);
     };
   }, [initSettings, setLMConnected]);
 

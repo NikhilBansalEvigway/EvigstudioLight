@@ -4,10 +4,11 @@ import { FileTree } from '@/components/FileTree';
 import {
   buildWorkspaceTree,
   getFileSystemAccessStatus,
-  getFileExtension,
   getUniqueWorkspaceLabel,
   pickDirectory,
   readWorkspaceFile,
+  requestWorkspacePermission,
+  resolveWorkspacePath,
   writeWorkspaceFile,
   writeWorkspaceFileVerified,
   workspaceRootsMatch,
@@ -20,30 +21,13 @@ import {
   workspaceFolderLabels,
 } from '@/lib/auditClient';
 import { SYSTEM_PROMPT } from '@/types';
-import { FolderOpen, FileCode, BookOpen, Save, AlertTriangle, FilePlus, X, Copy, Users, Loader2 } from 'lucide-react';
+import { findMentionNode } from '@/lib/fileMentions';
+import { Folder, FolderOpen, FileCode, BookOpen, Save, AlertTriangle, FilePlus, X, Copy, Users, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useActiveUsers } from '@/hooks/useActiveUsers';
 import { useTheme } from 'next-themes';
-import Editor, { loader } from '@monaco-editor/react';
-import * as monaco from 'monaco-editor';
-
-loader.config({ monaco });
-
-function getMonacoLanguage(filePath: string): string {
-  const ext = getFileExtension(filePath).toLowerCase();
-  const map: Record<string, string> = {
-    '.m': 'matlab', '.vhd': 'vhdl', '.vhdl': 'vhdl',
-    '.js': 'javascript', '.ts': 'typescript', '.tsx': 'typescript',
-    '.json': 'json', '.md': 'markdown', '.py': 'python',
-    '.c': 'c', '.cpp': 'cpp', '.h': 'c', '.hpp': 'cpp',
-    '.html': 'html', '.css': 'css', '.xml': 'xml',
-    '.yaml': 'yaml', '.yml': 'yaml', '.sh': 'shell',
-    '.v': 'systemverilog', '.sv': 'systemverilog',
-    '.txt': 'plaintext', '.ini': 'ini', '.toml': 'plaintext',
-  };
-  return map[ext] || 'plaintext';
-}
+import { CodeMirrorEditor } from '@/components/CodeMirrorEditor';
 
 type SharedWorkspaceRow = {
   id: string;
@@ -286,6 +270,19 @@ export function WorkspacePane() {
     }
   }, [setFileTree]);
 
+  
+  const handleRestoreAccess = useCallback(async () => {
+    const roots = useAppStore.getState().workspaceRoots;
+    if (roots.length === 0) return;
+    const granted = await requestWorkspacePermission(roots, 'readwrite');
+    if (!granted) {
+      toast.error('Folder access was not granted. Use "Open Folder" to re-select it.');
+      return;
+    }
+    await handleRefresh();
+    toast.success('Workspace access restored.');
+  }, [handleRefresh]);
+
   const handleSave = async () => {
     if (!hasWorkspace || !activeFilePath) return;
     try {
@@ -341,11 +338,31 @@ export function WorkspacePane() {
   const handleCreateFile = async () => {
     if (!hasWorkspace || !newFileName.trim()) return;
     try {
-      await writeWorkspaceFileVerified(workspaceRoots, newFileName.trim(), '', { expectCreate: true });
-      toast.success(`Created ${newFileName.trim()}`);
+      let inputPath = newFileName.trim();
+     
+      if (workspaceRoots.length > 1) {
+        const firstSegment = inputPath.replace(/\\/g, '/').split('/')[0] ?? '';
+        const hasPrefix = workspaceRoots.some((r) => r.label === firstSegment);
+        if (!hasPrefix) {
+          inputPath = `${workspaceRoots[0].label}/${inputPath}`;
+        }
+      }
+      await writeWorkspaceFileVerified(workspaceRoots, inputPath, '', { expectCreate: true });
+     
+      let normalizedPath = inputPath;
+      try {
+        normalizedPath = resolveWorkspacePath(workspaceRoots, inputPath).workspacePath;
+      } catch {
+        normalizedPath = inputPath;
+      }
+      toast.success(`Created ${normalizedPath}`);
       setNewFileName('');
       setShowNewFile(false);
       await handleRefresh();
+     
+      const appState = useAppStore.getState();
+      appState.setActiveFile(normalizedPath, '');
+      appState.setShowRightPane(true);
     } catch (err: any) {
       toast.error(`Create failed: ${err.message}`);
     }
@@ -396,6 +413,15 @@ export function WorkspacePane() {
                 </button>
                 {hasWorkspace && (
                   <>
+                    {fileTree.length === 0 && !workspaceTreeLoading && (
+                      <button
+                        onClick={handleRestoreAccess}
+                        className="rounded-xl border border-primary/30 bg-primary/15 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-primary transition-all hover:-translate-y-0.5 hover:bg-primary/20"
+                        title="Re-grant access to the open folder(s) from your last session"
+                      >
+                        Restore access
+                      </button>
+                    )}
                     <button
                       onClick={handleRefresh}
                       disabled={workspaceTreeLoading}
@@ -541,84 +567,13 @@ export function WorkspacePane() {
                   </div>
                 </div>
                 <div className="flex-1 min-h-0">
-                  <Editor
-                    height="100%"
-                    language={getMonacoLanguage(activeFilePath)}
+                  <CodeMirrorEditor
+                    filePath={activeFilePath}
                     value={activeFileContent}
-                    onChange={(v) => setActiveFileContent(v ?? '')}
-                    theme={resolvedTheme === 'dark' ? 'agent-dark' : 'agent-light'}
-                    beforeMount={(monaco) => {
-                      monaco.editor.defineTheme('agent-dark', {
-                        base: 'vs-dark',
-                        inherit: true,
-                        rules: [
-                          { token: 'comment', foreground: '546E7A', fontStyle: 'italic' },
-                          { token: 'keyword', foreground: '17b8a6' },
-                          { token: 'string', foreground: '4ade80' },
-                          { token: 'number', foreground: 'f59e0b' },
-                          { token: 'type', foreground: '60a5fa' },
-                        ],
-                        colors: {
-                          'editor.background': '#0d1017',
-                          'editor.foreground': '#d4d8e0',
-                          'editor.lineHighlightBackground': '#141b24',
-                          'editorCursor.foreground': '#17b8a6',
-                          'editor.selectionBackground': '#17b8a633',
-                          'editorLineNumber.foreground': '#374151',
-                          'editorLineNumber.activeForeground': '#6b7280',
-                          'editorGutter.background': '#0d1017',
-                          'editorWidget.background': '#141b24',
-                          'input.background': '#141b24',
-                          'input.foreground': '#d4d8e0',
-                          'input.border': '#1e2a36',
-                        },
-                      });
-                      monaco.editor.defineTheme('agent-light', {
-                        base: 'vs',
-                        inherit: true,
-                        rules: [
-                          { token: 'comment', foreground: '6b7280', fontStyle: 'italic' },
-                          { token: 'keyword', foreground: '0d9488' },
-                          { token: 'string', foreground: '16a34a' },
-                          { token: 'number', foreground: 'd97706' },
-                          { token: 'type', foreground: '2563eb' },
-                        ],
-                        colors: {
-                          'editor.background': '#f5f6f8',
-                          'editor.foreground': '#1e293b',
-                          'editor.lineHighlightBackground': '#e8ecf1',
-                          'editorCursor.foreground': '#0d9488',
-                          'editor.selectionBackground': '#0d948833',
-                          'editorLineNumber.foreground': '#94a3b8',
-                          'editorLineNumber.activeForeground': '#64748b',
-                          'editorGutter.background': '#f5f6f8',
-                          'editorWidget.background': '#eef0f4',
-                          'input.background': '#eef0f4',
-                          'input.foreground': '#1e293b',
-                          'input.border': '#d1d5db',
-                        },
-                      });
-                    }}
-                    onMount={(editor, monaco) => {
-                      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveActiveRef.current());
-                      editor.addCommand(
-                        monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS,
-                        () => saveAllRef.current(),
-                      );
-                    }}
-                    options={{
-                      fontSize: 12,
-                      fontFamily: "ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace",
-                      minimap: { enabled: false },
-                      scrollBeyondLastLine: false,
-                      padding: { top: 8 },
-                      lineNumbers: 'on',
-                      renderLineHighlight: 'line',
-                      bracketPairColorization: { enabled: true },
-                      automaticLayout: true,
-                      wordWrap: 'on',
-                      tabSize: 2,
-                    }}
+                    onChange={(v) => setActiveFileContent(v)}
+                    theme={resolvedTheme === 'dark' ? 'dark' : 'light'}
+                    onSave={() => saveActiveRef.current()}
+                    onSaveAll={() => saveAllRef.current()}
                   />
                 </div>
               </>
@@ -693,14 +648,20 @@ export function WorkspacePane() {
             </div>
             {contextFiles.length === 0 ? (
               <p className="text-xs text-muted-foreground">
-                No files in context. Click the + icon next to files in the file tree to add them.
+                No files in context. Click the book icon next to a file or folder in the tree, or @-mention it in chat, to add it here.
               </p>
             ) : (
               <div className="space-y-1">
-                {contextFiles.map(path => (
+                {contextFiles.map(path => {
+                  const isFolder = findMentionNode(fileTree, path)?.type === 'directory';
+                  return (
                   <div key={path} className="flex items-center gap-2 px-2 py-1 rounded bg-secondary text-xs">
-                    <FileCode className="w-3 h-3 text-primary shrink-0" />
-                    <span className="flex-1 truncate">{path}</span>
+                    {isFolder ? (
+                      <Folder className="w-3 h-3 text-primary shrink-0" />
+                    ) : (
+                      <FileCode className="w-3 h-3 text-primary shrink-0" />
+                    )}
+                    <span className="flex-1 truncate">{path}{isFolder ? '/' : ''}</span>
                     <button
                       onClick={() => {
                         toggleContextFile(path);
@@ -718,7 +679,8 @@ export function WorkspacePane() {
                       ×
                     </button>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
             <p className="text-[10px] text-muted-foreground mt-4">

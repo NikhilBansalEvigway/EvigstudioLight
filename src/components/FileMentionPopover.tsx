@@ -107,6 +107,7 @@ export function FileMentionPopover({ fileTree, query, onSelect, onClose, visible
                                 <button
                                     key={file.path}
                                     data-mention-item
+                                    onMouseDown={(e) => e.preventDefault()}
                                     onClick={() => onSelect(file)}
                                     onMouseEnter={() => setSelectedIndex(index)}
                                     className={`w-full flex items-center gap-2 px-3 py-1.5 text-left transition-colors ${index === selectedIndex

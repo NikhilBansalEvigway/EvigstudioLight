@@ -121,17 +121,19 @@ async function ensurePermission(
 ): Promise<void> {
   if (!handle || typeof handle.queryPermission !== 'function') return;
   const opts = { mode };
+  
+  const allowRequest = options?.request !== false;
   try {
     const current = await handle.queryPermission(opts);
     if (current === 'granted') return;
-    if (options?.request) {
-      const next = await handle.requestPermission?.(opts);
+    if (allowRequest && typeof handle.requestPermission === 'function') {
+      const next = await handle.requestPermission(opts);
       if (next === 'granted') return;
     }
-    throw new Error('Permission denied');
+    throw new Error('Workspace permission denied. Please re-open the workspace folder.');
   } catch (e) {
-    // Some Electron/Chromium builds may throw for permission queries; fall back to operation errors.
-    if (e instanceof Error && e.message === 'Permission denied') throw e;
+    // Some Chromium/Electron builds may throw for permission queries; fall back to operation errors.
+    if (e instanceof Error && e.message.startsWith('Workspace permission denied')) throw e;
   }
 }
 
@@ -231,7 +233,8 @@ export type BuildWorkspaceTreeOptions = {
 function createProgressEmitter(
   getTree: () => FileNode[],
   onProgress?: (tree: FileNode[]) => void,
-  intervalMs = 80,
+  
+  intervalMs = 200,
 ) {
   let lastEmit = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -274,7 +277,8 @@ async function buildAnnotatedFileTree(
   emitProgress: () => void,
   relativePath = '',
 ): Promise<void> {
-  await ensurePermission(dirHandle, 'read');
+  
+  await ensurePermission(dirHandle, 'read', { request: false });
 
   for await (const [name, handle] of (dirHandle as any).entries()) {
     const fullRelativePath = relativePath ? `${relativePath}/${name}` : name;
@@ -294,9 +298,8 @@ async function buildAnnotatedFileTree(
         isWorkspaceRoot: false,
       };
       targetNodes.push(directoryNode);
-      sortFileNodesInPlace(targetNodes);
-      emitProgress();
 
+      
       await buildAnnotatedFileTree(
         root,
         handle as FileSystemDirectoryHandle,
@@ -304,8 +307,6 @@ async function buildAnnotatedFileTree(
         emitProgress,
         fullRelativePath,
       );
-      sortFileNodesInPlace(directoryNode.children ?? []);
-      emitProgress();
       continue;
     }
 
@@ -319,9 +320,31 @@ async function buildAnnotatedFileTree(
       workspaceLabel: root.label,
       isWorkspaceRoot: false,
     });
-    sortFileNodesInPlace(targetNodes);
-    emitProgress();
   }
+
+  sortFileNodesInPlace(targetNodes);
+  emitProgress();
+}
+
+export async function requestWorkspacePermission(
+  workspaceRoots: WorkspaceRoot[],
+  mode: 'read' | 'readwrite' = 'readwrite',
+): Promise<boolean> {
+  let allGranted = true;
+  for (const root of workspaceRoots) {
+    const handle = root.handle as any;
+    if (!handle || typeof handle.requestPermission !== 'function') continue;
+    try {
+      const current =
+        typeof handle.queryPermission === 'function' ? await handle.queryPermission({ mode }) : 'prompt';
+      if (current === 'granted') continue;
+      const next = await handle.requestPermission({ mode });
+      if (next !== 'granted') allGranted = false;
+    } catch {
+      allGranted = false;
+    }
+  }
+  return allGranted;
 }
 
 export function isFileSystemAccessSupported(): boolean {
@@ -480,7 +503,8 @@ export async function buildFileTree(
   dirHandle: FileSystemDirectoryHandle,
   path = ''
 ): Promise<FileNode[]> {
-  await ensurePermission(dirHandle, 'read');
+  // Query-only (automatic on load) — never auto-prompt; see buildAnnotatedFileTree.
+  await ensurePermission(dirHandle, 'read', { request: false });
   const nodes: FileNode[] = [];
 
   for await (const [name, handle] of (dirHandle as any).entries()) {
@@ -556,6 +580,31 @@ export async function workspaceFileExists(workspaceRoots: WorkspaceRoot[], path:
   }
 
   return fileExists(current, parts[parts.length - 1]);
+}
+
+export async function workspacePathExists(workspaceRoots: WorkspaceRoot[], path: string): Promise<boolean> {
+  let resolved: { root: WorkspaceRoot; relativePath: string };
+  try {
+    resolved = resolveWorkspacePath(workspaceRoots, path);
+  } catch {
+    return false;
+  }
+  const { root, relativePath } = resolved;
+  if (!relativePath) return true; // the workspace root itself
+
+  const parts = sanitizePath(relativePath);
+  if (parts.length === 0) return false;
+
+  let current: FileSystemDirectoryHandle = root.handle;
+  for (let i = 0; i < parts.length - 1; i++) {
+    try {
+      current = await current.getDirectoryHandle(parts[i]);
+    } catch {
+      return false;
+    }
+  }
+
+  return entryExists(current, parts[parts.length - 1]);
 }
 
 export async function writeWorkspaceFileVerified(
@@ -768,28 +817,39 @@ export function isSupportedFile(name: string): boolean {
   ].includes(ext);
 }
 
-/** Flat list of file paths (directories omitted) for LLM project overview. */
 export function serializeFileTree(
   nodes: FileNode[],
   options?: {
     fileFilter?: (node: FileNode) => boolean;
+    maxChars?: number;
   },
 ): string {
+  const maxChars = options?.maxChars ?? Number.POSITIVE_INFINITY;
   const paths: string[] = [];
+  let approxChars = 0;
+  let truncated = false;
   const walk = (list: FileNode[]) => {
     for (const n of list) {
+      if (truncated) return;
       if (n.type === 'file') {
         if (!options?.fileFilter || options.fileFilter(n)) {
           paths.push(n.path);
+          approxChars += n.path.length + 1;
+          if (approxChars >= maxChars) {
+            truncated = true;
+            return;
+          }
         }
       } else if (n.type === 'directory' && n.children?.length) {
         walk(n.children);
+        if (truncated) return;
       }
     }
   };
   walk(nodes);
   paths.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-  return paths.join('\n');
+  const joined = paths.join('\n');
+  return truncated ? `${joined}\n... [truncated: large workspace; mention specific files/folders with @]` : joined;
 }
 
 /**

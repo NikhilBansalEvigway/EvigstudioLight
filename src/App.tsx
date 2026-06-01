@@ -6,12 +6,23 @@ import { ThemeProvider } from "next-themes";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import { SettingsBootstrap } from "@/components/SettingsBootstrap";
 import { UiThemeSync } from "@/components/UiThemeSync";
+import { useTabGuard } from "@/hooks/useTabGuard";
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
 import Login from "./pages/Login";
 import AdminPage from "./pages/AdminPage";
 
 const queryClient = new QueryClient();
+
+function SessionGuardBanner({ userId }: { userId: string }) {
+  const conflict = useTabGuard(userId);
+  if (!conflict) return null;
+  return (
+    <div className="fixed top-0 left-0 right-0 z-[9999] bg-warning/90 text-warning-foreground text-[12px] font-medium text-center px-4 py-1.5 shadow-md">
+      ⚠ Another session with this account is active. Using multiple tabs or devices simultaneously may cause conflicts.
+    </div>
+  );
+}
 
 function AppRoutes() {
   const { ready, serverAvailable, user } = useAuth();
@@ -36,12 +47,15 @@ function AppRoutes() {
 
   // API down or already signed in: main app; /login stays available when API is down so you can open the sign-in page.
   return (
-    <Routes>
-      <Route path="/login" element={user ? <Navigate to="/" replace /> : <Login />} />
-      <Route path="/admin" element={user ? <AdminPage /> : <Navigate to="/" replace />} />
-      <Route path="/" element={<Index />} />
-      <Route path="*" element={<NotFound />} />
-    </Routes>
+    <>
+      {user?.id && <SessionGuardBanner userId={user.id} />}
+      <Routes>
+        <Route path="/login" element={user ? <Navigate to="/" replace /> : <Login />} />
+        <Route path="/admin" element={user ? <AdminPage /> : <Navigate to="/" replace />} />
+        <Route path="/" element={<Index />} />
+        <Route path="*" element={<NotFound />} />
+      </Routes>
+    </>
   );
 }
 

@@ -6,9 +6,12 @@ import {
   buildWorkspaceTree,
   deleteWorkspacePath,
   isWorkspacePathIgnored,
+  listWorkspaceDirectoryContents,
   readWorkspaceFile,
+  resolveWorkspacePath,
   serializeFileTree,
   STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE,
+  workspacePathExists,
   writeWorkspaceFile,
 } from '@/lib/fsWorkspace';
 import { DEFAULT_CONTEXT_RULES, isAllowedContextPath } from '@/lib/contextRules';
@@ -18,7 +21,10 @@ import {
   hasGatherTools,
   hasMutationTools,
   executeAgentTools,
+  extractThinkingBlocks,
   stripChannelTokens,
+  stripToolMarkers,
+  normalizeToolMarkerLineBreaks,
   type AgentAction,
 } from '@/lib/agentTools';
 import { applyPatch, containsPatches, parsePatches } from '@/lib/patchApply';
@@ -74,6 +80,34 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 
+function deriveThinkingFromUserPrompt(userText: string): string {
+  const text = userText.trim().slice(0, 300);
+  if (!text) return '';
+  const lower = text.toLowerCase();
+  let plan: string;
+  if (/\b(fix|bug|error|crash|issue|broken|fail|wrong|not working)\b/.test(lower)) {
+    plan = 'diagnose the problem and propose a targeted fix';
+  } else if (/\b(create|write|make|build|generate|add|implement|scaffold|new)\b/.test(lower)) {
+    plan = 'implement the requested feature or content';
+  } else if (/\b(refactor|clean|improve|optimize|simplify|restructure|rewrite)\b/.test(lower)) {
+    plan = 'refactor the code while preserving behavior';
+  } else if (/\b(explain|what is|what are|why|how does|how do|tell me|describe|understand|mean)\b/.test(lower)) {
+    plan = 'explain the concept clearly with relevant details';
+  } else if (/\b(test|spec|unit test|coverage|testing)\b/.test(lower)) {
+    plan = 'write the requested tests';
+  } else if (/\b(review|check|audit|look at|inspect|is this|is it)\b/.test(lower)) {
+    plan = 'review and provide feedback';
+  } else if (/\b(update|change|modify|edit|replace|rename)\b/.test(lower)) {
+    plan = 'apply the requested change';
+  } else if (/\b(delete|remove|clean up|get rid)\b/.test(lower)) {
+    plan = 'remove the specified code or content';
+  } else {
+    plan = 'understand the request and formulate a response';
+  }
+  const preview = text.length > 150 ? `${text.slice(0, 150)}…` : text;
+  return `**Request:** "${preview}"\n\n**Approach:** ${plan}.`;
+}
+
 const KEY_PROJECT_FILES = [
   'package.json',
   'tsconfig.json',
@@ -88,20 +122,25 @@ const AUTO_SUMMARY_HEADER = 'Conversation summary (auto-generated):';
 const AUTO_SUMMARY_FOOTER = 'Continue chatting with this summary as context.';
 const SUMMARY_TEMP = 0.1;
 const SUMMARY_MAX_TOKENS = 2048;
+// Hard ceiling so a stalled local model can never leave the UI stuck on "Summarizing…".
+const SUMMARY_TIMEOUT_MS = 3 * 60_000;
 const INPUT_MIN_HEIGHT_PX = 56;
 const INPUT_MAX_HEIGHT_PX = 220;
 
 export function ChatPane() {
   const {
     chats, activeChatId, createChat, addMessage, updateLastAssistantMessage, updateChatFields, saveVersionSnapshot,
-    settings, contextFiles, fileTree, isStreaming, setIsStreaming, workspaceRoots,
+    settings, contextFiles, fileTree, isStreaming, streamingChatId, setIsStreaming, workspaceRoots,
     workspaceContextUsedChars, contextBudgetChars,
     serverContextRules,
     setHistoryContextUsage,
   } = useAppStore();
 
+  const isActiveChatStreaming = isStreaming && streamingChatId === activeChatId;
+
   const [autoAppliedPathsByMessageId, setAutoAppliedPathsByMessageId] = useState<Record<string, string[]>>({});
   const [agentActionsByMessageId, setAgentActionsByMessageId] = useState<Record<string, AgentAction[]>>({});
+  const [agentThoughtsByMessageId, setAgentThoughtsByMessageId] = useState<Record<string, string[]>>({});
   const patchedPathsRef = useRef<Set<string>>(new Set());
   const [agentGatherStep, setAgentGatherStep] = useState<number | null>(null);
   const [showContextActionsDialog, setShowContextActionsDialog] = useState(false);
@@ -128,6 +167,19 @@ export function ChatPane() {
   useEffect(() => {
     patchedPathsRef.current = new Set();
   }, [activeChatId]);
+
+  
+  useEffect(() => {
+    if (!isActiveChatStreaming) return;
+    const id = window.setTimeout(() => {
+      if (useAppStore.getState().isStreaming) {
+        setIsStreaming(false);
+        setAgentGatherStep(null);
+        useAppStore.getState().setAgentStepProgress(0, 0);
+      }
+    }, 12 * 60 * 1000);
+    return () => window.clearTimeout(id);
+  }, [isActiveChatStreaming, setIsStreaming]);
 
   const activeChat = chats.find(c => c.id === activeChatId);
   const isLocked = activeChat ? !canWriteChat(activeChat) : false;
@@ -166,8 +218,15 @@ export function ChatPane() {
   const abortReasonRef = useRef<'user' | 'stall' | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Used to pass explicit values to sendCurrentInput when React state is stale (context-action re-send flow).
+  const forcedSendRef = useRef<{
+    input: string;
+    images: string[];
+    mentionedFiles: string[];
+    selectionRef: Message['selectionRef'] | null;
+  } | null>(null);
 
-  const [showCompactedHistory, setShowCompactedHistory] = useState(false);
+  const [showCompactedHistory, setShowCompactedHistory] = useState(true);
 
   useEffect(() => {
     setShowCompactedHistory(false);
@@ -362,18 +421,34 @@ export function ChatPane() {
     }
   }, []);
 
+ 
   useEffect(() => {
-    if (fileTree.length === 0 || mentionedFiles.length === 0) return;
-    setMentionedFiles((prev) => prev.filter((path) => !!findMentionNode(fileTree, path)));
-  }, [fileTree, mentionedFiles.length]);
+    if (workspaceRoots.length === 0 || mentionedFiles.length === 0) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      const checks = await Promise.all(
+        mentionedFiles.map(async (path) => ({
+          path,
+          exists: await workspacePathExists(workspaceRoots, path).catch(() => true),
+        })),
+      );
+      if (cancelled) return;
+      const missing = new Set(checks.filter((c) => !c.exists).map((c) => c.path));
+      if (missing.size === 0) return;
+      setMentionedFiles((prev) => prev.filter((path) => !missing.has(path)));
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [workspaceRoots, mentionedFiles]);
 
   useEffect(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
     const BOTTOM_THRESHOLD_PX = 96;
     const onScroll = () => {
-      // When switching chats, we intentionally jump to the bottom. During that
-      // initialization window, don't mark the user as "scrolled up".
+      
       if (isInitializingScroll.current) {
         userScrolledUp.current = false;
         setShowScrollToLatest(false);
@@ -419,14 +494,20 @@ export function ChatPane() {
     isInitializingScroll.current = true;
     userScrolledUp.current = false;
     setShowScrollToLatest(false);
-    // After the message list renders (and after any async refresh loads), snap to the latest.
+    
     requestAnimationFrame(() => scrollToBottom('auto'));
-    const id = window.setTimeout(() => {
+   
+    const id0 = window.setTimeout(() => { scrollToBottom('auto'); }, 0);
+   
+    const id1 = window.setTimeout(() => { scrollToBottom('auto'); }, 120);
+    const id2 = window.setTimeout(() => {
       scrollToBottom('auto');
       isInitializingScroll.current = false;
-    }, 0);
+    }, 400);
     return () => {
-      window.clearTimeout(id);
+      window.clearTimeout(id0);
+      window.clearTimeout(id1);
+      window.clearTimeout(id2);
       isInitializingScroll.current = false;
     };
   }, [activeChatId, scrollToBottom]);
@@ -443,6 +524,9 @@ export function ChatPane() {
       Object.fromEntries(Object.entries(prev).filter(([messageId]) => keepIds.has(messageId))),
     );
     setAgentActionsByMessageId((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([messageId]) => keepIds.has(messageId))),
+    );
+    setAgentThoughtsByMessageId((prev) =>
       Object.fromEntries(Object.entries(prev).filter(([messageId]) => keepIds.has(messageId))),
     );
   }, []);
@@ -659,7 +743,9 @@ export function ChatPane() {
 
   const buildContextMessages = useCallback(async (messageMentionedFiles: string[] = []): Promise<{ role: 'user'; content: string }[]> => {
     if (workspaceRoots.length === 0) {
-      useAppStore.getState().setContextUsage(0, Math.max(10_000, contextBudgetChars || 200_000));
+     
+      const _histChars1 = useAppStore.getState().historyContextUsedChars;
+      useAppStore.getState().setContextUsage(0, Math.max(10_000, contextBudgetChars || 200_000), _histChars1);
       return [];
     }
 
@@ -667,11 +753,19 @@ export function ChatPane() {
     const parts: string[] = [];
     const stats = { attachedFiles: 0, attachedFolders: 0, staleRefs: 0, truncatedFiles: 0, omittedFiles: 0 };
 
-    const MAX_TREE_CHARS = 30_000;
+    const MAX_TOTAL_CONTEXT_CHARS = Math.max(10_000, contextBudgetChars || 200_000);
+   
+    const WORKSPACE_CONTEXT_LIMIT = Math.min(
+      MAX_TOTAL_CONTEXT_CHARS,
+      Math.max(24_000, Math.floor(MAX_TOTAL_CONTEXT_CHARS * 0.6)),
+    );
+    const MAX_TREE_CHARS = Math.min(16_000, Math.floor(WORKSPACE_CONTEXT_LIMIT * 0.4));
     const MAX_FILE_CHARS_AUTO = 2_000;
     const MAX_FILE_CHARS_EXPLICIT = 60_000;
-    const MAX_FOLDER_FILE_CONTENTS = 8;
-    const MAX_TOTAL_CONTEXT_CHARS = Math.max(10_000, contextBudgetChars || 200_000);
+   
+    const MAX_FILE_CHARS_FOLDER = 20_000;
+    const MAX_FOLDER_FILES_SCAN = 300;
+    const MAX_FOLDER_LISTING_ENTRIES = 400;
 
     const truncate = (content: string, maxChars: number) => ({
       text: content.length > maxChars ? `${content.slice(0, maxChars)}\n\n... [truncated]` : content,
@@ -679,20 +773,21 @@ export function ChatPane() {
     });
 
     const totalChars = () => parts.reduce((sum, part) => sum + part.length, 0);
-    const canAdd = (nextPart: string) => totalChars() + nextPart.length <= MAX_TOTAL_CONTEXT_CHARS;
+    const canAdd = (nextPart: string) => totalChars() + nextPart.length <= WORKSPACE_CONTEXT_LIMIT;
 
     const rules = serverContextRules ?? DEFAULT_CONTEXT_RULES;
     const isContextFilePath = (p: string) => isAllowedContextPath(p, rules);
 
-    const addFileContext = async (path: string, heading: string, maxChars: number, required = false) => {
+    
+    const addFileContext = async (path: string, heading: string, maxChars: number, required = false, explicit = false) => {
       if (included.has(path)) return true;
-      if (isWorkspacePathIgnored(path)) {
+      if (!explicit && isWorkspacePathIgnored(path)) {
         stats.omittedFiles += 1;
         return false;
       }
 
-      if (!isContextFilePath(path)) {
-        // Keep non-code assets (images, videos, etc.) out of the LLM context.
+      if (!explicit && !isContextFilePath(path)) {
+      
         const block = `### ${heading}: ${path}\n(Skipped: non-code file)`;
         if (canAdd(block)) {
           parts.push(block);
@@ -738,8 +833,9 @@ export function ChatPane() {
       }
 
       stats.attachedFolders += 1;
-      // Summarize the folder but keep non-code files out of the listing.
-      const listing = summarizeDirectory(node)
+
+     
+      const listing = summarizeDirectory(node, MAX_FOLDER_LISTING_ENTRIES)
         .split('\n')
         .filter((line) => {
           const trimmed = line.trim();
@@ -748,14 +844,27 @@ export function ChatPane() {
           return isContextFilePath(p);
         })
         .join('\n');
-      const block = `### Folder: ${path}\n\`\`\`\n${listing || '(empty)'}\n\`\`\``;
-      if (canAdd(block)) {
-        parts.push(block);
+      const listingBlock = `### Folder: ${path}\n\`\`\`\n${listing || '(empty)'}\n\`\`\``;
+      if (canAdd(listingBlock)) {
+        parts.push(listingBlock);
       }
 
-      const folderFiles = collectDirectoryFilePaths(node, MAX_FOLDER_FILE_CONTENTS).filter(isContextFilePath);
+      
+      const folderFiles = collectDirectoryFilePaths(node, MAX_FOLDER_FILES_SCAN).filter(isContextFilePath);
+      let inlined = 0;
       for (const filePath of folderFiles) {
-        await addFileContext(filePath, `File from @folder ${path}`, MAX_FILE_CHARS_AUTO);
+        const ok = await addFileContext(filePath, `File from folder ${path}`, MAX_FILE_CHARS_FOLDER);
+        if (ok) {
+          inlined += 1;
+        } else if (totalChars() >= WORKSPACE_CONTEXT_LIMIT) {
+          break; // budget exhausted (large folder) — rely on the listing + on-demand reads
+        }
+      }
+      const remaining = folderFiles.length - inlined;
+      if (remaining > 0 && totalChars() >= WORKSPACE_CONTEXT_LIMIT) {
+        parts.push(
+          `(Folder "${path}" is large: inlined ${inlined} file(s) in full; ${remaining}+ more are listed above. Read any of them with *** Read File: path.)`,
+        );
       }
     };
 
@@ -763,27 +872,54 @@ export function ChatPane() {
     for (const path of mentionedRefs) {
       const node = findMentionNode(fileTree, path);
       if (!node) {
-        const readFromPath = await addFileContext(path, '@ file (not in current tree)', MAX_FILE_CHARS_EXPLICIT, true);
-        if (!readFromPath) stats.staleRefs += 1;
+       
+        let dirListing: string[] | null = null;
+        try {
+          dirListing = await listWorkspaceDirectoryContents(workspaceRoots, path);
+        } catch {
+          dirListing = null;
+        }
+        if (dirListing) {
+          const listing = dirListing
+            .filter((name) => name.endsWith('/') || isContextFilePath(`${path}/${name}`))
+            .join('\n');
+          const block = `### @ folder: ${path}\n\`\`\`\n${listing || '(empty)'}\n\`\`\``;
+          if (canAdd(block)) {
+            parts.push(block);
+            stats.attachedFolders += 1;
+          } else {
+            stats.staleRefs += 1;
+          }
+        } else {
+          const readFromPath = await addFileContext(path, '@ file (not in current tree)', MAX_FILE_CHARS_EXPLICIT, true, true);
+          if (!readFromPath) stats.staleRefs += 1;
+        }
         continue;
       }
       if (node.type === 'directory') {
         await addFolderContext(path);
       } else {
-        await addFileContext(path, '@ file', MAX_FILE_CHARS_EXPLICIT, true);
+        await addFileContext(path, '@ file', MAX_FILE_CHARS_EXPLICIT, true, true);
       }
     }
 
-    const pinnedContextFiles = contextFiles.filter((path) => !mentionedRefs.includes(path));
-    for (const path of pinnedContextFiles) {
-      await addFileContext(path, 'Pinned context file', MAX_FILE_CHARS_EXPLICIT);
+    const pinnedContextEntries = contextFiles.filter((path) => !mentionedRefs.includes(path));
+    for (const path of pinnedContextEntries) {
+    
+      const node = findMentionNode(fileTree, path);
+      if (node?.type === 'directory') {
+        await addFolderContext(path);
+      } else {
+        await addFileContext(path, 'Pinned context file', MAX_FILE_CHARS_EXPLICIT, true, true);
+      }
     }
 
-    const hasExplicitContext = mentionedRefs.length > 0 || pinnedContextFiles.length > 0;
+    const hasExplicitContext = mentionedRefs.length > 0 || pinnedContextEntries.length > 0;
     if (!hasExplicitContext) {
       const treeStr = fileTree.length
         ? serializeFileTree(fileTree, {
             fileFilter: (n) => isContextFilePath(n.path),
+            maxChars: MAX_TREE_CHARS,
           })
         : '';
       if (treeStr) {
@@ -815,12 +951,14 @@ export function ChatPane() {
     }
 
     if (parts.length === 0) {
-      useAppStore.getState().setContextUsage(0, MAX_TOTAL_CONTEXT_CHARS);
+      const _histChars2 = useAppStore.getState().historyContextUsedChars;
+      useAppStore.getState().setContextUsage(0, MAX_TOTAL_CONTEXT_CHARS, _histChars2);
       return [];
     }
     const summary = `Context summary: ${stats.attachedFiles} @ file(s), ${stats.attachedFolders} @ folder(s), ${stats.truncatedFiles} truncated file(s), ${stats.staleRefs} stale reference(s). Use the provided file contents and workspace tools; do not ask the user to provide these files again.`;
     const content = `Workspace context (use paths below as ground truth; do not invent paths that are not listed):\n${summary}\n\n${parts.join('\n\n')}`;
-    useAppStore.getState().setContextUsage(content.length, MAX_TOTAL_CONTEXT_CHARS);
+    const _histChars3 = useAppStore.getState().historyContextUsedChars;
+    useAppStore.getState().setContextUsage(content.length, MAX_TOTAL_CONTEXT_CHARS, _histChars3);
     return [{ role: 'user' as const, content }];
   }, [workspaceRoots, fileTree, contextFiles, contextBudgetChars, serverContextRules]);
 
@@ -848,6 +986,12 @@ export function ChatPane() {
 
   const handleMentionSelect = useCallback((entry: MentionEntry) => {
     setMentionedFiles(prev => prev.includes(entry.path) ? prev : [...prev, entry.path]);
+
+    // Also pin the reference into the persistent context list so it shows in the right-pane
+    // "Injected Files" panel and stays available on later turns (works for files and folders).
+    if (!useAppStore.getState().contextFiles.includes(entry.path)) {
+      useAppStore.getState().toggleContextFile(entry.path);
+    }
 
     if (mentionStartIdx >= 0) {
       const before = input.slice(0, mentionStartIdx);
@@ -880,11 +1024,19 @@ export function ChatPane() {
     const roots = useAppStore.getState().workspaceRoots;
     if (roots.length === 0) throw new Error('No workspace folder open');
 
-    const { filePath, content, operation = 'update' } = patch;
+    const { filePath, operation = 'update' } = patch;
+
+   
+    let normalizedPath: string;
+    try {
+      normalizedPath = resolveWorkspacePath(roots, filePath).workspacePath;
+    } catch {
+      normalizedPath = filePath;
+    }
 
     if (operation === 'delete') {
       await deleteWorkspacePath(roots, filePath);
-      useAppStore.getState().removeWorkspacePathReferences(filePath);
+      useAppStore.getState().removeWorkspacePathReferences(normalizedPath);
       return;
     }
 
@@ -896,7 +1048,7 @@ export function ChatPane() {
     }
     const result = applyPatch(original, patch);
     await writeWorkspaceFile(roots, filePath, result);
-    useAppStore.getState().syncEditorFileContent(filePath, result);
+    useAppStore.getState().syncEditorFileContent(normalizedPath, result);
   }, []);
 
   const handleOpenEditorFile = useCallback(async (filePath: string) => {
@@ -950,7 +1102,15 @@ export function ChatPane() {
       for (const p of patches) {
         try {
           await applyPatchToWorkspace(p);
-          appliedPaths.push(p.filePath);
+          
+          let normalizedPath = p.filePath;
+          try {
+            const roots = useAppStore.getState().workspaceRoots;
+            normalizedPath = resolveWorkspacePath(roots, p.filePath).workspacePath;
+          } catch {
+            normalizedPath = p.filePath;
+          }
+          appliedPaths.push(normalizedPath);
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           errors.push(`${p.filePath}: ${msg}`);
@@ -965,10 +1125,14 @@ export function ChatPane() {
           [assistantMessageId]: [...new Set([...(prev[assistantMessageId] ?? []), ...appliedPaths])],
         }));
 
-        const actions: AgentAction[] = appliedPaths.map((path) => {
-          const patch = patches.find((p) => p.filePath === path);
+        const actions: AgentAction[] = appliedPaths.map((normalizedPath) => {
+          const patch = patches.find((p) => {
+            let np = p.filePath;
+            try { np = resolveWorkspacePath(useAppStore.getState().workspaceRoots, p.filePath).workspacePath; } catch {}
+            return np === normalizedPath;
+          });
           const type = patch?.operation === 'create' ? 'write' : patch?.operation === 'delete' ? 'delete' : 'write';
-          return { type, path, success: true };
+          return { type, path: normalizedPath, success: true };
         });
         setAgentActionsByMessageId((prev) => ({
           ...prev,
@@ -999,7 +1163,14 @@ export function ChatPane() {
       for (const p of patches) {
         try {
           await applyPatchToWorkspace(p);
-          appliedPaths.push(p.filePath);
+          let normalizedPath = p.filePath;
+          try {
+            const roots = useAppStore.getState().workspaceRoots;
+            normalizedPath = resolveWorkspacePath(roots, p.filePath).workspacePath;
+          } catch {
+            normalizedPath = p.filePath;
+          }
+          appliedPaths.push(normalizedPath);
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           errors.push(`${p.filePath}: ${msg}`);
@@ -1056,8 +1227,7 @@ export function ChatPane() {
 
     let needsContextAction = false;
 
-    // Re-check context pressure using the actual messages we will send.
-    // The UI pre-check uses cached workspace context size and can be stale when context pins/@mentions change.
+
     const toApi = (message: Message): LLMMessage => {
       const selection = message.selectionRef?.text?.trim();
       if (!selection || message.role !== 'user') {
@@ -1104,7 +1274,7 @@ export function ChatPane() {
       return content.length + 48;
     };
 
-    // Compaction support: keep full transcript in UI, but omit older messages from model context.
+    
     const baseMessagesForContext = baseMessages.filter((m) => !m.excludedFromContext);
 
     const candidateMessages: LLMMessage[] = [
@@ -1154,7 +1324,7 @@ export function ChatPane() {
     };
     addMessage(chatId, assistantMsg);
 
-    setIsStreaming(true);
+    setIsStreaming(true, chatId);
     abortReasonRef.current = null;
     abortRef.current = new AbortController();
 
@@ -1173,9 +1343,16 @@ export function ChatPane() {
 
     let loopMessages: LLMMessage[] = candidateMessages;
 
+   
+    let streamedContent = '';
+    let lastCompleteStreamedContent = '';
+    const allActions: AgentAction[] = [];
+    const allThoughts: string[] = [];
+    // Each tool-using iteration overwrites the visible assistant message; remember the
+    // superseded outputs so the UI can still show every earlier attempt.
+    const priorAttempts: Array<{ content: string; createdAt: number }> = [];
+
     try {
-      let streamedContent = '';
-      const allActions: AgentAction[] = [];
 
       for (let iter = 1; iter <= maxIter; iter++) {
         if (isAgentMode) {
@@ -1185,8 +1362,6 @@ export function ChatPane() {
           setAgentGatherStep(iter);
         }
 
-        // Guard against stalled streaming (common when the upstream drops the connection mid-stream).
-        // If we never receive tokens for too long, or we stop receiving tokens for too long, abort so the UI can recover.
         const startedAt = Date.now();
         let lastTokenAt = startedAt;
         let receivedAnyToken = false;
@@ -1229,11 +1404,23 @@ export function ChatPane() {
           window.clearInterval(stallIntervalId);
         }
 
+
+        lastCompleteStreamedContent = streamedContent;
+
         if (!isAgentMode) break;
         if (iter >= maxIter) break;
 
-        const tools = parseToolCalls(stripChannelTokens(streamedContent));
+       
+        const normalizedContent = normalizeToolMarkerLineBreaks(streamedContent);
+        const tools = parseToolCalls(stripChannelTokens(normalizedContent));
         if (!hasAgentTools(tools)) break;
+
+        const strippedForThought = stripToolMarkers(normalizedContent);
+        const { thinking: iterThinking } = extractThinkingBlocks(strippedForThought);
+        // Keep the Reasoning panel focused on the model's thinking; the full intermediate
+        // response body is preserved separately as a "Previous attempt" on the message.
+        const intermediateThought = iterThinking.trim();
+        if (intermediateThought) allThoughts.push(intermediateThought);
 
         const roots = useAppStore.getState().workspaceRoots;
         if (roots.length === 0) {
@@ -1270,6 +1457,11 @@ export function ChatPane() {
         const continueAfterTools = hasGatherTools(tools) || hasMutationTools(tools);
         if (!continueAfterTools) break;
 
+        // This iteration's output is about to be replaced by the next one — preserve it.
+        if (streamedContent.trim()) {
+          priorAttempts.push({ content: streamedContent, createdAt: Date.now() });
+        }
+
          loopMessages = [
            { role: 'system', content: systemPrompt },
            ...contextMsgs,
@@ -1283,15 +1475,6 @@ export function ChatPane() {
           },
           { role: 'assistant', content: '' },
         ];
-      }
-
-      setAgentGatherStep(null);
-
-      if (allActions.length > 0) {
-        setAgentActionsByMessageId((prev) => ({
-          ...prev,
-          [assistantMsg.id]: [...(prev[assistantMsg.id] ?? []), ...allActions],
-        }));
       }
 
       const finalChat = useAppStore.getState().chats.find((chat) => chat.id === chatId);
@@ -1317,8 +1500,20 @@ export function ChatPane() {
     } catch (err: unknown) {
       const name = err instanceof Error ? err.name : '';
       if (name === 'AbortError') {
-        // On manual stop, keep partial output silently. On stalled streams, show a recovery hint.
+        // On manual stop, keep partial output silently. On stalled streams, auto-retry up to 2 times.
         if (abortReasonRef.current === 'stall') {
+          const stallRetries = (runAssistantTurn as any)._stallRetries ?? 0;
+          if (stallRetries < 2 && abortRef.current && !abortRef.current.signal.aborted) {
+           
+            (runAssistantTurn as any)._stallRetries = stallRetries + 1;
+            abortRef.current = new AbortController();
+            abortReasonRef.current = null;
+            updateLastAssistantMessage(chatId, '');
+            toast.info(`Connection stalled — retrying (${stallRetries + 1}/2)…`);
+            void runAssistantTurn({ chatId, chatMode, baseMessages, hasVision, mentionedFilePaths });
+            return !needsContextAction;
+          }
+          (runAssistantTurn as any)._stallRetries = 0;
           useAppStore.getState().setLMConnected(false);
           const st = useAppStore.getState();
           const chat = st.chats.find((c) => c.id === chatId);
@@ -1327,12 +1522,16 @@ export function ChatPane() {
           const suffix = existing.trim().length > 0 ? '\n\n' : '';
           updateLastAssistantMessage(
             chatId,
-            `${existing}${suffix}[Generation stopped: connection stalled. Press Regenerate or send again to retry.]`,
+            `${existing}${suffix}[Generation stopped: connection stalled after 2 retries. Press Regenerate to try again.]`,
           );
           toast.error('Local AI connection stalled');
         }
       } else {
         const errorMsg = err instanceof Error ? err.message : 'Unknown error';
+       
+        if (lastCompleteStreamedContent && !isContextLengthError(errorMsg)) {
+          updateLastAssistantMessage(chatId, lastCompleteStreamedContent);
+        }
         if (isContextLengthError(errorMsg)) {
           // Provider rejected due to context size: prompt user with summarize/clear/new chat actions.
           const p = estimateContextPressureForApi(loopMessages);
@@ -1358,6 +1557,32 @@ export function ChatPane() {
         toast.error('Local AI request failed');
       }
     } finally {
+      
+      if (allActions.length > 0) {
+        setAgentActionsByMessageId((prev) => ({
+          ...prev,
+          [assistantMsg.id]: [...(prev[assistantMsg.id] ?? []), ...allActions],
+        }));
+      }
+      if (allThoughts.length > 0) {
+        setAgentThoughtsByMessageId((prev) => ({
+          ...prev,
+          [assistantMsg.id]: [...(prev[assistantMsg.id] ?? []), ...allThoughts],
+        }));
+      }
+      // Attach the superseded iteration outputs to the message so earlier attempts stay visible.
+      if (priorAttempts.length > 0) {
+        const store = useAppStore.getState();
+        const chat = store.chats.find((c) => c.id === chatId);
+        if (chat) {
+          const messages = chat.messages.map((m) =>
+            m.id === assistantMsg.id
+              ? { ...m, meta: { ...(m.meta ?? {}), attempts: priorAttempts } }
+              : m,
+          );
+          store.updateChatFields(chatId, { messages });
+        }
+      }
       setAgentGatherStep(null);
       setIsStreaming(false);
       useAppStore.getState().setAgentStepProgress(0, 0);
@@ -1410,10 +1635,18 @@ export function ChatPane() {
 
   const handleRegenerateMessage = useCallback(async (messageId: string) => {
     const chatId = useAppStore.getState().activeChatId;
-    if (!chatId || isStreaming) return;
+    if (!chatId) return;
+    if (isStreaming) {
+      toast.error('Please wait for the current response to finish before regenerating.');
+      return;
+    }
 
     const chat = useAppStore.getState().chats.find((entry) => entry.id === chatId);
-    if (!chat || !canWriteChat(chat)) return;
+    if (!chat) return;
+    if (!canWriteChat(chat)) {
+      toast.error('This conversation is locked and cannot be regenerated.');
+      return;
+    }
 
     const messageIndex = chat.messages.findIndex((message) => message.id === messageId);
     if (messageIndex < 0) return;
@@ -1444,7 +1677,15 @@ export function ChatPane() {
   }, [deriveChatTitle, isStreaming, runAssistantTurn, saveVersionSnapshot, trimMessageUiState, updateChatFields]);
 
   const sendCurrentInput = useCallback(async () => {
-    if ((!input.trim() && images.length === 0 && !selectionAttachment) || isStreaming) return;
+    // Consume any forced values set by context-action re-send handlers to avoid stale closure.
+    const forced = forcedSendRef.current;
+    forcedSendRef.current = null;
+    const effectiveInput = forced !== null ? forced.input : input;
+    const effectiveImages = forced !== null ? forced.images : images;
+    const effectiveMentionedFiles = forced !== null ? forced.mentionedFiles : mentionedFiles;
+    const effectiveSelectionAttachment = forced !== null ? forced.selectionRef : selectionAttachment;
+
+    if ((!effectiveInput.trim() && effectiveImages.length === 0 && !effectiveSelectionAttachment) || isStreaming) return;
     const state = useAppStore.getState();
     const currentActiveChat = state.activeChatId
       ? state.chats.find((chat) => chat.id === state.activeChatId) ?? null
@@ -1471,10 +1712,10 @@ export function ChatPane() {
       }
     }
 
-    const hasVision = images.length > 0;
-    const rawInput = input;
-    const selectionRef = selectionAttachment;
-    const mentionedFilePaths = mentionedFiles;
+    const hasVision = effectiveImages.length > 0;
+    const rawInput = effectiveInput;
+    const selectionRef = effectiveSelectionAttachment;
+    const mentionedFilePaths = effectiveMentionedFiles;
     const hasWorkspaceContext = mentionedFilePaths.length > 0 || contextFiles.length > 0;
     const shouldUseAgentForEdit =
       currentMode === 'chat' &&
@@ -1500,7 +1741,7 @@ export function ChatPane() {
     if (hasVision) {
       const parts: ContentPart[] = [];
       if (rawInput.trim()) parts.push({ type: 'text', text: rawInput });
-      for (const img of images) {
+      for (const img of effectiveImages) {
         parts.push({ type: 'image_url', image_url: { url: img } });
       }
       userContent = parts;
@@ -1546,7 +1787,7 @@ export function ChatPane() {
             model: settings.textModel,
               preview: getMessageText(userMsg).slice(0, 500),
               promptLength: getMessageText(userMsg).length,
-              imageCount: images.length,
+              imageCount: effectiveImages.length,
               mentionedFileCount: mentionedFilePaths.length,
               workspaceFolders: workspaceFolderLabels(workspaceRoots),
               contextFiles: normalizeAuditPaths(contextFiles, 50),
@@ -1605,6 +1846,13 @@ export function ChatPane() {
     if (!chat || !canWriteChat(chat)) return false;
     const previousSummary = findLatestAutoSummaryBody(chat.messages);
 
+    // Guard first — before any side effects — so contextFiles aren't mutated when there's nothing to summarize.
+    const transcript = buildCondenseTranscriptForSummary(chat.messages, getSummarizeTranscriptBudget());
+    if (!transcript) {
+      toast.error('No conversation to summarize yet. Send a few messages first.');
+      return false;
+    }
+
     const pinContext = opts?.pinContext ?? false;
 
     // If requested, keep the currently referenced files available after condensing.
@@ -1615,12 +1863,6 @@ export function ChatPane() {
         const nextPinned = [...new Set([...(st.contextFiles ?? []), ...refs])];
         useAppStore.setState({ contextFiles: nextPinned });
       }
-    }
-
-    const transcript = buildCondenseTranscriptForSummary(chat.messages, getSummarizeTranscriptBudget());
-    if (!transcript) {
-      toast.error('Not possible to summarize right now. Please use Clear chat or New chat.');
-      return false;
     }
 
     // Compaction policy: keep the full transcript in the UI, but exclude older messages from future model context.
@@ -1635,12 +1877,17 @@ export function ChatPane() {
         ? notExcludedIdxs[notExcludedIdxs.length - KEEP_TAIL_MESSAGES]
         : null;
     const toExclude = cutoffIdx == null ? [] : chat.messages.filter((_, idx) => idx < cutoffIdx && !chat.messages[idx].excludedFromContext);
+    // Track which messages to compact by id, not index: the chat may change during the
+    // (potentially slow) summary request, and ids stay stable while indices do not.
+    const toExcludeIds = new Set(toExclude.map((m) => m.id));
     const compactedMessageCount = toExclude.length;
     const compactedCharCount = toExclude.reduce((sum, m) => sum + getMessageText(m).length + 48, 0);
     const previousCompactionCount = chat.messages.filter((m) => m.meta?.kind === 'auto_summary').length;
     const compactionDepth = previousCompactionCount + 1;
 
     setIsCondensingChat(true);
+    const abortController = new AbortController();
+    const timeoutId = window.setTimeout(() => abortController.abort(), SUMMARY_TIMEOUT_MS);
     try {
       const summary = (await chatCompletion({
         messages: [
@@ -1652,7 +1899,7 @@ export function ChatPane() {
           {
             role: 'user',
             content:
-              `Summarize the conversation below for future context carry-over. Output plain text with short headings and bullets.\n\nConversation:\n${transcript}`,
+              `Summarize the conversation below for future context carry-over. Use markdown formatting: ## headings, **bold** for key terms, and - bullet lists.\n\nConversation:\n${transcript}`,
           },
         ],
         settings: {
@@ -1662,6 +1909,7 @@ export function ChatPane() {
           maxTokens: Math.min(SUMMARY_MAX_TOKENS, Math.max(256, Math.floor(settings.maxTokens / 2))),
         },
         useVision: false,
+        signal: abortController.signal,
         requestContext: {
           chatId,
           orgId: chat.groupId ?? null,
@@ -1670,13 +1918,22 @@ export function ChatPane() {
       })).trim();
 
       if (!summary) {
-        toast.error('Not possible to summarize right now. Please use Clear chat or New chat.');
+        toast.error('The AI returned an empty summary. Check your model settings and try again.');
+        return false;
+      }
+
+      // Re-read the chat from the store: it may have gained messages (or been edited) while
+      // the summary was generating. Building from a stale snapshot here would silently drop
+      // anything added in the meantime.
+      const freshChat = useAppStore.getState().chats.find((entry) => entry.id === chatId);
+      if (!freshChat || !canWriteChat(freshChat)) {
+        toast.error('The conversation is no longer available to summarize.');
         return false;
       }
 
       const { mergedSummary, retainedCount } = mergeSummaryWithEntityRetention(previousSummary, summary);
 
-      saveVersionSnapshot(chat.id, 'Before auto-summary condense');
+      saveVersionSnapshot(chatId, 'Before auto-summary condense');
 
       const summaryMessage: Message = {
         id: crypto.randomUUID(),
@@ -1692,8 +1949,9 @@ export function ChatPane() {
       };
 
       // Mark older messages as excluded from future model context, but keep them visible in the UI.
-      const nextMessages = chat.messages.map((m, idx) => {
-        if (cutoffIdx != null && idx < cutoffIdx) {
+      // Match by id so messages appended during the request stay live and uncompacted.
+      const nextMessages = freshChat.messages.map((m) => {
+        if (toExcludeIds.has(m.id)) {
           return { ...m, excludedFromContext: true };
         }
         // Exclude previous auto-summaries from context so only the latest summary is used.
@@ -1703,12 +1961,13 @@ export function ChatPane() {
         return m;
       });
 
-      // Insert the latest summary right at the cutoff point so the chat reads naturally.
-      const insertAt = cutoffIdx == null ? nextMessages.length : cutoffIdx;
-      nextMessages.splice(insertAt, 0, summaryMessage);
+
+      nextMessages.push(summaryMessage);
 
       trimMessageUiState(nextMessages);
-      updateChatFields(chat.id, { messages: nextMessages });
+      updateChatFields(chatId, { messages: nextMessages });
+
+      useAppStore.getState().resetContextUsageMeter();
       userScrolledUp.current = false;
       setShowScrollToLatest(false);
       toast.success(
@@ -1719,9 +1978,17 @@ export function ChatPane() {
       return true;
     } catch (err) {
       console.error('[EvigStudio] summarize conversation failed', err);
-      toast.error('Not possible to summarize right now. Please use Clear chat or New chat.');
+      const errName = (err as { name?: string } | null)?.name;
+      const aborted = errName === 'AbortError' || errName === 'TimeoutError';
+      if (aborted) {
+        toast.error('Summarization timed out. The AI server did not respond — check it is running and try again.');
+      } else {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        toast.error(`Summarization failed: ${errMsg}. Check your AI server is running and try again.`);
+      }
       return false;
     } finally {
+      window.clearTimeout(timeoutId);
       setIsCondensingChat(false);
     }
   }, [
@@ -1748,6 +2015,8 @@ export function ChatPane() {
       messages: [],
       title: 'New Chat',
     });
+   
+    useAppStore.getState().resetContextUsageMeter();
     userScrolledUp.current = false;
     setShowScrollToLatest(false);
     toast.success('Chat cleared. Start a fresh conversation.');
@@ -1777,15 +2046,30 @@ export function ChatPane() {
     }
 
     const ok = await summarizeActiveChat({ pinContext: summarizePinContext });
-    if (!ok) return;
 
-    // Keep the dialog open while summarizing so users see progress.
+    // Always close the summarize dialog — whether it succeeded or failed.
     setShowSummarizeDialog(false);
+
+    if (!ok) {
+      // If this was triggered from the context-pressure dialog, send the user back
+      // so they can try Clear chat or New chat instead.
+      if (pendingContextActionInputRef.current) {
+        setShowContextActionsDialog(true);
+      }
+      return;
+    }
 
     // If this summarize was part of a context-pressure continuation flow, restore and re-send.
     if (pendingContextActionInputRef.current) {
       const pending = pendingContextActionInputRef.current;
       pendingContextActionInputRef.current = null;
+      // Set forced values BEFORE calling sendCurrentInput so its stale closure is bypassed.
+      forcedSendRef.current = {
+        input: pending.input,
+        images: pending.images,
+        mentionedFiles: pending.mentionedFiles,
+        selectionRef: pending.selectionRef,
+      };
       setInput(pending.input);
       setImages(pending.images);
       setMentionedFiles(pending.mentionedFiles);
@@ -1801,6 +2085,13 @@ export function ChatPane() {
     if (pendingContextActionInputRef.current) {
       const pending = pendingContextActionInputRef.current;
       pendingContextActionInputRef.current = null;
+      // Set forced values BEFORE calling sendCurrentInput so its stale closure is bypassed.
+      forcedSendRef.current = {
+        input: pending.input,
+        images: pending.images,
+        mentionedFiles: pending.mentionedFiles,
+        selectionRef: pending.selectionRef,
+      };
       setInput(pending.input);
       setImages(pending.images);
       setMentionedFiles(pending.mentionedFiles);
@@ -1839,6 +2130,13 @@ export function ChatPane() {
       if (pendingContextActionInputRef.current) {
         const pending = pendingContextActionInputRef.current;
         pendingContextActionInputRef.current = null;
+        // Set forced values BEFORE calling sendCurrentInput so its stale closure is bypassed.
+        forcedSendRef.current = {
+          input: pending.input,
+          images: pending.images,
+          mentionedFiles: pending.mentionedFiles,
+          selectionRef: pending.selectionRef,
+        };
         setInput(pending.input);
         setImages(pending.images);
         setMentionedFiles(pending.mentionedFiles);
@@ -1854,6 +2152,10 @@ export function ChatPane() {
 
   const handleSend = useCallback(async () => {
     if ((!input.trim() && images.length === 0 && !selectionAttachment) || isStreaming) return;
+    if (isCondensingChat) {
+      toast.error('Please wait for the summary to finish before sending a new message.');
+      return;
+    }
 
     const state = useAppStore.getState();
     const currentActiveChat = state.activeChatId
@@ -1883,7 +2185,7 @@ export function ChatPane() {
     }
 
     await sendCurrentInput();
-  }, [estimateContextPressure, images, input, isStreaming, mentionedFiles, selectionAttachment, sendCurrentInput]);
+  }, [estimateContextPressure, images, input, isStreaming, isCondensingChat, mentionedFiles, selectionAttachment, sendCurrentInput]);
 
   const handleStop = () => {
     abortReasonRef.current = 'user';
@@ -2219,6 +2521,7 @@ export function ChatPane() {
                                 onGetOriginal={handleGetOriginal}
                                 autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
                                 agentActions={agentActionsByMessageId[msg.id]}
+                                agentThoughts={agentThoughtsByMessageId[msg.id]}
                                 onOpenFile={handleOpenEditorFile}
                                 onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
                                 onRegenerate={isLocked ? undefined : handleRegenerateMessage}
@@ -2231,32 +2534,44 @@ export function ChatPane() {
                     </div>
                   )}
 
-                  {visible.map((msg) => (
-                    <div
-                      key={msg.id}
-                      data-evig-message-id={msg.id}
-                      data-evig-message-role={msg.role}
-                      data-evig-message-timestamp={msg.timestamp}
-                    >
-                      <ChatMessage
-                        message={msg}
-                        chatMode={chatMode}
-                        onApplyPatch={handleApplyPatch}
-                        onGetOriginal={handleGetOriginal}
-                        autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
-                        agentActions={agentActionsByMessageId[msg.id]}
-                        onOpenFile={handleOpenEditorFile}
-                        onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
-                        onRegenerate={isLocked ? undefined : handleRegenerateMessage}
-                        busy={isStreaming}
-                      />
-                    </div>
-                  ))}
+                  {visible.map((msg, idx) => {
+                   
+                    const precedingUser =
+                      msg.role === 'assistant'
+                        ? [...visible.slice(0, idx)].reverse().find((m) => m.role === 'user')
+                        : undefined;
+                    const fallbackThinking = precedingUser
+                      ? deriveThinkingFromUserPrompt(getMessageText(precedingUser))
+                      : undefined;
+                    return (
+                      <div
+                        key={msg.id}
+                        data-evig-message-id={msg.id}
+                        data-evig-message-role={msg.role}
+                        data-evig-message-timestamp={msg.timestamp}
+                      >
+                        <ChatMessage
+                          message={msg}
+                          chatMode={chatMode}
+                          onApplyPatch={handleApplyPatch}
+                          onGetOriginal={handleGetOriginal}
+                          autoAppliedPaths={autoAppliedPathsByMessageId[msg.id]}
+                          agentActions={agentActionsByMessageId[msg.id]}
+                          agentThoughts={agentThoughtsByMessageId[msg.id]}
+                          fallbackThinking={fallbackThinking}
+                          onOpenFile={handleOpenEditorFile}
+                          onSubmitEdit={isLocked ? undefined : handleSubmitMessageEdit}
+                          onRegenerate={isLocked ? undefined : handleRegenerateMessage}
+                          busy={isStreaming}
+                        />
+                      </div>
+                    );
+                  })}
                 </>
               );
             })()
           )}
-          {isStreaming && (
+          {isActiveChatStreaming && (
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <Loader2 className="w-3 h-3 animate-spin" />
               <span>
@@ -2267,7 +2582,7 @@ export function ChatPane() {
               <span className="animate-blink">▋</span>
             </div>
           )}
-          {!isStreaming && isCondensingChat && (
+          {!isActiveChatStreaming && isCondensingChat && (
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <Loader2 className="w-3 h-3 animate-spin" />
               <span>Summarizing conversation…</span>
@@ -2444,13 +2759,13 @@ export function ChatPane() {
               value={input}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
-              disabled={isLocked}
-              placeholder={isAgent ? 'Describe what to build, fix, or change… (@ file)' : 'Ask anything…'}
+              disabled={isLocked || isCondensingChat}
+              placeholder={isCondensingChat ? 'Summarizing… please wait' : isAgent ? 'Describe what to build, fix, or change… (@ file)' : 'Ask anything…'}
               rows={2}
               className="min-h-[56px] w-full resize-none rounded-lg border border-border/80 bg-input px-3 py-3 text-base leading-snug outline-none ring-2 ring-transparent transition-shadow placeholder:text-muted-foreground focus:border-primary/40 focus:ring-primary/30 sm:min-h-[48px] sm:py-2.5 sm:text-sm"
             />
           </div>
-          {isStreaming ? (
+          {isActiveChatStreaming ? (
             <button
               type="button"
               onClick={handleStop}
@@ -2462,7 +2777,7 @@ export function ChatPane() {
             <button
               type="button"
               onClick={handleSend}
-              disabled={isLocked || (!input.trim() && images.length === 0 && mentionedFiles.length === 0 && !selectionAttachment)}
+              disabled={isLocked || isCondensingChat || (!input.trim() && images.length === 0 && mentionedFiles.length === 0 && !selectionAttachment)}
               className="glow-primary shrink-0 rounded bg-primary p-2.5 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30 sm:p-2"
             >
               <Send className="h-5 w-5 sm:h-4 sm:w-4" />

@@ -1,4 +1,4 @@
-import { useDeferredValue, useState, useCallback } from 'react';
+import { useDeferredValue, useMemo, useState, useCallback } from 'react';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -50,6 +50,7 @@ import {
   readWorkspaceFile,
   removeWorkspaceRootFromTree,
   renameWorkspacePath,
+  resolveWorkspacePath,
   workspaceRootsMatch,
 } from '@/lib/fsWorkspace';
 import {
@@ -228,9 +229,10 @@ export function FileTree() {
   const [searchQuery, setSearchQuery] = useState('');
 
   const deferredQuery = useDeferredValue(searchQuery);
-  const filteredTree = filterTree(fileTree, deferredQuery);
-  const totalStats = countTreeStats(fileTree);
-  const filteredStats = countTreeStats(filteredTree);
+ 
+  const filteredTree = useMemo(() => filterTree(fileTree, deferredQuery), [fileTree, deferredQuery]);
+  const totalStats = useMemo(() => countTreeStats(fileTree), [fileTree]);
+  const filteredStats = useMemo(() => countTreeStats(filteredTree), [filteredTree]);
   const searching = deferredQuery.trim().length > 0;
   const deleteStats = deleteTarget ? countNodeDescendants(deleteTarget) : null;
   const deleteMatchesPath = useCallback(
@@ -430,13 +432,28 @@ export function FileTree() {
 
   const handleCreate = useCallback(async () => {
     if (!createState || workspaceRoots.length === 0 || !createName.trim()) return;
-    const fullPath = createState.parentPath ? `${createState.parentPath}/${createName.trim()}` : createName.trim();
+    let fullPath = createState.parentPath ? `${createState.parentPath}/${createName.trim()}` : createName.trim();
+  
+    if (!createState.parentPath && workspaceRoots.length > 1) {
+      const firstSegment = fullPath.replace(/\\/g, '/').split('/')[0] ?? '';
+      const hasPrefix = workspaceRoots.some((r) => r.label === firstSegment);
+      if (!hasPrefix) {
+        fullPath = `${workspaceRoots[0].label}/${fullPath}`;
+      }
+    }
     try {
+     
+      let normalizedPath = fullPath;
+      try {
+        normalizedPath = resolveWorkspacePath(workspaceRoots, fullPath).workspacePath;
+      } catch {
+        normalizedPath = fullPath;
+      }
       if (createState.type === 'file') {
         await createWorkspaceFile(workspaceRoots, fullPath);
         await refreshTree();
         const content = await readWorkspaceFile(workspaceRoots, fullPath);
-        setActiveFile(fullPath, content);
+        setActiveFile(normalizedPath, content);
       } else {
         await createWorkspaceDirectory(workspaceRoots, fullPath);
         await refreshTree();
@@ -765,6 +782,21 @@ function TreeNode({
                 Workspace
               </span>
             )}
+          </button>
+          {/* Add-to-context (book) toggle lives outside the hover-only group so the pinned state
+              stays visible without hovering, matching file rows. */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleContext(node.path);
+            }}
+            className={`mr-0.5 shrink-0 rounded-md p-1 transition-all ${isContext
+              ? 'bg-primary/12 text-primary shadow-sm'
+              : 'text-muted-foreground opacity-0 group-hover:opacity-100 hover:bg-secondary hover:text-primary'}`}
+            title={isContext ? 'Remove folder from context' : 'Add folder to context'}
+          >
+            <BookOpen className="h-3 w-3" />
           </button>
           <div className="flex items-center gap-0.5 pr-1 opacity-0 transition-all group-hover:opacity-100">
             <button

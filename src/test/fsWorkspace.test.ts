@@ -7,6 +7,7 @@ import {
   getUniqueWorkspaceLabel,
   resolveWorkspacePath,
   workspaceFileExists,
+  workspacePathExists,
   workspaceRootsMatch,
   writeWorkspaceFileVerified,
 } from '@/lib/fsWorkspace';
@@ -288,6 +289,26 @@ describe('workspace path helpers', () => {
     await expect(workspaceFileExists([root], 'src/App.tsx')).resolves.toBe(true);
   });
 
+  it('resolves @-mention existence against disk for files, folders, and the root', async () => {
+    const rootNode = createMemoryDirectory({
+      src: createMemoryDirectory({ 'App.tsx': createMemoryFile('export {}') }),
+    });
+    const root: WorkspaceRoot = {
+      id: 'root-1',
+      label: 'frontend',
+      handle: createDirectoryHandle(rootNode),
+    };
+
+  
+    await expect(workspacePathExists([root], 'frontend/src/App.tsx')).resolves.toBe(true);
+    await expect(workspacePathExists([root], 'frontend/src')).resolves.toBe(true);
+    
+    await expect(workspacePathExists([root], 'frontend')).resolves.toBe(true);
+    
+    await expect(workspacePathExists([root], 'frontend/src/Missing.tsx')).resolves.toBe(false);
+    await expect(workspacePathExists([root], 'frontend/nope/deep.ts')).resolves.toBe(false);
+  });
+
   it('surfaces a stale-chat recovery message when file creation cannot be verified', async () => {
     let createAttempted = false;
     const root: WorkspaceRoot = {
@@ -311,7 +332,7 @@ describe('workspace path helpers', () => {
           }
           throw new Error('File not found');
         },
-      } as FileSystemDirectoryHandle,
+      } as unknown as FileSystemDirectoryHandle,
     };
 
     await expect(createWorkspaceFile([root], 'ghost.txt')).rejects.toThrow(STALE_WORKSPACE_WRITE_RECOVERY_MESSAGE);
