@@ -30,7 +30,7 @@ services:
     image: evigstudiolight-api:latest
     restart: unless-stopped
     # Keep env_file so deployers can provide secrets/config without rebuilding.
-    env_file: ./server/.env
+    env_file: ./server/.env.offline
     environment:
       # IMPORTANT: inside Docker, 127.0.0.1 is the container itself.
       DATABASE_URL: postgresql://evigstudio:evigstudio@db:5432/evigstudio
